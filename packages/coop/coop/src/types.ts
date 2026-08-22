@@ -91,7 +91,7 @@ export interface CoopInboxEntry {
   time: number
   from: string
   planId: string
-  kind: 'notify' | 'pre_review' | 'verify' | 'execution' | 'abort'
+  kind: 'drive' | 'notify' | 'pre_review' | 'verify' | 'execution' | 'abort'
   summary: string
   docPath: string
   reason?: string

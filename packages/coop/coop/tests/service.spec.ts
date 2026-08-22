@@ -142,11 +142,24 @@ describe('plan workflow across two sessions', () => {
       .rejects.toMatchObject({ code: 'COOP_NOT_ASSIGNED_WORKER' })
     await ctx.coop.submitPreReview(worker, plan.planId, 'pass', 'looks fine')
     expect((await readPlanFile(planPath(join(h.cwd, '.dsh/coop'), plan.planId)))?.status).toBe('ready_to_execute')
-    expect(coopMessages(master).some(text => text.includes('pre-review pass'))).toBe(true)
+    expect(coopMessages(master).some(text => text.includes('passed pre-review'))).toBe(true)
     await ctx.coop.beginExecution(worker, plan.planId)
     const reported = await ctx.coop.reportExecution(worker, plan.planId, 'done the thing')
     expect(reported.status).toBe('pending_verify')
     expect(coopMessages(master).some(text => text.includes('execution reported'))).toBe(true)
+  })
+
+  it('drives the worker into execution after its own pre-review passes', async () => {
+    const h = await flow()
+    const { ctx, master, worker, plan } = h
+    await ctx.coop.notifyPlan(master, plan.planId)
+    const before = coopMessages(worker).length
+    await ctx.coop.submitPreReview(worker, plan.planId, 'pass')
+    // The drive signal lands as a fresh woken turn on the worker itself.
+    const drives = coopMessages(worker).filter(text => text.includes('approved for execution') && text.includes('coop_execute_begin'))
+    expect(drives).toHaveLength(1)
+    expect(coopMessages(worker).length - before).toBe(1)
+    expect(coopMessages(master).some(text => text.includes('execution starting'))).toBe(true)
   })
 
   it('walks request_changes → rework → close end to end', async () => {

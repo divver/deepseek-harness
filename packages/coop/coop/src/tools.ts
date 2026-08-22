@@ -189,7 +189,9 @@ export function registerCoopTools(ctx: Context, service: CoopService): void {
           status: { type: 'string', required: true },
         },
       },
-      render: (_args, value) => textOut(`Plan ${value.planId} is now ${value.status}.`),
+      render: (_args, value) => textOut(value.status === 'ready_to_execute'
+        ? `Plan ${value.planId} is ready_to_execute — call coop_execute_begin(planId) now, do the work, then coop_execute_report.`
+        : `Plan ${value.planId} returned to the master (${value.status}).`),
     },
     async execute(args, exec) {
       const agent = needAgent(exec)
