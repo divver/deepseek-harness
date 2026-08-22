@@ -43,6 +43,13 @@ import { registerCoopTools } from './tools.ts'
 
 /** Raw deployment config; enum and positivity rules are enforced in {@link resolveCoopConfig}. */
 export interface Config {
+  /**
+   * Append `coop/*` mirror events to each acting session's log. Off by
+   * default: `Session.append` cannot mark events ignorable, so mirrors are
+   * unreadable to any build whose vocabulary predates this package (resume
+   * fails loud). Enable only when every reader build knows `coop/*`.
+   */
+  mirrorEvents?: boolean
   defaultReviewLevel?: ReviewLevel
   docRoot?: string
   allowNoWorker?: boolean
@@ -65,6 +72,7 @@ export const Config: z<Config> = z.object({
   workerSelector: z.string(),
   inboxCompactThreshold: z.number(),
   allowAnyCwdRoles: z.array(z.string()),
+  mirrorEvents: z.boolean(),
 }) as unknown as z<Config>
 
 declare module '@deepseek-ai/cordis' {
@@ -140,6 +148,15 @@ export class CoopService extends Service {
         this.ctx.logger.warn(`coop: draining inbox for "${String(agent.session.id)}" failed: ${String(error)}`)
       })
     })
+  }
+
+  /**
+   * Append one coop mirror event when `mirrorEvents` is enabled. Mirrors are
+   * audit/replay extras; the shared files stay authoritative either way.
+   */
+  private appendMirror(session: Agent['session'], type: 'coop/registry' | 'coop/plan-change' | 'coop/review' | 'coop/execution', data: unknown): void {
+    if (!this.resolved.mirrorEvents) return
+    session.append(type, data as never)
   }
 
   // ---- workspace plumbing ----
@@ -240,7 +257,7 @@ export class CoopService extends Service {
       await store.removeEntry(localPath, sessionId)
       const globalPath = scope === 'any' ? this.globalRegistryPath() : undefined
       if (globalPath !== undefined) await store.removeEntry(globalPath, sessionId)
-      agent.session.append('coop/registry', { roles: [], updatedAt: now })
+      this.appendMirror(agent.session, 'coop/registry', { roles: [], updatedAt: now })
       return []
     }
     const entry: CoopRegistryEntry = {
@@ -265,7 +282,7 @@ export class CoopService extends Service {
       }
       throw error
     }
-    agent.session.append('coop/registry', {
+    this.appendMirror(agent.session, 'coop/registry', {
       roles,
       ...(entry.reviewLevel !== undefined ? { reviewLevel: entry.reviewLevel } : {}),
       updatedAt: now,
@@ -343,7 +360,7 @@ export class CoopService extends Service {
       '',
     ].join('\n'))
     await store.writePlanFile(store.planPath(root, planId), plan)
-    agent.session.append('coop/plan-change', { planId, op: 'create', status: 'draft' })
+    this.appendMirror(agent.session, 'coop/plan-change', { planId, op: 'create', status: 'draft' })
     return plan
   }
 
@@ -429,7 +446,7 @@ export class CoopService extends Service {
     })
     const summary = opts.summary ?? plan.objective.slice(0, 200)
     await this.deliver(senderId, boundWorker, plan, 'notify', summary)
-    agent.session.append('coop/plan-change', { planId, op: 'notify', status: nextStatus, summary })
+    this.appendMirror(agent.session, 'coop/plan-change', { planId, op: 'notify', status: nextStatus, summary })
     return { ...plan, assignedWorkerSessionId: boundWorker }
   }
 
@@ -515,7 +532,7 @@ export class CoopService extends Service {
       `- ${new Date(now).toISOString()} worker ${workerId}: **${decision}**${summary === undefined ? '' : ` — ${summary}`}`,
       '',
     ].join('\n'))
-    agent.session.append('coop/review', review)
+    this.appendMirror(agent.session, 'coop/review', review)
     await this.deliver(workerId, plan.createdBy, plan, 'pre_review', `pre-review ${decision}${summary === undefined ? '' : `: ${summary}`}`)
     return plan
   }
@@ -541,7 +558,7 @@ export class CoopService extends Service {
         history: [...current.history, { time: now, sessionId: workerId, op: 'execute_begin', status: 'executing' }],
       }
     })
-    agent.session.append('coop/execution', { planId, phase: 'begin' })
+    this.appendMirror(agent.session, 'coop/execution', { planId, phase: 'begin' })
     return plan
   }
 
@@ -590,7 +607,7 @@ export class CoopService extends Service {
       `- ${new Date(now).toISOString()} worker ${workerId}: ${summary}`,
       '',
     ].join('\n'))
-    agent.session.append('coop/execution', execution)
+    this.appendMirror(agent.session, 'coop/execution', execution)
     await this.deliver(workerId, plan.createdBy, plan, 'execution', summary)
     return plan
   }
@@ -650,7 +667,7 @@ export class CoopService extends Service {
       `- ${new Date(now).toISOString()} master ${masterId}: **${decision}**${summary === undefined ? '' : ` — ${summary}`}`,
       '',
     ].join('\n'))
-    agent.session.append('coop/review', review)
+    this.appendMirror(agent.session, 'coop/review', review)
     const workerId = updated.assignedWorkerSessionId
     if (workerId !== undefined) {
       await this.deliver(masterId, workerId, updated, 'verify', `verify ${decision}${summary === undefined ? '' : `: ${summary}`}`)
@@ -692,7 +709,7 @@ export class CoopService extends Service {
         `- ${new Date(now).toISOString()} master ${masterId} requested abort${reason === undefined ? '' : `: ${reason}`}`,
         '',
       ].join('\n'))
-      agent.session.append('coop/plan-change', { planId, op: 'abort', status: 'aborting', ...(reason === undefined ? {} : { summary: reason }) })
+      this.appendMirror(agent.session, 'coop/plan-change', { planId, op: 'abort', status: 'aborting', ...(reason === undefined ? {} : { summary: reason }) })
     }
     const workerId = plan.assignedWorkerSessionId
     if (workerId !== undefined) {
@@ -725,7 +742,7 @@ export class CoopService extends Service {
       `- ${new Date(now).toISOString()} worker ${workerId} acknowledged abort.`,
       '',
     ].join('\n'))
-    agent.session.append('coop/review', { planId, phase: 'abort_ack', decision: 'ack' })
+    this.appendMirror(agent.session, 'coop/review', { planId, phase: 'abort_ack', decision: 'ack' })
     await this.deliver(workerId, plan.createdBy, plan, 'verify', 'abort acknowledged (plan aborted)')
     return plan
   }

@@ -9,6 +9,7 @@ export const DEFAULT_ANY_CWD_ROLES: readonly Role[] = ['master', 'worker']
 
 /** Deployment-tunable coop defaults; every value is a validated `Config` field, none are hardcoded at use sites. */
 export interface ResolvedCoopConfig {
+  mirrorEvents: boolean
   defaultReviewLevel: ReviewLevel
   docRoot: string
   allowNoWorker: boolean
@@ -27,6 +28,7 @@ export interface ResolvedCoopConfig {
  * @returns the resolved config.
  */
 export function resolveCoopConfig(config: {
+  mirrorEvents?: boolean
   defaultReviewLevel?: ReviewLevel
   docRoot?: string
   allowNoWorker?: boolean
@@ -53,6 +55,7 @@ export function resolveCoopConfig(config: {
     workerSelector: config.workerSelector ?? 'earliest',
     inboxCompactThreshold: positive(config.inboxCompactThreshold, 'inboxCompactThreshold') ?? 256,
     allowAnyCwdRoles: config.allowAnyCwdRoles ?? [...DEFAULT_ANY_CWD_ROLES],
+    mirrorEvents: config.mirrorEvents ?? false,
   }
 }
 

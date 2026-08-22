@@ -32,7 +32,8 @@ All fields optional; enum and positivity rules fail loud at load.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `defaultReviewLevel` | `standard` | Worker gating level when a registration omits it |
+| `mirrorEvents` | `false` | Append the four `coop/*` mirror events to each acting session log |
+| `defaultReviewLevel` |
 | `docRoot` | `.dsh/coop` | Workspace-relative store root |
 | `allowNoWorker` | `false` | Let a master self-assign when no worker is visible |
 | `staleMs` | `300000` | Registry heartbeat window; also gates master takeover |
@@ -80,5 +81,6 @@ Append-only notifications follow the reusable prefix and do not invalidate exist
 
 - **Execution interrupt is deferred** — abort is a policy-level soft stop (state machine + prompt instruction). The plan→AbortController execution-interrupt pipeline over shell/subprocess/workflow is the spec's separate P4 and has no code here.
 - **`autoDrive` config is rejected, not implemented** — deterministic service-driven execution would let a cross-cwd notification trigger tools without the model in the loop; until the execution-interrupt pipeline exists the loader fails loud instead of accepting the key.
+- **Mirror events are off by default** — `Session.append` cannot mark an event envelope ignorable, so a log carrying `coop/*` mirrors is unresumable on any build whose vocabulary predates them. Set `mirrorEvents: true` only when every reader build knows the vocabulary; the shared files remain authoritative without them.
 - **Liveness is heartbeat-only** — the persisted-header existence check (`ctx.sessionPersistence.list()`) named by the spec is deferred; `staleMs` alone decides freshness and takeover.
 - **Cross-process delivery waits for activation** — a parked worker process learns about signals only on its next session start; there is no watcher or push channel (non-goal for v1).

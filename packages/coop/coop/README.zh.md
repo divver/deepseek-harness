@@ -32,7 +32,8 @@ executing 心跳超时           → needs_rework（worker 可重新 begin）
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `defaultReviewLevel` | `standard` | 注册未指定时 worker 的门控级别 |
+| `mirrorEvents` | `false` | 把四个 `coop/*` 镜像事件写入各 session 日志 |
+| `defaultReviewLevel` |
 | `docRoot` | `.dsh/coop` | workspace 相对的存储根 |
 | `allowNoWorker` | `false` | 无可见 worker 时允许 master 自指派 |
 | `staleMs` | `300000` | 注册表心跳窗口；同时决定 master 抢占 |
@@ -80,5 +81,6 @@ executing 心跳超时           → needs_rework（worker 可重新 begin）
 
 - **执行中断推迟** — abort 目前是 policy 层软停止（状态机 + 提示指令）。覆盖 shell/subprocess/workflow 的 plan→AbortController 执行中断管线是 spec 的独立 P4，本包没有相关代码。
 - **`autoDrive` 配置直接拒绝而非实现** — 确定性的服务驱动执行会让跨 cwd 通知绕过模型触发工具；在执行中断管线存在之前，Loader 对该配置键 fail loud。
+- **镜像事件默认关闭** — `Session.append` 无法给事件信封打 ignorable 标记，携带 `coop/*` 镜像的日志在任何词汇表更旧的构建上都无法 resume。仅当所有读取方构建都认识该词汇时才设 `mirrorEvents: true`；没有镜像时共享文件依然是权威。
 - **存活判定仅用心跳** — spec 提到的持久 header 存在性检查（`ctx.sessionPersistence.list()`）已推迟；当前由 `staleMs` 单独决定新鲜度与抢占。
 - **跨进程投递等待激活** — 挂起的 worker 进程只会在下一次 session 启动时得知信令；v1 非目标，不引入 watcher 或推送通道。

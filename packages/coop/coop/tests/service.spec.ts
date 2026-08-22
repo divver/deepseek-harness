@@ -39,7 +39,9 @@ async function harness(config: Partial<ConstructorParameters<typeof CoopService>
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   await ctx.plugin(AgentLoop, { agents: [] })
-  await ctx.plugin(CoopService, config)
+  // Mirrors on: the suite pins the dual-write contract that mixed-version
+  // deployments must leave off (see Config.mirrorEvents).
+  await ctx.plugin(CoopService, { mirrorEvents: true, ...config })
   const create = (id: string): Agent => ctx.agentLoop.create(SessionId(id), { provider: 'mock', model: 'mock' }, { cwd })
   return { ctx, cwd, master: create('master'), worker: create('worker'), other: create('other') }
 }
@@ -79,6 +81,12 @@ describe('registration', () => {
   it('fails loud when reading roles without a registry', async () => {
     const { ctx, master } = await harness()
     await expect(ctx.coop.getRoles(master)).rejects.toMatchObject({ code: 'COOP_REGISTRY_MISSING' })
+  })
+
+  it('writes no mirror events by default (cross-build resume safety)', async () => {
+    const { ctx, master } = await harness({ mirrorEvents: false })
+    await ctx.coop.setRoles(master, { set: ['master'] })
+    expect(master.session.events.some(event => event.type.startsWith('coop/'))).toBe(false)
   })
 
   it('deregisters through an empty replacement set', async () => {
