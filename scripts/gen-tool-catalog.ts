@@ -57,6 +57,7 @@ import * as ToolLsp from '@deepseek-ai/dsh-tool-lsp'
 import * as ToolSkill from '@deepseek-ai/dsh-tool-skill'
 import * as ToolSessionQuery from '@deepseek-ai/dsh-tool-session-query'
 import * as ToolTasks from '@deepseek-ai/dsh-tool-jobs'
+import CoopService from '@deepseek-ai/dsh-coop'
 import * as ToolTodo from '@deepseek-ai/dsh-tool-todo'
 import * as ToolSubagent from '@deepseek-ai/dsh-tool-subagent'
 import * as ToolWeb from '@deepseek-ai/dsh-tool-web'
@@ -505,6 +506,26 @@ const TOOL_PACKAGES: ToolPackage[] = [
     },
     note:
       'The kind-agnostic background-job controller: background bash commands, PTY sends, and subagents are read, listed, and killed through the same three tools. Loading the plugin attaches the controller that arms producers\' `ctx.jobs.start()`.',
+  },
+  {
+    pkg: '@deepseek-ai/dsh-coop',
+    dir: 'coop',
+    source: 'packages/coop/coop/src/index.ts',
+    requires: ['ctx.tools', 'ctx.agents', 'a workspace cwd shared by every participating session'],
+    writes: [
+      'tool/call',
+      'tool/result',
+      'user/message via Agent.followup() for cross-session notifications',
+      'coop/registry',
+      'coop/plan-change',
+      'coop/review',
+      'coop/execution',
+    ],
+    async mount(ctx) {
+      await ctx.plugin(CoopService, {})
+    },
+    note:
+      'Cross-session master/worker plan cooperation over a workspace-shared file store (.dsh/coop/). The session files are authoritative and per-session coop/* events are mirrors; notifications become inbox signal lines that drain into woken follow-up turns, so delivery works across dsh processes.',
   },
   {
     pkg: '@deepseek-ai/dsh-tool-todo',

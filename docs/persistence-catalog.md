@@ -389,6 +389,52 @@ Types: [ContentBlock](subsystems/core.md) · [TokenUsage](subsystems/llm-streami
 
 Source: [`packages/compaction/compaction/src/types.ts:33`](../packages/compaction/compaction/src/types.ts)
 
+### `coop/*`
+
+<a id="coopexecution--log-only"></a>
+
+#### `coop/execution` — log-only
+
+```ts persistence-catalog
+/** Execution report mirror. */
+'coop/execution': CoopExecutionEventData
+```
+
+Source: [`packages/coop/coop/src/types.ts:153`](../packages/coop/coop/src/types.ts)
+
+<a id="coopplan-change--log-only"></a>
+
+#### `coop/plan-change` — log-only
+
+```ts persistence-catalog
+/** Shared-plan mutation mirror. */
+'coop/plan-change': CoopPlanChangeEventData
+```
+
+Source: [`packages/coop/coop/src/types.ts:149`](../packages/coop/coop/src/types.ts)
+
+<a id="coopregistry--log-only"></a>
+
+#### `coop/registry` — log-only
+
+```ts persistence-catalog
+/** Registry mutation mirror; audit and fold tests read it, authority stays in the shared file. */
+'coop/registry': CoopRegistryEventData
+```
+
+Source: [`packages/coop/coop/src/types.ts:147`](../packages/coop/coop/src/types.ts)
+
+<a id="coopreview--log-only"></a>
+
+#### `coop/review` — log-only
+
+```ts persistence-catalog
+/** Review-phase outcome mirror. */
+'coop/review': CoopReviewEventData
+```
+
+Source: [`packages/coop/coop/src/types.ts:151`](../packages/coop/coop/src/types.ts)
+
 ### `feedback/*`
 
 <a id="feedbackrecord--log-only"></a>

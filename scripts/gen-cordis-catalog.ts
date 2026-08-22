@@ -62,6 +62,7 @@ export const SERVICE_PAGE: Record<string, string> = {
   clientModules: 'client-modules.md',
   codeRuntime: 'code-runtime.md',
   commands: 'commands.md',
+  coop: 'coop.md',
   compaction: 'compaction.md',
   cordisInspect: 'extensions.md',
   credentials: 'credentials.md',
@@ -505,6 +506,10 @@ export const FOUNDATION_TYPE_NAMES: ReadonlySet<string> = new Set([
 
 /** Project types deliberately documented outside the subsystems catalog. */
 export const TYPE_LINK_EXEMPTIONS: Readonly<Record<string, string>> = {
+  CoopPlanFile: 'shared-plan storage shape is owned by packages/coop/coop/src/types.ts',
+  CoopRegistryEntry: 'registry entry shape is owned by packages/coop/coop/src/types.ts',
+  ReviewLevel: 'coop gating enum is owned by packages/coop/coop/src/types.ts',
+  Role: 'coop role enum is owned by packages/coop/coop/src/types.ts',
   z: 'schemastery schema constructor is owned by vendor/schemastery (vendored upstream)',
   BeginCommandRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',
   InsertReferenceRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',
