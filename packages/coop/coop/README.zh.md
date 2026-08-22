@@ -8,7 +8,7 @@
 
 - **注册表** — `.dsh/coop/registry.json` 保存 `{ sessionId, roles, reviewLevel?, updatedAt, heartbeatAt, cwd, cwdScope }`。每个 workspace 只有一个存活 `master`：单例检查在注册表写锁（`withFileLock`）内完成，两个进程不可能同时成为 master。过期条目（`heartbeatAt` 超过 `staleMs`）不再阻塞并可被抢占。`cwdScope: "any"` 的条目同时写入全局表（`$DSH_HOME`/`~/.dsh`），从任意 workspace 可见。
 - **计划** — `.dsh/coop/plans/<planId>.json` 是权威计划状态；`.dsh/coop/docs/<planId>.md` 承载人类可读轨迹（Objective / Pre-review / Execution / Verify / Abort / Changelog）。每次状态迁移都在单个 plan 锁内完成校验与提交；模型侧调用者永远见不到冲突、也永远不需要重试。
-- **投递** — 单一路径。通知追加一行信令到 `.dsh/coop/inbox/<sessionId>.jsonl`（单调 `seq`）；接收 session 把水位（`.dsh/coop/inbox/.consumed/<sessionId>`）之上的每一行经 `Agent.followup` 投给自己的 agent——唤醒 driver，并作为真实 turn 落入 transcript。同进程对端立即 drain；跨进程对端在下一次激活（`agent/session-start`）时 drain。追加与水位写的是不同文件，因此既不会丢消息也不会重复投递。
+- **投递** — 单一路径。通知追加一行信令到 `.dsh/coop/inbox/<sessionId>.jsonl`（单调 `seq`）；接收 session 把水位（`.dsh/coop/inbox/.consumed/<sessionId>`）之上的每一行经 `Agent.followup` 投给自己的 agent——唤醒 driver，并作为真实 turn 落入 transcript。同进程对端立即 drain；每个存活 session 还会按 `inboxPollMs`（默认 1 秒）轮询自己的 inbox，因此开着的空闲 worker 最迟一个轮询周期内就会收到通知，并在它的 TUI 里实时流式渲染出该 turn。追加与水位写的是不同文件，因此既不会丢消息也不会重复投递。
 - **镜像** — `coop/registry`、`coop/plan-change`、`coop/review`、`coop/execution` 追加到执行方 session 的日志，用于审计与回放折叠。它们只是观察记录；任何分歧以共享文件为准。
 
 ## 工作流
@@ -83,4 +83,4 @@ executing 心跳超时           → needs_rework（worker 可重新 begin）
 - **`autoDrive` 配置直接拒绝而非实现** — 确定性的服务驱动执行会让跨 cwd 通知绕过模型触发工具；在执行中断管线存在之前，Loader 对该配置键 fail loud。
 - **镜像事件默认关闭** — `Session.append` 无法给事件信封打 ignorable 标记，携带 `coop/*` 镜像的日志在任何词汇表更旧的构建上都无法 resume。仅当所有读取方构建都认识该词汇时才设 `mirrorEvents: true`；没有镜像时共享文件依然是权威。
 - **存活判定仅用心跳** — spec 提到的持久 header 存在性检查（`ctx.sessionPersistence.list()`）已推迟；当前由 `staleMs` 单独决定新鲜度与抢占。
-- **跨进程投递等待激活** — 挂起的 worker 进程只会在下一次 session 启动时得知信令；v1 非目标，不引入 watcher 或推送通道。
+- **跨进程投递基于轮询** — 信令在 session 启动时和每 1 秒的 inbox 轮询中被拾取；不引入推送通道或 fs watcher（v1 非目标），最坏情况为一个轮询周期的延迟。

@@ -27,3 +27,7 @@ Store behavior is covered directly over temp dirs; service behavior runs through
 ## Follow-up (same day): mirrors are opt-in after a real mixed-version failure
 
 The ignorable deviation above bit immediately: running the repo-built plugin inside the published `dsh` profile made every mirror append land in a log whose reader build predates the `coop/*` vocabulary, and resume failed loud (`session contains event type "coop/registry"`). Neither rc.5 nor rc.7 `Session.append` can attach the envelope marker, so no writer-side fix exists within the public API. Shipped resolution: `Config.mirrorEvents` (default off) gates all eleven mirror appends; the shared files stay authoritative and model-visible inputs remain covered by the natively logged followup turns. Existing poisoned logs are repairable offline by adding `"ignorable":true` to each `coop/*` line of the zstd JSONL. The proper fix — an append-time ignorable option in core session, or publishing coop so vocabulary and readers move together — is deferred until one of those lands.
+
+## Follow-up: live inbox polling for idle sessions
+
+Session-start alone left an open-but-idle worker blind to signals written after its activation — exactly the master-notifies-worker moment the TUI user watches. CoopService now runs a `ctx.effect` interval (`inboxPollMs`, default 1s) draining every live agent's inbox with a per-session reentrancy guard; non-participants cost one ENOENT read per tick.

@@ -8,6 +8,7 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import { appendSignal, inboxPath } from '../src/index.ts'
 import CoopService from '../src/index.ts'
 import { planPath, readPlanFile, registryPath } from '../src/index.ts'
 
@@ -81,6 +82,26 @@ describe('registration', () => {
   it('fails loud when reading roles without a registry', async () => {
     const { ctx, master } = await harness()
     await expect(ctx.coop.getRoles(master)).rejects.toMatchObject({ code: 'COOP_REGISTRY_MISSING' })
+  })
+
+  it('polling delivers signals to an open-but-idle worker session', async () => {
+    const h = await harness({ inboxPollMs: 20 })
+    const { ctx, cwd, worker } = h
+    await ctx.coop.setRoles(worker, { set: ['worker'] })
+    // A foreign process drops a signal straight into the worker's inbox file.
+    await appendSignal(inboxPath(join(cwd, '.dsh/coop'), String(worker.session.id)), {
+      time: Date.now(),
+      from: 'remote-master',
+      planId: 'plan-x',
+      kind: 'notify',
+      summary: 'cross-process plan',
+      docPath: join(cwd, '.dsh/coop/docs/plan-x.md'),
+    })
+    expect(coopMessages(worker)).toHaveLength(0)
+    await new Promise((resolve) => { setTimeout(resolve, 120) })
+    const texts = coopMessages(worker).filter(text => text.includes('[coop]'))
+    expect(texts).toHaveLength(1)
+    expect(await ctx.coop.drainInbox(worker)).toBe(0)
   })
 
   it('writes no mirror events by default (cross-build resume safety)', async () => {

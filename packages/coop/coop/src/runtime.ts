@@ -9,6 +9,7 @@ export const DEFAULT_ANY_CWD_ROLES: readonly Role[] = ['master', 'worker']
 
 /** Deployment-tunable coop defaults; every value is a validated `Config` field, none are hardcoded at use sites. */
 export interface ResolvedCoopConfig {
+  inboxPollMs: number
   mirrorEvents: boolean
   defaultReviewLevel: ReviewLevel
   docRoot: string
@@ -28,6 +29,7 @@ export interface ResolvedCoopConfig {
  * @returns the resolved config.
  */
 export function resolveCoopConfig(config: {
+  inboxPollMs?: number
   mirrorEvents?: boolean
   defaultReviewLevel?: ReviewLevel
   docRoot?: string
@@ -49,6 +51,7 @@ export function resolveCoopConfig(config: {
     defaultReviewLevel: config.defaultReviewLevel ?? 'standard',
     docRoot: config.docRoot ?? '.dsh/coop',
     allowNoWorker: config.allowNoWorker ?? false,
+    inboxPollMs: positive(config.inboxPollMs, 'inboxPollMs') ?? 1_000,
     staleMs: positive(config.staleMs, 'staleMs') ?? 300_000,
     executingStaleMs: positive(config.executingStaleMs, 'executingStaleMs') ?? 600_000,
     abortAckTimeoutMs: positive(config.abortAckTimeoutMs, 'abortAckTimeoutMs') ?? 120_000,

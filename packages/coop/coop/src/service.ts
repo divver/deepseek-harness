@@ -43,6 +43,8 @@ import { registerCoopTools } from './tools.ts'
 
 /** Raw deployment config; enum and positivity rules are enforced in {@link resolveCoopConfig}. */
 export interface Config {
+  /** Inbox poll cadence for live sessions; watch degradation is a plain timer. */
+  inboxPollMs?: number
   /**
    * Append `coop/*` mirror events to each acting session's log. Off by
    * default: `Session.append` cannot mark events ignorable, so mirrors are
@@ -72,6 +74,7 @@ export const Config: z<Config> = z.object({
   workerSelector: z.string(),
   inboxCompactThreshold: z.number(),
   allowAnyCwdRoles: z.array(z.string()),
+  inboxPollMs: z.number(),
   mirrorEvents: z.boolean(),
 }) as unknown as z<Config>
 
@@ -148,6 +151,19 @@ export class CoopService extends Service {
         this.ctx.logger.warn(`coop: draining inbox for "${String(agent.session.id)}" failed: ${String(error)}`)
       })
     })
+    // An open-but-idle session never re-fires session-start, so poll the live
+    // agents' inboxes too: a plan notification then lands as a woken turn (and
+    // streams straight into that session's TUI) within one poll interval.
+    ctx.effect(() => {
+      const timer = setInterval(() => {
+        this.pollLiveInboxes().catch((error: unknown) => {
+          this.ctx.logger.warn(`coop: inbox poll failed: ${String(error)}`)
+        })
+      }, this.resolved.inboxPollMs)
+      return () => {
+        clearInterval(timer)
+      }
+    }, 'coop:inbox-poll')
   }
 
   /**
@@ -796,6 +812,26 @@ export class CoopService extends Service {
   async drainInbox(agent: Agent): Promise<number> {
     const root = this.rootOf(this.workspaceOf(agent))
     return this.drainAgentInbox(agent, root)
+  }
+
+  /** Session ids with an in-flight drain, so poll ticks never double-deliver. */
+  private readonly draining = new Set<string>()
+
+  /**
+   * Drain every live agent's inbox once per tick. Non-participants cost one
+   * ENOENT read each; failures are logged by the caller and retried next tick.
+   */
+  private async pollLiveInboxes(): Promise<void> {
+    for (const agent of this.ctx.agents.list()) {
+      const id = String(agent.session.id)
+      if (this.draining.has(id)) continue
+      this.draining.add(id)
+      try {
+        await this.drainAgentInbox(agent, this.rootOf(this.workspaceOf(agent)))
+      } finally {
+        this.draining.delete(id)
+      }
+    }
   }
 
   private async drainAgentInbox(agent: Agent, root: string): Promise<number> {
