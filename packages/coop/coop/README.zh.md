@@ -6,7 +6,7 @@
 
 ## 模型
 
-- **注册表** — `.dsh/coop/registry.json` 保存 `{ sessionId, roles, reviewLevel?, updatedAt, heartbeatAt, cwd, cwdScope }`。每个 workspace 只有一个存活 `master`：单例检查在注册表写锁（`withFileLock`）内完成，两个进程不可能同时成为 master。过期条目（`heartbeatAt` 超过 `staleMs`）不再阻塞并可被抢占。`cwdScope: "any"` 的条目同时写入全局表（`$DSH_HOME`/`~/.dsh`），从任意 workspace 可见。
+- **注册表** — `.dsh/coop/registry.json` 保存 `{ sessionId, roles, reviewLevel?, updatedAt, heartbeatAt, cwd, cwdScope }`。每个 workspace 只有一个存活 `master`：单例检查在注册表写锁（`withFileLock`）内完成，两个进程不可能同时成为 master。每个存活 session 都会在轮询周期内触碰心跳（`inboxPollMs`），开着的会话永远可见；过期条目（`heartbeatAt` 超过 `staleMs`）不再阻塞并可被抢占。`cwdScope: "any"` 的条目同时写入全局表（`$DSH_HOME`/`~/.dsh`），从任意 workspace 可见。
 - **计划** — `.dsh/coop/plans/<planId>.json` 是权威计划状态；`.dsh/coop/docs/<planId>.md` 承载人类可读轨迹（Objective / Pre-review / Execution / Verify / Abort / Changelog）。每次状态迁移都在单个 plan 锁内完成校验与提交；模型侧调用者永远见不到冲突、也永远不需要重试。
 - **投递** — 单一路径。通知追加一行信令到 `.dsh/coop/inbox/<sessionId>.jsonl`（单调 `seq`）；接收 session 把水位（`.dsh/coop/inbox/.consumed/<sessionId>`）之上的每一行经 `Agent.followup` 投给自己的 agent——唤醒 driver，并作为真实 turn 落入 transcript。同进程对端立即 drain；每个存活 session 还会按 `inboxPollMs`（默认 1 秒）轮询自己的 inbox，因此开着的空闲 worker 最迟一个轮询周期内就会收到通知，并在它的 TUI 里实时流式渲染出该 turn。追加与水位写的是不同文件，因此既不会丢消息也不会重复投递。
 - **镜像** — `coop/registry`、`coop/plan-change`、`coop/review`、`coop/execution` 追加到执行方 session 的日志，用于审计与回放折叠。它们只是观察记录；任何分歧以共享文件为准。

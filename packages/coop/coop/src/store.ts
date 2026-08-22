@@ -85,8 +85,11 @@ export async function mutateRegistry(
   mutate: (current: CoopRegistryFile | undefined) => CoopRegistryFile | undefined,
 ): Promise<void> {
   await withFileLock(path, async () => {
-    const next = mutate(await readRegistryFile(path))
-    if (next !== undefined) await writeRegistryFile(path, next)
+    const current = await readRegistryFile(path)
+    const next = mutate(current)
+    // Same reference means "nothing changed" (e.g. a heartbeat touch for an
+    // absent entry); skip the pointless rewrite.
+    if (next !== undefined && next !== current) await writeRegistryFile(path, next)
   })
 }
 
@@ -159,10 +162,14 @@ export async function removeEntry(path: string, sessionId: string): Promise<void
 export async function touchHeartbeat(path: string, sessionId: string, now: number): Promise<void> {
   await mutateRegistry(path, (current) => {
     if (current === undefined) return undefined
-    for (const entry of current.entries) {
-      if (entry.sessionId === sessionId) entry.heartbeatAt = now
+    const touched = current.entries.some(entry => entry.sessionId === sessionId)
+    // Return a fresh table only when a heartbeat actually moved, so the
+    // caller's unchanged-reference skip treats absent entries as no-ops.
+    if (!touched) return current
+    return {
+      version: 1,
+      entries: current.entries.map(entry => entry.sessionId === sessionId ? { ...entry, heartbeatAt: now } : entry),
     }
-    return current
   })
 }
 

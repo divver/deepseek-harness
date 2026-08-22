@@ -104,6 +104,29 @@ describe('registration', () => {
     expect(await ctx.coop.drainInbox(worker)).toBe(0)
   })
 
+  it('polling keeps live sessions visible past the stale window', async () => {
+    const h = await harness({ staleMs: 200, inboxPollMs: 20 })
+    const { ctx, cwd, worker } = h
+    await ctx.coop.setRoles(worker, { set: ['worker'] })
+    // Backdate the heartbeat beyond staleMs, as if the session had gone quiet.
+    const regPath = registryPath(join(cwd, '.dsh/coop'))
+    const backdate = async (): Promise<void> => {
+      const raw = JSON.parse(await readFile(regPath, 'utf8')) as { entries: { heartbeatAt: number }[] }
+      for (const entry of raw.entries) entry.heartbeatAt = Date.now() - 60_000
+      await writeFile(regPath, JSON.stringify(raw))
+    }
+    await backdate()
+    const storedAt = JSON.parse(await readFile(regPath, 'utf8')) as { entries: { sessionId: string; heartbeatAt: number }[] }
+    const staleAt = storedAt.entries[0]?.heartbeatAt ?? 0
+
+    // The poll loop touches heartbeats; the entry becomes fresh (and visible) again.
+    await new Promise((resolve) => { setTimeout(resolve, 300) })
+    const refreshed = JSON.parse(await readFile(regPath, 'utf8')) as { entries: { sessionId: string; heartbeatAt: number }[] }
+    expect(refreshed.entries[0]?.heartbeatAt).toBeGreaterThan(staleAt)
+    const visible = await ctx.coop.listWorkspace(worker)
+    expect(visible.map(entry => entry.sessionId)).toEqual([String(worker.session.id)])
+  })
+
   it('writes no mirror events by default (cross-build resume safety)', async () => {
     const { ctx, master } = await harness({ mirrorEvents: false })
     await ctx.coop.setRoles(master, { set: ['master'] })

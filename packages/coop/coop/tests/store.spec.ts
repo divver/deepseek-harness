@@ -44,10 +44,10 @@ describe('registry table', () => {
     const path = registryPath(root)
     expect(await readRegistryFile(path)).toBeUndefined()
     await mutateRegistry(path, () => ({ version: 1, entries: [] }))
-    await mutateRegistry(path, (current) => {
-      current?.entries.push(entry('s1'))
-      return current
-    })
+    await mutateRegistry(path, current => ({
+      version: 1,
+      entries: [...current?.entries ?? [], entry('s1')],
+    }))
     const table = await readRegistryFile(path)
     expect(table?.version).toBe(1)
     expect(table?.entries.map(candidate => candidate.sessionId)).toEqual(['s1'])

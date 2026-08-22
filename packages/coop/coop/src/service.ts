@@ -203,6 +203,28 @@ export class CoopService extends Service {
     return now - entry.heartbeatAt <= this.resolved.staleMs
   }
 
+  /** Per-session throttle behind heartbeat touches: at most one registry write per quarter stale window. */
+  private readonly lastTouch = new Map<string, number>()
+
+  /**
+   * Touch the calling session's registry heartbeat. A live process keeps its
+   * entries fresh by polling; a crashed one stops touching and ages out of
+   * visibility (and master preemption) after `staleMs`.
+   */
+  private async touchOwnEntry(agent: Agent): Promise<void> {
+    const sessionId = String(agent.session.id)
+    const now = Date.now()
+    const last = this.lastTouch.get(sessionId) ?? 0
+    if (now - last < Math.min(this.resolved.staleMs / 4, 30_000)) return
+    this.lastTouch.set(sessionId, now)
+    try {
+      await store.touchHeartbeat(this.localRegistryPath(this.workspaceOf(agent)), sessionId, now)
+    } catch {
+      // A missing/corrupt registry surfaces on the next real operation;
+      // heartbeat loss alone must not break the caller.
+    }
+  }
+
   private async requireRegistry(cwd: string): Promise<void> {
     if (await store.readRegistryFile(this.localRegistryPath(cwd)) === undefined) {
       throw new CoopError(`no coop registry under ${cwd} — register a role first (/coop role ...)`, 'COOP_REGISTRY_MISSING')
@@ -215,6 +237,7 @@ export class CoopService extends Service {
    * @returns the roles held in the shared registry (empty when unregistered).
    */
   async getRoles(agent: Agent): Promise<Role[]> {
+    await this.touchOwnEntry(agent)
     const cwd = this.workspaceOf(agent)
     await this.requireRegistry(cwd)
     const entry = await this.findOwnEntry(cwd, String(agent.session.id))
@@ -314,6 +337,7 @@ export class CoopService extends Service {
    * @returns fresh entries, deduplicated across the local and global tables.
    */
   async listWorkspace(agent: Agent, opts: { all?: boolean } = {}): Promise<CoopRegistryEntry[]> {
+    await this.touchOwnEntry(agent)
     const cwd = this.workspaceOf(agent)
     await this.requireRegistry(cwd)
     const tables = [await store.readRegistryFile(this.localRegistryPath(cwd)),
@@ -839,6 +863,7 @@ export class CoopService extends Service {
       this.draining.add(id)
       try {
         await this.drainAgentInbox(agent, this.rootOf(this.workspaceOf(agent)))
+        await this.touchOwnEntry(agent)
       } finally {
         this.draining.delete(id)
       }
