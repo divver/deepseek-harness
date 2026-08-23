@@ -579,10 +579,11 @@ export class CoopService extends Service {
       // it into a fresh followup turn that per policy begins execution.
       await this.deliver(workerId, workerId, plan, 'drive', `pre-review passed — call coop_execute_begin(planId="${planId}") now, do the work, then coop_execute_report`)
     }
-    await this.deliver(workerId, plan.createdBy, plan, 'pre_review',
+    await this.deliver(workerId, plan.createdBy, plan,
+      decision === 'pass' ? 'pre_review' : 'drive',
       decision === 'pass'
         ? `worker ${workerId} passed pre-review — execution starting; you will be woken to verify.`
-        : `pre-review request_changes${summary === undefined ? '' : `: ${summary}`} — revise via coop_plan_create/update, then re-notify.`)
+        : `pre-review request_changes${summary === undefined ? '' : `: ${summary}`} — revise the plan via coop_plan_create/update, then coop_plan_notify(planId="${planId}") to send it back for review.`)
     return plan
   }
 
@@ -719,7 +720,11 @@ export class CoopService extends Service {
     this.appendMirror(agent.session, 'coop/review', review)
     const workerId = updated.assignedWorkerSessionId
     if (workerId !== undefined) {
-      await this.deliver(masterId, workerId, updated, 'verify', `verify ${decision}${summary === undefined ? '' : `: ${summary}`}`)
+      await this.deliver(masterId, workerId, updated,
+        decision === 'pass' ? 'verify' : 'drive',
+        decision === 'pass'
+          ? 'verify passed — plan closed, nothing further to do.'
+          : `rework requested${summary === undefined ? '' : `: ${summary}`} — call coop_execute_begin(planId="${planId}"), address the feedback, then coop_execute_report`)
     }
     return { ...updated, status: nextStatus }
   }
@@ -822,7 +827,7 @@ export class CoopService extends Service {
   private signalText(entry: CoopInboxEntry): string {
     switch (entry.kind) {
       case 'drive':
-        return `[coop] Plan "${entry.planId}" is approved for execution. ${entry.summary}. Document: ${entry.docPath}.`
+        return `[coop] Plan "${entry.planId}" action required. ${entry.summary}. Document: ${entry.docPath}.`
       case 'notify':
         return `[coop] New plan to pre-review "${entry.planId}" — ${entry.summary} Document: ${entry.docPath}. Call coop_status, then coop_pre_review(planId, decision); on pass, continue straight into execution.`
       case 'pre_review':

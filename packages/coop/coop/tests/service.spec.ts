@@ -179,7 +179,7 @@ describe('plan workflow across two sessions', () => {
     const before = coopMessages(worker).length
     await ctx.coop.submitPreReview(worker, plan.planId, 'pass')
     // The drive signal lands as a fresh woken turn on the worker itself.
-    const drives = coopMessages(worker).filter(text => text.includes('approved for execution') && text.includes('coop_execute_begin'))
+    const drives = coopMessages(worker).filter(text => text.includes('action required') && text.includes('coop_execute_begin'))
     expect(drives).toHaveLength(1)
     expect(coopMessages(worker).length - before).toBe(1)
     expect(coopMessages(master).some(text => text.includes('execution starting'))).toBe(true)
@@ -196,7 +196,8 @@ describe('plan workflow across two sessions', () => {
       .rejects.toMatchObject({ code: 'COOP_NOT_PLAN_OWNER' })
     const rework = await ctx.coop.verifyPlan(master, plan.planId, 'request_changes', 'more tests')
     expect(rework.status).toBe('needs_rework')
-    expect(coopMessages(worker).some(text => text.includes('verify request_changes'))).toBe(true)
+    const reworkDrive = coopMessages(worker).filter(text => text.includes('rework requested') && text.includes('coop_execute_begin'))
+    expect(reworkDrive.length).toBeGreaterThanOrEqual(1)
     await ctx.coop.beginExecution(worker, plan.planId)
     const done = await ctx.coop.reportExecution(worker, plan.planId, 'second attempt')
     expect(done.status).toBe('pending_verify')
