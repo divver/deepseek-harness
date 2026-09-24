@@ -6932,6 +6932,160 @@
       }
     },
     {
+      "key": "event:coop/registry-v2",
+      "kind": "event",
+      "event": "coop/registry-v2",
+      "surface": false,
+      "digest": "0ce6406452e6fb7f9def9a448b566be4390c402890eaeef72596a64d246c4a57",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 17,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 16,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 16,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 18,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "bindState",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "masterId",
+                "type": 5,
+                "optional": true
+              },
+              {
+                "name": "op",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "roles",
+                "type": 11,
+                "optional": false
+              },
+              {
+                "name": "updatedAt",
+                "type": 16,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "union",
+            "types": [
+              3,
+              4
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "bound"
+          },
+          {
+            "kind": "literal",
+            "value": "unbound"
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "union",
+            "types": [
+              7,
+              8,
+              9,
+              10
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "bind"
+          },
+          {
+            "kind": "literal",
+            "value": "off"
+          },
+          {
+            "kind": "literal",
+            "value": "register"
+          },
+          {
+            "kind": "literal",
+            "value": "release"
+          },
+          {
+            "kind": "array",
+            "element": 12
+          },
+          {
+            "kind": "union",
+            "types": [
+              13,
+              14,
+              15
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "master"
+          },
+          {
+            "kind": "literal",
+            "value": "reviewer"
+          },
+          {
+            "kind": "literal",
+            "value": "worker"
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "coop/registry-v2"
+          }
+        ]
+      }
+    },
+    {
       "key": "event:coop/review",
       "kind": "event",
       "event": "coop/review",
@@ -23731,6 +23885,172 @@
       "sources": []
     },
     {
+      "digest": "0c82007861a2592592f9ea29e78e6b2f3a61415908ef3c4e54f46d99d4f52ba9",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "bind"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "0ce6406452e6fb7f9def9a448b566be4390c402890eaeef72596a64d246c4a57",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 17,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 16,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 16,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 18,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "bindState",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "masterId",
+                "type": 5,
+                "optional": true
+              },
+              {
+                "name": "op",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "roles",
+                "type": 11,
+                "optional": false
+              },
+              {
+                "name": "updatedAt",
+                "type": 16,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "union",
+            "types": [
+              3,
+              4
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "bound"
+          },
+          {
+            "kind": "literal",
+            "value": "unbound"
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "union",
+            "types": [
+              7,
+              8,
+              9,
+              10
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "bind"
+          },
+          {
+            "kind": "literal",
+            "value": "off"
+          },
+          {
+            "kind": "literal",
+            "value": "register"
+          },
+          {
+            "kind": "literal",
+            "value": "release"
+          },
+          {
+            "kind": "array",
+            "element": 12
+          },
+          {
+            "kind": "union",
+            "types": [
+              13,
+              14,
+              15
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "master"
+          },
+          {
+            "kind": "literal",
+            "value": "reviewer"
+          },
+          {
+            "kind": "literal",
+            "value": "worker"
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "coop/registry-v2"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "0cf589f0abe2af957a5222b7d13b5e9603643027c321a11fd9528e0c894a286e",
       "schema": {
         "root": 0,
@@ -33885,6 +34205,123 @@
       "sources": []
     },
     {
+      "digest": "223ac5339a1a41764a72f1f3bc676a36305b2659a6bb13910e84c23a6c919d1f",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "bindState",
+                "type": 1,
+                "optional": true
+              },
+              {
+                "name": "masterId",
+                "type": 4,
+                "optional": true
+              },
+              {
+                "name": "op",
+                "type": 5,
+                "optional": false
+              },
+              {
+                "name": "roles",
+                "type": 10,
+                "optional": false
+              },
+              {
+                "name": "updatedAt",
+                "type": 15,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "union",
+            "types": [
+              2,
+              3
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "unbound"
+          },
+          {
+            "kind": "literal",
+            "value": "bound"
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "union",
+            "types": [
+              6,
+              7,
+              8,
+              9
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "bind"
+          },
+          {
+            "kind": "literal",
+            "value": "off"
+          },
+          {
+            "kind": "literal",
+            "value": "register"
+          },
+          {
+            "kind": "literal",
+            "value": "release"
+          },
+          {
+            "kind": "array",
+            "element": 11
+          },
+          {
+            "kind": "union",
+            "types": [
+              12,
+              13,
+              14
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "reviewer"
+          },
+          {
+            "kind": "literal",
+            "value": "worker"
+          },
+          {
+            "kind": "literal",
+            "value": "master"
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          }
+        ]
+      },
+      "names": [
+        "packages/coop/coop/src/types.ts#CoopV2RegistryEventData"
+      ],
+      "sources": [
+        "packages/coop/coop/src/types.ts:216"
+      ]
+    },
+    {
       "digest": "224aa11d4d5f88c450822d01b99e6ca5e3a9c7f26a5ede10bae33384a09ef4dc",
       "schema": {
         "root": 0,
@@ -37909,6 +38346,40 @@
       },
       "names": [],
       "sources": []
+    },
+    {
+      "digest": "2b90fe43705b8adad5eb8fa18c7f72aeceb3796f982dbd160544bf0f8bbf7f1b",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "union",
+            "types": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "master"
+          },
+          {
+            "kind": "literal",
+            "value": "reviewer"
+          },
+          {
+            "kind": "literal",
+            "value": "worker"
+          }
+        ]
+      },
+      "names": [
+        "packages/coop/coop/src/types.ts#V2Role"
+      ],
+      "sources": [
+        "packages/coop/coop/src/types.ts:163"
+      ]
     },
     {
       "digest": "2c4c21f19f426a58f2dac914e34313aa43f8408972de857a486d1f086d5adb6c",
@@ -42637,6 +43108,40 @@
       "sources": []
     },
     {
+      "digest": "367695c3f6620b1673ba0d7cdf9180d1751ecd11b432c918713326a6ca3c3fc9",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "array",
+            "element": 1
+          },
+          {
+            "kind": "union",
+            "types": [
+              2,
+              3,
+              4
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "master"
+          },
+          {
+            "kind": "literal",
+            "value": "reviewer"
+          },
+          {
+            "kind": "literal",
+            "value": "worker"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "36d6a9a871d949ea4f3edd919d81d66aa69218bebef38899d2a1282c39420a1f",
       "schema": {
         "root": 0,
@@ -43075,6 +43580,31 @@
       "sources": [
         "packages/feedback/message-feedback/src/types.ts:17"
       ]
+    },
+    {
+      "digest": "39eb8076a5c96994386f7a18395bf0d3ec224f7e54df52afc1273120b5d0133a",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "union",
+            "types": [
+              1,
+              2
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "bound"
+          },
+          {
+            "kind": "literal",
+            "value": "unbound"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
     },
     {
       "digest": "3abae7324356f155cb42450c00b806d134ec93bd6439d2063b8d724162d58604",
@@ -44801,6 +45331,20 @@
       ]
     },
     {
+      "digest": "471581d8cce4fb2263106aa3eb0390056e110cbedb3b57fe15a5fa27d39305d6",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "release"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "4715b8fc59c832514a51bb510c4912f8c1d3e9b7359dad86866b428d2e76fa9a",
       "schema": {
         "root": 0,
@@ -46301,6 +46845,20 @@
       "sources": [
         "packages/llm/llm/src/assistant-stream.ts:44"
       ]
+    },
+    {
+      "digest": "48afb9ebc9ec5fe87592a70caa35fb7da4adb05cada0eb9dabeb3a7dce35e421",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "off"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
     },
     {
       "digest": "48e5c9861f16ac07e78cb7b5ae9dabdf7bb85c58baed5a51b4ad275050ea58e3",
@@ -56391,6 +56949,41 @@
       ]
     },
     {
+      "digest": "5df34d962a8b04509216e38a95f8e597d1b901c3a91c0c8fa35ca9f411c94fdf",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "union",
+            "types": [
+              1,
+              2,
+              3,
+              4
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "bind"
+          },
+          {
+            "kind": "literal",
+            "value": "off"
+          },
+          {
+            "kind": "literal",
+            "value": "register"
+          },
+          {
+            "kind": "literal",
+            "value": "release"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "5e6db6e24948d4a853c71cb9fabd252ad051ce93d4672c1266cf837c1c17b84e",
       "schema": {
         "root": 0,
@@ -57446,6 +58039,20 @@
       "sources": [
         "packages/skill/skill/src/index.ts:146"
       ]
+    },
+    {
+      "digest": "675ba628ce917fe16bca43b2558840086a5bc2cfed8fa6669993b988fefccd61",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "coop/registry-v2"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
     },
     {
       "digest": "67d5f73ceae82f5265258142ad6cf172de2c1fef93ba551b7f0454e0a93bffe0",
@@ -69008,6 +69615,20 @@
       ]
     },
     {
+      "digest": "898111ebe8e5eec479d78fe8526df5e0e039d785cae83c93f547261cfedd48bd",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "bound"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "89a9812450699683b42f6b44338741bd26726a8215a1aebe2c27e34e8e2617eb",
       "schema": {
         "root": 0,
@@ -72370,6 +72991,20 @@
           {
             "kind": "literal",
             "value": "command/done"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "8d0cc4a8fd38b61c46b484360352e3fd45332eee6c6f0896cff9f707350a9653",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "reviewer"
           }
         ]
       },
@@ -90790,6 +91425,20 @@
       "sources": []
     },
     {
+      "digest": "dca66b4f3ac10b061ec9647a286697903a3be2504e71641c8051dd2a7304ce54",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "register"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "dd2780e7e07684332f7a9ab047237798d260e7eaffb1321cb38eca695d184c3d",
       "schema": {
         "root": 0,
@@ -97273,6 +97922,20 @@
       "sources": [
         "packages/llm/llm/src/types.ts:397"
       ]
+    },
+    {
+      "digest": "f34f155376a33081be80777d4d2ca0d2f5732564618e87d49692773a79d30554",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "unbound"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
     },
     {
       "digest": "f4a66f654996c093aae700ea4c434ff2ee3569fea9c0e5813ccf6afdccabd163",

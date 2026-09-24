@@ -91,7 +91,7 @@ export interface CoopInboxEntry {
   time: number
   from: string
   planId: string
-  kind: 'drive' | 'notify' | 'pre_review' | 'verify' | 'execution' | 'abort'
+  kind: 'drive' | 'notify' | 'pre_review' | 'verify' | 'execution' | 'abort' | 'node'
   summary: string
   docPath: string
   reason?: string
@@ -138,13 +138,19 @@ export type CoopErrorCode =
   | 'COOP_ANY_CWD_FORBIDDEN'
   | 'COOP_REMOTE_DRIVE_FORBIDDEN'
   | 'COOP_DOC_PATH_OUTSIDE_WORKSPACE'
-  | 'COOP_PLAN_NOT_FOUND'
-  | 'COOP_CONFIG_UNSUPPORTED'
+    | 'COOP_PLAN_NOT_FOUND'
+    | 'COOP_CONFIG_UNSUPPORTED'
+    | 'COOP_NODE_NOT_FOUND'
+    | 'COOP_NODE_ALREADY_BOUND'
+    | 'COOP_NODE_LIMIT_REACHED'
+    | 'COOP_NOT_YOUR_NODE'
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
     /** Registry mutation mirror; audit and fold tests read it, authority stays in the shared file. */
     'coop/registry': CoopRegistryEventData
+    /** v2 registry mutation mirror (roles, bind, release). */
+    'coop/registry-v2': CoopV2RegistryEventData
     /** Shared-plan mutation mirror. */
     'coop/plan-change': CoopPlanChangeEventData
     /** Review-phase outcome mirror. */
@@ -152,4 +158,65 @@ declare module '@deepseek-ai/dsh-session/types' {
     /** Execution report mirror. */
     'coop/execution': CoopExecutionEventData
   }
+}
+/** A v2 cooperation role: master orchestrates, worker executes, reviewer gates. */
+export type V2Role = 'master' | 'worker' | 'reviewer'
+
+/** Whether a v2 node is adoptable by any master or exclusively owned by one. */
+export type BindState = 'unbound' | 'bound'
+
+/** Branded master identifier (`<slug>#<short-uuid>`); the v2 isolation unit. */
+export type MasterId = Branded<'CoopMasterId'>
+
+/** One entry of the v2 workspace-shared node registry. */
+export interface CoopV2RegistryEntry {
+  /** Session id of the registered agent (shared agent/session id space). */
+  sessionId: string
+  /** Roles held by that session; masters hold exactly `['master']`. */
+  roles: V2Role[]
+  /** Owning master for bound nodes; the master's own id for master nodes. */
+  masterId?: MasterId
+  /** Exclusive ownership marker; `unbound` nodes are visible to every master. */
+  bindState: BindState
+  /** Normalized absolute cwd the node registered from. */
+  cwd: string
+  /** Whether the node talks only inside its cwd or across workspaces. */
+  cwdScope: CwdScope
+  /** Last registry mutation, epoch ms. */
+  updatedAt: number
+  /** Liveness heartbeat touched by the owning session, epoch ms. */
+  heartbeatAt: number
+  /** Optional registration metadata; `model` is the LlmAdapter route string. */
+  meta?: { model?: string; provider?: string; pid?: number; host?: string }
+}
+
+/** On-disk shape of `.dsh/coop/v2/registry.json` and the global any-scope v2 table. */
+export interface CoopV2RegistryFile {
+  version: 2
+  entries: CoopV2RegistryEntry[]
+}
+
+/** Workspace anchor evidence: `<root>/.dsh/coop/workspace.json`, written only by `/coop workspace init`. */
+export interface CoopWorkspaceFile {
+  version: 2
+  root: string
+  createdAt: number
+}
+
+/** One master's durable profile under `v2/masters/<masterId>/profile.json`. */
+export interface CoopV2MasterProfile {
+  masterId: MasterId
+  sessionId: string
+  displayName: string
+  createdAt: number
+  status: 'active' | 'retired'
+}
+
+/** Per-session mirror of a v2 registry mutation (audit only; the shared file is authority). */
+export interface CoopV2RegistryEventData {
+  op: 'register' | 'bind' | 'release' | 'off'
+  roles: V2Role[]
+  masterId?: string
+  bindState?: BindState
+  updatedAt: number
 }

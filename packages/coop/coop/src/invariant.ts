@@ -94,6 +94,9 @@ function validateEvent(event: SessionEvent, fail: InvariantFailure): void {
     case 'coop/registry':
       validateRegistry(event.data as never, fail)
       break
+    case 'coop/registry-v2':
+      validateV2Registry(event.data as never, fail)
+      break
     case 'coop/plan-change':
       if (validatePlanRef(event.data as never, fail)) {
         const op = (event.data as { op?: unknown }).op
@@ -134,3 +137,25 @@ const install: InvariantInstaller = Object.assign((ctx: Context, fail: Invariant
  */
 export const apply = (ctx: Context): Promise<() => void> =>
   Promise.resolve(ctx.invariants.register(PACKAGE_NAME, install))
+const V2_ROLES = new Set(['master', 'worker', 'reviewer'])
+const V2_OPS = new Set(['register', 'bind', 'release', 'off'])
+const BIND_STATES = new Set(['unbound', 'bound'])
+/** Validate one `coop/registry-v2` mirror payload. */
+function validateV2Registry(value: Record<string, unknown>, fail: InvariantFailure): void {
+  const op = value['op']
+  if (typeof op !== 'string' || !V2_OPS.has(op)) return fail(`coop/registry-v2 carries unknown op ${JSON.stringify(op)}`)
+  const roles = value['roles']
+  if (!Array.isArray(roles)) return fail('coop/registry-v2 roles must be an array')
+  for (const role of roles) {
+    if (typeof role !== 'string' || !V2_ROLES.has(role)) fail(`coop/registry-v2 carries unknown role ${JSON.stringify(role)}`)
+  }
+  if (typeof value['updatedAt'] !== 'number') fail('coop/registry-v2 updatedAt must be a number')
+  const bindState = value['bindState']
+  if (bindState !== undefined && (typeof bindState !== 'string' || !BIND_STATES.has(bindState))) {
+    fail(`coop/registry-v2 carries unknown bindState ${JSON.stringify(bindState)}`)
+  }
+  const masterId = value['masterId']
+  if (masterId !== undefined && typeof masterId !== 'string') {
+    fail(`coop/registry-v2 masterId must be a string, got ${typeof masterId}`)
+  }
+}

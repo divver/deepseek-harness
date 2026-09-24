@@ -377,3 +377,183 @@ function describePlan(plan: {
   const last = plan.history?.at(-1)
   return `${plan.planId} "${plan.title}" — ${plan.status}${plan.assignedWorkerSessionId === undefined ? '' : ` (worker ${plan.assignedWorkerSessionId})`}${last === undefined ? '' : `; last: ${last.op}`}`
 }
+
+/**
+ * Register the v2 coop tools: the node registry (register/list/bind/release)
+ * and status. These replace the v1 eleven while `mode: "v2"` is in force;
+ * plan/task tooling arrives with later phases.
+ * @param ctx - context carrying the tool registry child.
+ * @param service - owning coop service performing the transitions.
+ */
+export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
+  const needAgent = (exec: { agent?: NonAgent }): Agent => {
+    if (exec.agent === undefined) throw new Error('coop tools require an owning agent session')
+    return exec.agent
+  }
+  const failMessage = (error: unknown): string =>
+    error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+
+  ctx.tools.register(defineTool({
+    name: 'coop_register',
+    description: 'Register THIS session as a coop v2 node: master (orchestrate), worker (execute), or reviewer (gate). Empty roles deregister. Workers/reviewers stay unbound until a master binds them.',
+    parameters: {
+      roles: {
+        type: 'array',
+        required: true,
+        description: 'Roles to hold after this call; empty deregisters.',
+        items: { type: 'string', enum: ['master', 'worker', 'reviewer'] },
+      },
+      masterId: {
+        type: 'string',
+        description: 'Pre-bind to this master id at registration (workers/reviewers only).',
+      },
+      model: {
+        type: 'string',
+        description: 'Model route string recorded on your node for orchestration defaults.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          roles: { type: 'array', items: { type: 'string' }, required: true },
+          bindState: { type: 'string' },
+          masterId: { type: 'string' },
+        },
+      },
+      render: (_args, value) => textOut(`coop v2 node: ${value.roles.join(', ') || '(none — deregistered)'}${value.masterId === undefined ? '' : ` [${String(value.bindState)} to ${value.masterId}]`}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const entry = await service.registerV2(agent, {
+          roles: args.roles,
+          ...(args.masterId === undefined ? {} : { masterId: args.masterId }),
+          ...(args.model === undefined ? {} : { model: args.model }),
+        })
+        return {
+          roles: entry.roles,
+          ...(entry.masterId === undefined ? {} : { bindState: entry.bindState, masterId: String(entry.masterId) }),
+        }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Register coop v2 node', kind: 'other', rawInput: args.roles }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_list',
+    description: 'List coop v2 nodes visible to you: your own master\'s nodes plus every unbound worker/reviewer.',
+    parameters: {
+      unbound: { type: 'boolean', description: 'Only show adoptable unbound nodes.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          count: { type: 'integer', required: true },
+          detail: { type: 'array', required: true, items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => textOut(value.count === 0 ? 'No visible coop nodes.' : `${value.count} visible coop node(s):\n${value.detail.join('\n')}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      const entries = await service.listNodesV2(agent, { ...(args.unbound === true ? { unboundOnly: true } : {}) })
+      return {
+        count: entries.length,
+        detail: entries.map(entry => `${entry.sessionId}: ${entry.roles.join('+')} [${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}]`),
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_bind',
+    description: 'Adopt one unbound worker/reviewer node for your master (master only). Binding is exclusive: the node becomes visible to your master alone.',
+    parameters: {
+      sessionId: { type: 'string', required: true, description: 'Session id of the unbound node to adopt.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          sessionId: { type: 'string', required: true },
+          bindState: { type: 'string', required: true },
+          masterId: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => textOut(`node ${value.sessionId} bound to ${value.masterId}.`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const bound = await service.bindNode(agent, args.sessionId)
+        return { sessionId: bound.sessionId, bindState: bound.bindState, masterId: String(bound.masterId) }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Bind coop node', kind: 'other', rawInput: args.sessionId }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_release',
+    description: 'Return one bound node to the unbound pool (its owning master only).',
+    parameters: {
+      sessionId: { type: 'string', required: true, description: 'Session id of the bound node to release.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { sessionId: { type: 'string', required: true }, released: { type: 'boolean', required: true } },
+      },
+      render: (_args, value) => textOut(`node ${value.sessionId} released to the unbound pool.`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        await service.releaseNode(agent, args.sessionId)
+        return { sessionId: args.sessionId, released: true }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Release coop node', kind: 'other', rawInput: args.sessionId }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_status',
+    description: 'Summarize this workspace\'s coop v2 state: your node, live masters, your bound nodes, and the adoptable unbound count.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          self: { type: 'string' },
+          masters: { type: 'integer', required: true },
+          ownNodes: { type: 'integer', required: true },
+          unbound: { type: 'integer', required: true },
+        },
+      },
+      render: (_args, value) => textOut(`${value.self ?? 'unregistered'} · masters: ${String(value.masters)} · your nodes: ${String(value.ownNodes)} · unbound: ${String(value.unbound)}`),
+    },
+    async execute(_args, exec) {
+      const agent = needAgent(exec)
+      const status = await service.statusV2(agent)
+      return {
+        ...(status.self === undefined
+          ? {}
+          : { self: `${status.self.roles.join('+')} [${status.self.bindState}${status.self.masterId === undefined ? '' : ` → ${String(status.self.masterId)}`}]` }),
+        masters: status.masters.length,
+        ownNodes: status.own.length,
+        unbound: status.unbound,
+      }
+    },
+  }))
+}

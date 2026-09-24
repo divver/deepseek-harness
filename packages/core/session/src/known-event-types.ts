@@ -36,6 +36,7 @@ export const KNOWN_SESSION_EVENT_TYPES: ReadonlySet<string> = new Set([
   'coop/execution',
   'coop/plan-change',
   'coop/registry',
+  'coop/registry-v2',
   'coop/review',
   'deliverables/presented',
   'developer/message',

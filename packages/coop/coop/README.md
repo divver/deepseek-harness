@@ -42,6 +42,19 @@ All fields optional; enum and positivity rules fail loud at load.
 | `workerSelector` | `earliest` | `earliest` or `round-robin` first-notify binding |
 | `inboxCompactThreshold` | `256` | Delivered signal lines before compaction |
 | `allowAnyCwdRoles` | `[master, worker]` | Roles allowed to declare `cwdScope: "any"` |
+| `mode` | `v1` | `v2` selects the multi-master node registry (see below) |
+| `maxWorkers` | `4` | v2 per-master worker capacity enforced at bind and registration |
+| `maxReviewers` | `2` | v2 per-master reviewer capacity enforced at bind and registration |
+
+## v2 mode (P0 shipped)
+
+Set `mode: "v2"` to switch to the multi-master node registry ([spec](../../../.agents/specs/2026-09-24-coop-v2-multi-master-dag.md)). P0 ships the registry layer; plan/DAG, worktrees, reviewer gates, and memory arrive with later phases.
+
+- **Roles** — `master` / `worker` / `reviewer` register into `.dsh/coop/v2/registry.json`. A master mints a `masterId` (`<slug>#<uuid>`); workers/reviewers land `unbound`.
+- **Exclusive bind** — `coop_bind` adopts an unbound node under the registry writer lock; once bound, the node is visible to that master alone (isolation is enforced by visibility). `coop_release` returns it to the unbound pool; capacity follows `maxWorkers` / `maxReviewers`.
+- **Workspace anchor** — nodes resolve the nearest `.dsh/coop/workspace.json` walking up from the session cwd, else the cwd itself. A parent directory becomes a workspace only via `/coop workspace init [path]` — never silently.
+- **Commands** — `/coop master|worker|reviewer [--master <id>] [--model <route>] [--any-cwd]`, `/coop list [--unbound]`, `/coop bind|release <sessionId>`, `/coop status`, `/coop off`, `/coop workspace init [path]`.
+- **Tools** — `coop_register`, `coop_list`, `coop_bind`, `coop_release`, `coop_status`; the v1 eleven are not registered in v2 mode.
 
 ## Human commands
 

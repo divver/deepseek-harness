@@ -190,6 +190,65 @@ async abortAck(agent: Agent, planId: string): Promise<CoopPlanFile>
  * @returns how many previously undelivered signals were delivered.
  */
 async drainInbox(agent: Agent): Promise<number>
+
+/**
+     * Explicitly anchor a workspace root for this session's directory tree.
+     * Never invoked implicitly — the anchor file is the only marker later
+     * sessions use to adopt this root (spec §3.1/§12.5: a parent directory is
+     * never claimed silently).
+     * @param agent - anchoring live agent.
+     * @param target - explicit root; defaults to the session cwd's parent.
+     * @returns the anchored workspace root.
+     */
+async initWorkspace(agent: Agent, target?: string): Promise<string>
+
+/**
+     * Register this session as a v2 node. A master mints (or resumes) its
+     * masterId and profile; a worker/reviewer lands `unbound` for any master to
+     * adopt, or pre-bound when `masterId` names a live master with spare
+     * capacity. Empty roles deregister.
+     * @param agent - registering live agent.
+     * @param req - target roles, optional owning master, model route, and directory scope.
+     * @returns the committed registry entry.
+     */
+async registerV2( agent: Agent, req: { roles: V2Role[]; masterId?: string; model?: string; cwdScope?: CwdScope }, ): Promise<CoopV2RegistryEntry>
+
+/**
+     * Nodes visible to the caller under v2 isolation: a master sees itself, its
+     * bound nodes, and every `unbound` worker/reviewer (the only globally
+     * visible window); a worker/reviewer sees itself and its owning master.
+     * @param agent - querying live agent.
+     * @param opts - `unboundOnly` keeps just adoptable nodes.
+     * @returns fresh entries in scope.
+     */
+async listNodesV2(agent: Agent, opts: { unboundOnly?: boolean } = {}): Promise<CoopV2RegistryEntry[]>
+
+/**
+     * Adopt one `unbound` worker/reviewer for the calling master. The bind
+     * commits under the registry writer lock; once bound, the node disappears
+     * from every other master's view — isolation is enforced by visibility, not
+     * by a second lock domain.
+     * @param agent - binding live master.
+     * @param sessionId - target node session id.
+     * @returns the bound entry.
+     */
+async bindNode(agent: Agent, sessionId: string): Promise<CoopV2RegistryEntry>
+
+/**
+     * Return one bound node to the `unbound` pool; only its owning master may.
+     * @param agent - releasing live master.
+     * @param sessionId - target node session id.
+     */
+async releaseNode(agent: Agent, sessionId: string): Promise<void>
+
+/**
+     * Human/model summary across the workspace: live masters, the caller's own
+     * nodes, and the adoptable unbound count. Cross-master detail stays
+     * summarized — isolation applies to agents, not to the human operator.
+     * @param agent - querying live agent.
+     * @returns the caller's entry, master ids, own nodes, and unbound count.
+     */
+async statusV2(agent: Agent): Promise<{ self: CoopV2RegistryEntry | undefined masters: string[] own: CoopV2RegistryEntry[] unbound: number }>
 ```
 
 Types: [Agent](core.md)

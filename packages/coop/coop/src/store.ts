@@ -11,7 +11,7 @@
 import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { writeFileAtomic, withFileLock } from '@deepseek-ai/dsh-atomic-write'
-import type { CoopInboxEntry, CoopPlanFile, CoopRegistryEntry, CoopRegistryFile } from './types.ts'
+import type { CoopInboxEntry, CoopPlanFile, CoopRegistryEntry, CoopRegistryFile, CoopV2MasterProfile, CoopV2RegistryFile, CoopWorkspaceFile } from './types.ts'
 
 /** Whether one caught read failure is the plain absence of the file. */
 function isMissing(error: unknown): boolean {
@@ -379,4 +379,196 @@ export async function appendDocSection(docPath: string, text: string): Promise<v
     const glue = existing.length === 0 || existing.endsWith('\n\n') ? '' : existing.endsWith('\n') ? '\n' : '\n\n'
     await writeFileAtomic(docPath, existing + glue + text, { mode: FILE_MODE })
   })
+}
+
+// ---- v2 namespace: multi-master node registry and workspace anchor ----
+
+/**
+ * The v2 registry path under one workspace v2 root.
+ * @param root - absolute v2 root (`<workspace>/.dsh/coop/v2`).
+ * @returns the v2 registry file path.
+ */
+export function v2RegistryPath(root: string): string {
+  return join(root, 'registry.json')
+}
+
+/**
+ * The global any-scope v2 registry path.
+ * @param home - resolved harness home.
+ * @returns the global v2 registry file path.
+ */
+export function globalV2RegistryPath(home: string): string {
+  return join(home, 'coop', 'v2', 'registry.json')
+}
+
+/**
+ * The workspace anchor file path.
+ * @param workspaceRoot - candidate workspace root.
+ * @param docRoot - configured doc root relative to the workspace.
+ * @returns the `workspace.json` path.
+ */
+export function workspaceAnchorPath(workspaceRoot: string, docRoot: string): string {
+  return join(workspaceRoot, docRoot, 'workspace.json')
+}
+
+/**
+ * One master's profile path under the v2 root.
+ * @param root - absolute v2 root.
+ * @param masterId - owning master id.
+ * @returns the profile JSON path.
+ */
+export function masterProfilePath(root: string, masterId: string): string {
+  return join(root, 'masters', masterId, 'profile.json')
+}
+
+/**
+ * Read and validate one v2 registry table.
+ * @param path - v2 registry file path.
+ * @returns the parsed table, or `undefined` when absent.
+ * @throws when the file exists but is not a version-2 registry table.
+ */
+export async function readV2Registry(path: string): Promise<CoopV2RegistryFile | undefined> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
+    if (isMissing(error)) return undefined
+    throw error
+  }
+  const parsed = JSON.parse(raw) as Partial<CoopV2RegistryFile> & Record<string, unknown>
+  if (parsed.version !== 2 || !Array.isArray(parsed.entries)) {
+    throw new Error(`coop v2 registry at ${path} is not a version-2 registry table`)
+  }
+  return parsed as CoopV2RegistryFile
+}
+
+/**
+ * Atomically replace one v2 registry table.
+ * @param path - v2 registry file path.
+ * @param file - complete next table.
+ */
+export async function writeV2Registry(path: string, file: CoopV2RegistryFile): Promise<void> {
+  await writeFileAtomic(path, `${JSON.stringify(file, null, 2)}\n`, { mode: FILE_MODE, dirMode: DIR_MODE })
+}
+
+/**
+ * Run one locked read-check-write cycle over a v2 registry table. The mutator
+ * sees the current table and returns the next table (or `undefined` to leave
+ * it untouched) plus a value computed from the locked state, so bind/release
+ * exclusivity and capacity checks share one lock with the write.
+ * @param path - v2 registry file path.
+ * @param mutate - locked transition returning `{ next, value }`.
+ * @returns the mutator's value.
+ */
+export async function mutateV2Registry<T>(
+  path: string,
+  mutate: (current: CoopV2RegistryFile | undefined) => { next?: CoopV2RegistryFile; value: T },
+): Promise<T> {
+  // The lock file lives beside the registry; both appear with the first
+  // mutation, so create the directory before acquiring the lock (the v1
+  // tables are pre-created by their first caller instead).
+  await mkdir(dirname(path), { recursive: true, mode: DIR_MODE })
+  return withFileLock(path, async () => {
+    const current = await readV2Registry(path)
+    const { next, value } = mutate(current)
+    if (next !== undefined && next !== current) await writeV2Registry(path, next)
+    return value
+  })
+}
+
+/**
+ * Touch one session's v2 heartbeat without disturbing other fields.
+ * @param path - v2 registry file path.
+ * @param sessionId - owning session.
+ * @param now - epoch ms to stamp.
+ */
+export async function touchHeartbeatV2(path: string, sessionId: string, now: number): Promise<void> {
+  await mutateV2Registry(path, (current) => {
+    if (current === undefined) return { value: undefined }
+    const touched = current.entries.some(entry => entry.sessionId === sessionId)
+    if (!touched) return { value: undefined }
+    return {
+      next: { version: 2, entries: current.entries.map(entry => entry.sessionId === sessionId ? { ...entry, heartbeatAt: now } : entry) },
+      value: undefined,
+    }
+  })
+}
+
+/**
+ * Read and validate one workspace anchor file.
+ * @param path - `workspace.json` path.
+ * @returns the parsed anchor, or `undefined` when absent.
+ * @throws when the file exists but is not a version-2 workspace file.
+ */
+export async function readWorkspaceFile(path: string): Promise<CoopWorkspaceFile | undefined> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
+    if (isMissing(error)) return undefined
+    throw error
+  }
+  const parsed = JSON.parse(raw) as Partial<CoopWorkspaceFile> & Record<string, unknown>
+  if (parsed.version !== 2 || typeof parsed.root !== 'string') {
+    throw new Error(`coop workspace anchor at ${path} is not a version-2 workspace file`)
+  }
+  return parsed as CoopWorkspaceFile
+}
+
+/**
+ * Atomically write one workspace anchor file.
+ * @param path - `workspace.json` path.
+ * @param file - complete anchor content.
+ */
+export async function writeWorkspaceFile(path: string, file: CoopWorkspaceFile): Promise<void> {
+  await writeFileAtomic(path, `${JSON.stringify(file, null, 2)}\n`, { mode: FILE_MODE, dirMode: DIR_MODE })
+}
+
+/**
+ * Resolve the workspace root for one cwd: walk up until a `workspace.json`
+ * anchor exists (explicit workspace), else the cwd itself (single-project
+ * fallback). The anchor is never created here — only `/coop workspace init`
+ * writes it, so a parent directory is never claimed silently.
+ * @param startCwd - normalized session cwd.
+ * @param docRoot - configured doc root relative to a candidate root.
+ * @returns the workspace root plus whether an anchor evidenced it.
+ */
+export async function findWorkspaceRoot(startCwd: string, docRoot: string): Promise<{ root: string; explicit: boolean }> {
+  let dir = startCwd
+  for (;;) {
+    if (await readWorkspaceFile(workspaceAnchorPath(dir, docRoot)) !== undefined) return { root: dir, explicit: true }
+    const parent = dirname(dir)
+    if (parent === dir) return { root: startCwd, explicit: false }
+    dir = parent
+  }
+}
+
+/**
+ * Read one master profile.
+ * @param path - profile JSON path.
+ * @returns the parsed profile, or `undefined` when absent.
+ * @throws when the file exists but is malformed.
+ */
+export async function readMasterProfile(path: string): Promise<CoopV2MasterProfile | undefined> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
+    if (isMissing(error)) return undefined
+    throw error
+  }
+  const parsed = JSON.parse(raw) as Partial<CoopV2MasterProfile> & Record<string, unknown>
+  if (typeof parsed.masterId !== 'string' || typeof parsed.sessionId !== 'string' || typeof parsed.status !== 'string') {
+    throw new Error(`coop master profile at ${path} is malformed`)
+  }
+  return parsed as CoopV2MasterProfile
+}
+
+/**
+ * Atomically write one master profile.
+ * @param path - profile JSON path.
+ * @param profile - complete next profile.
+ */
+export async function writeMasterProfile(path: string, profile: CoopV2MasterProfile): Promise<void> {
+  await writeFileAtomic(path, `${JSON.stringify(profile, null, 2)}\n`, { mode: FILE_MODE, dirMode: DIR_MODE })
 }

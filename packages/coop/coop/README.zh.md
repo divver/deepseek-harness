@@ -42,6 +42,19 @@ executing heartbeat timeout → needs_rework (worker may re-begin)
 | `workerSelector` | `earliest` | 首 notify 绑定策略：`earliest` 或 `round-robin` |
 | `inboxCompactThreshold` | `256` | 已投递信令行数达到阈值后压缩 |
 | `allowAnyCwdRoles` | `[master, worker]` | 允许声明 `cwdScope: "any"` 的角色 |
+| `mode` | `v1` | `v2` 启用多 master 节点注册表（见下） |
+| `maxWorkers` | `4` | v2 单 master 的 worker 容量上限（bind 与注册时校验） |
+| `maxReviewers` | `2` | v2 单 master 的 reviewer 容量上限（bind 与注册时校验） |
+
+## v2 模式（已交付 P0）
+
+设置 `mode: "v2"` 切换到多 master 节点注册表（[spec](../../../.agents/specs/2026-09-24-coop-v2-multi-master-dag.md)）。P0 交付注册表层；plan/DAG、worktree、reviewer 门控与 memory 随后续阶段交付。
+
+- **角色** —— `master` / `worker` / `reviewer` 注册到 `.dsh/coop/v2/registry.json`。master 铸造 `masterId`（`<slug>#<uuid>`）；worker/reviewer 以 `unbound` 落地。
+- **独占绑定** —— `coop_bind` 在注册表写锁内领养 unbound 节点；绑定后该节点仅对该 master 可见（隔离靠可见性实现）。`coop_release` 将其退回 unbound 池；容量遵循 `maxWorkers` / `maxReviewers`。
+- **Workspace 锚点** —— 节点自 session cwd 逐级向上找最近的 `.dsh/coop/workspace.json`，找不到则以 cwd 自身为 workspace。父目录只有通过 `/coop workspace init [path]` 才会成为 workspace —— 绝不静默创建。
+- **命令** —— `/coop master|worker|reviewer [--master <id>] [--model <route>] [--any-cwd]`、`/coop list [--unbound]`、`/coop bind|release <sessionId>`、`/coop status`、`/coop off`、`/coop workspace init [path]`。
+- **工具** —— `coop_register`、`coop_list`、`coop_bind`、`coop_release`、`coop_status`；v2 模式下不注册 v1 的十一个工具。
 
 ## 人类命令
 

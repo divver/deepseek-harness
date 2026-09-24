@@ -9,7 +9,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 // Type-only: resolves ctx.commands / ctx.systemPrompt for the optional children.
@@ -23,21 +23,25 @@ import type {
   CoopInboxEntry,
   CoopPlanFile,
   CoopRegistryEntry,
+  CoopV2RegistryEntry,
+  CoopV2RegistryFile,
   PlanStatus,
   ReviewLevel,
   Role,
-} from './types.ts'
+  V2Role, CwdScope } from './types.ts'
 import {
   CoopError,
   PlanId as brandPlanId,
   canCommunicate,
   coopRoot,
+  mintMasterId,
   normalizeCwd,
   resolveCoopConfig,
+  v2Root,
 } from './runtime.ts'
 import type { ResolvedCoopConfig } from './runtime.ts'
 import * as store from './store.ts'
-import { COOP_POLICY_ORDER, COOP_POLICY_SECTION_NAME, COOP_POLICY_TEXT } from './policy.ts'
+import { COOP_POLICY_ORDER, COOP_POLICY_SECTION_NAME, COOP_POLICY_TEXT, COOP_V2_POLICY_TEXT } from './policy.ts'
 import { registerCoopCommands } from './commands.ts'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 
@@ -47,7 +51,7 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-import { registerCoopTools } from './tools.ts'
+import { registerCoopTools, registerCoopV2Tools } from './tools.ts'
 
 /** Raw deployment config; enum and positivity rules are enforced in {@link resolveCoopConfig}. */
 export interface Config {
@@ -69,6 +73,12 @@ export interface Config {
   workerSelector?: 'earliest' | 'round-robin'
   inboxCompactThreshold?: number
   allowAnyCwdRoles?: Role[]
+  /** Registry/tool model: `v1` (default) ships the master/worker plan flow; `v2` selects the multi-master node registry. */
+  mode?: 'v1' | 'v2'
+  /** v2 per-master worker capacity enforced at bind and registration. */
+  maxWorkers?: number
+  /** v2 per-master reviewer capacity enforced at bind and registration. */
+  maxReviewers?: number
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -82,6 +92,9 @@ export const Config: z<Config> = z.object({
   workerSelector: z.string(),
   inboxCompactThreshold: z.number(),
   allowAnyCwdRoles: z.array(z.string()),
+  mode: z.string(),
+  maxWorkers: z.number(),
+  maxReviewers: z.number(),
   inboxPollMs: z.number(),
   mirrorEvents: z.boolean(),
 }) as unknown as z<Config>
@@ -143,11 +156,12 @@ export class CoopService extends Service {
       promptCtx.systemPrompt.section({
         name: COOP_POLICY_SECTION_NAME,
         order: COOP_POLICY_ORDER,
-        text: COOP_POLICY_TEXT,
+        text: this.resolved.mode === 'v2' ? COOP_V2_POLICY_TEXT : COOP_POLICY_TEXT,
       })
     })
     ctx.inject(['tools'], (toolCtx) => {
-      registerCoopTools(toolCtx, this)
+      if (this.resolved.mode === 'v2') registerCoopV2Tools(toolCtx, this)
+      else registerCoopTools(toolCtx, this)
     })
     ctx.inject(['commands'], (commandCtx) => {
       registerCoopCommands(commandCtx, this)
@@ -178,7 +192,7 @@ export class CoopService extends Service {
    * Append one coop mirror event when `mirrorEvents` is enabled. Mirrors are
    * audit/replay extras; the shared files stay authoritative either way.
    */
-  private appendMirror(session: Agent['session'], type: 'coop/registry' | 'coop/plan-change' | 'coop/review' | 'coop/execution', data: unknown): void {
+  private appendMirror(session: Agent['session'], type: 'coop/registry' | 'coop/registry-v2' | 'coop/plan-change' | 'coop/review' | 'coop/execution', data: unknown): void {
     if (!this.resolved.mirrorEvents) return
     session.append(type, data as never)
   }
@@ -846,6 +860,8 @@ export class CoopService extends Service {
         return `[coop] Plan "${entry.planId}" execution reported: ${entry.summary}. Call coop_verify(planId, decision).`
       case 'abort':
         return `[coop] ABORT plan "${entry.planId}"${entry.reason === undefined ? '' : ` — reason: ${entry.reason}`} — stop all further work for this plan immediately, clean up, then call coop_abort_ack(planId).`
+      case 'node':
+        return `[coop] Node notice: ${entry.summary}`
       default:
         return `[coop] Plan "${entry.planId}" notification: ${entry.summary}`
     }
@@ -858,7 +874,7 @@ export class CoopService extends Service {
    * @returns how many previously undelivered signals were delivered.
    */
   async drainInbox(agent: Agent): Promise<number> {
-    const root = this.rootOf(this.workspaceOf(agent))
+    const root = await this.activeRootOf(agent)
     return this.drainAgentInbox(agent, root)
   }
 
@@ -875,8 +891,8 @@ export class CoopService extends Service {
       if (this.draining.has(id)) continue
       this.draining.add(id)
       try {
-        await this.drainAgentInbox(agent, this.rootOf(this.workspaceOf(agent)))
-        await this.touchOwnEntry(agent)
+        await this.drainAgentInbox(agent, await this.activeRootOf(agent))
+        await this.touchActive(agent)
       } finally {
         this.draining.delete(id)
       }
@@ -901,5 +917,402 @@ export class CoopService extends Service {
       await store.compactSignals(path, watermarkPath, this.resolved.inboxCompactThreshold)
     }
     return entries.length
+  }
+
+  /** Per-session throttle behind v2 heartbeats; mirrors the v1 map's cadence. */
+  private readonly lastTouchV2 = new Map<string, number>()
+
+  /** Registry model in force for this deployment. */
+  get mode(): 'v1' | 'v2' {
+    return this.resolved.mode
+  }
+
+  /**
+       * The v2 coop root for one agent: nearest explicit workspace anchor above
+       * the session cwd, else the cwd itself (single-project fallback).
+       * @param agent - anchoring live agent.
+       * @returns the absolute `.dsh/coop/v2` root.
+       */
+  private async v2RootOf(agent: Agent): Promise<string> {
+    const anchor = await store.findWorkspaceRoot(this.workspaceOf(agent), this.resolved.docRoot)
+    return v2Root(anchor.root, this.resolved.docRoot)
+  }
+
+  /**
+       * The coop root whose inbox the active mode's signals flow through.
+       * @param agent - anchoring live agent.
+       * @returns the v1 or v2 coop root for the session's workspace.
+       */
+  private async activeRootOf(agent: Agent): Promise<string> {
+    return this.resolved.mode === 'v2' ? await this.v2RootOf(agent) : this.rootOf(this.workspaceOf(agent))
+  }
+
+  /** The global any-scope v2 registry path. */
+  private v2GlobalRegistryPath(): string {
+    return store.globalV2RegistryPath(resolveDshHome())
+  }
+
+  /**
+       * Merge the local and global v2 tables, deduplicated by session id.
+       * @param root - absolute v2 root.
+       * @returns every registered entry across both tables.
+       */
+  private async v2Tables(root: string): Promise<CoopV2RegistryEntry[]> {
+    const local = await store.readV2Registry(store.v2RegistryPath(root))
+    const global = await store.readV2Registry(this.v2GlobalRegistryPath())
+    const seen = new Set<string>()
+    const merged: CoopV2RegistryEntry[] = []
+    for (const entry of [...local?.entries ?? [], ...global?.entries ?? []]) {
+      if (seen.has(entry.sessionId)) continue
+      seen.add(entry.sessionId)
+      merged.push(entry)
+    }
+    return merged
+  }
+
+  /** Whether one v2 entry is within the stale window. */
+  private isFreshV2(entry: CoopV2RegistryEntry, now: number): boolean {
+    return now - entry.heartbeatAt <= this.resolved.staleMs
+  }
+
+  /**
+       * Heartbeat the calling session's entry in whichever registry its mode uses.
+       * @param agent - owning live agent.
+       */
+  private async touchActive(agent: Agent): Promise<void> {
+    if (this.resolved.mode === 'v2') await this.touchOwnEntryV2(agent)
+    else await this.touchOwnEntry(agent)
+  }
+
+  /**
+       * Touch the calling session's v2 registry heartbeat under the v1-style
+       * per-session throttle; a crashed session ages out of visibility after
+       * `staleMs` and its nodes return to the adoptable pool only via release.
+       * @param agent - owning live agent.
+       */
+  private async touchOwnEntryV2(agent: Agent): Promise<void> {
+    const sessionId = String(agent.session.id)
+    const now = Date.now()
+    const last = this.lastTouchV2.get(sessionId) ?? 0
+    if (now - last < Math.min(this.resolved.staleMs / 4, 30_000)) return
+    this.lastTouchV2.set(sessionId, now)
+    try {
+      await store.touchHeartbeatV2(store.v2RegistryPath(await this.v2RootOf(agent)), sessionId, now)
+    } catch {
+      // A missing/corrupt registry surfaces on the next real operation.
+    }
+  }
+
+  /**
+       * Explicitly anchor a workspace root for this session's directory tree.
+       * Never invoked implicitly — the anchor file is the only marker later
+       * sessions use to adopt this root (spec §3.1/§12.5: a parent directory is
+       * never claimed silently).
+       * @param agent - anchoring live agent.
+       * @param target - explicit root; defaults to the session cwd's parent.
+       * @returns the anchored workspace root.
+       */
+  async initWorkspace(agent: Agent, target?: string): Promise<string> {
+    const cwd = this.workspaceOf(agent)
+    const root = normalizeCwd(target ?? dirname(cwd))
+    if (root !== cwd && !cwd.startsWith(`${root}/`)) {
+      throw new CoopError(`workspace root "${root}" must be the current directory or one of its ancestors`, 'COOP_CONFIG_UNSUPPORTED')
+    }
+    await store.writeWorkspaceFile(store.workspaceAnchorPath(root, this.resolved.docRoot), {
+      version: 2,
+      root,
+      createdAt: Date.now(),
+    })
+    return root
+  }
+
+  /**
+       * Enforce per-master node capacity for one role set against already-bound others.
+       * @param roles - roles the candidate node wants.
+       * @param boundOthers - the master's other fresh bound nodes.
+       */
+  private assertCapacity(roles: V2Role[], boundOthers: CoopV2RegistryEntry[]): void {
+    const workers = boundOthers.filter(candidate => candidate.roles.includes('worker')).length
+    const reviewers = boundOthers.filter(candidate => candidate.roles.includes('reviewer')).length
+    if (roles.includes('worker') && workers >= this.resolved.maxWorkers) {
+      throw new CoopError(`master already holds ${workers} worker(s) (maxWorkers=${String(this.resolved.maxWorkers)})`, 'COOP_NODE_LIMIT_REACHED')
+    }
+    if (roles.includes('reviewer') && reviewers >= this.resolved.maxReviewers) {
+      throw new CoopError(`master already holds ${reviewers} reviewer(s) (maxReviewers=${String(this.resolved.maxReviewers)})`, 'COOP_NODE_LIMIT_REACHED')
+    }
+  }
+
+  /**
+       * Register this session as a v2 node. A master mints (or resumes) its
+       * masterId and profile; a worker/reviewer lands `unbound` for any master to
+       * adopt, or pre-bound when `masterId` names a live master with spare
+       * capacity. Empty roles deregister.
+       * @param agent - registering live agent.
+       * @param req - target roles, optional owning master, model route, and directory scope.
+       * @returns the committed registry entry.
+       */
+  async registerV2(
+    agent: Agent,
+    req: { roles: V2Role[]; masterId?: string; model?: string; cwdScope?: CwdScope },
+  ): Promise<CoopV2RegistryEntry> {
+    if (req.roles.length === 0) return this.deregisterV2(agent)
+    const sessionId = String(agent.session.id)
+    const cwd = this.workspaceOf(agent)
+    const scope = req.cwdScope ?? 'cwd'
+    const now = Date.now()
+    const root = await this.v2RootOf(agent)
+    const localPath = store.v2RegistryPath(root)
+    const meta = req.model === undefined ? {} : { meta: { model: req.model } }
+    if (req.roles.includes('master')) {
+      const entry = await store.mutateV2Registry(localPath, (current) => {
+        const existing = (current?.entries ?? []).find(candidate => candidate.sessionId === sessionId && candidate.roles.includes('master'))
+        const masterId = existing?.masterId ?? mintMasterId(cwd)
+        const next: CoopV2RegistryEntry = {
+          sessionId,
+          roles: ['master'],
+          masterId,
+          bindState: 'bound',
+          cwd,
+          cwdScope: scope,
+          updatedAt: now,
+          heartbeatAt: now,
+          ...meta,
+        }
+        return {
+          next: { version: 2, entries: [...(current?.entries ?? []).filter(candidate => candidate.sessionId !== sessionId), next] },
+          value: next,
+        }
+      })
+      const masterId = entry.masterId
+      if (masterId === undefined) throw new CoopError('master registration lost its masterId', 'COOP_CONFIG_UNSUPPORTED')
+      await store.writeMasterProfile(store.masterProfilePath(root, String(masterId)), {
+        masterId,
+        sessionId,
+        displayName: String(masterId).split('#')[0] ?? 'master',
+        createdAt: now,
+        status: 'active',
+      })
+      this.appendMirror(agent.session, 'coop/registry-v2', { op: 'register', roles: ['master'], masterId: String(masterId), bindState: 'bound', updatedAt: now })
+      return entry
+    }
+    const result = await store.mutateV2Registry(localPath, (current) => {
+      const entries = current?.entries ?? []
+      const others = entries.filter(candidate => candidate.sessionId !== sessionId)
+      const next: CoopV2RegistryEntry = {
+        sessionId,
+        roles: req.roles,
+        bindState: 'unbound',
+        cwd,
+        cwdScope: scope,
+        updatedAt: now,
+        heartbeatAt: now,
+        ...meta,
+      }
+      if (req.masterId === undefined) {
+        return { next: { version: 2, entries: [...others, next] }, value: { entry: next, masterId: undefined as string | undefined } }
+      }
+      const master = entries.find(candidate => String(candidate.masterId ?? '') === req.masterId)
+      if (master === undefined || !master.roles.includes('master') || !this.isFreshV2(master, now)) {
+        throw new CoopError(`master "${req.masterId}" is not a live master in this workspace`, 'COOP_NODE_NOT_FOUND')
+      }
+      const masterId = master.masterId
+      if (masterId === undefined) {
+        throw new CoopError(`master "${req.masterId}" is not a live master in this workspace`, 'COOP_NODE_NOT_FOUND')
+      }
+      const boundOthers = entries.filter(candidate => candidate.bindState === 'bound' && String(candidate.masterId) === String(masterId) && candidate.sessionId !== sessionId && this.isFreshV2(candidate, now))
+      this.assertCapacity(req.roles, boundOthers)
+      const bound: CoopV2RegistryEntry = { ...next, masterId, bindState: 'bound' }
+      return { next: { version: 2, entries: [...others, bound] }, value: { entry: bound, masterId: String(masterId) } }
+    })
+    if (scope === 'any') {
+      await store.mutateV2Registry(this.v2GlobalRegistryPath(), (current) => {
+        const others = (current?.entries ?? []).filter(candidate => candidate.sessionId !== sessionId)
+        return { next: { version: 2, entries: [...others, result.entry] }, value: undefined }
+      })
+    }
+    this.appendMirror(agent.session, 'coop/registry-v2', {
+      op: 'register',
+      roles: req.roles,
+      ...(result.masterId === undefined ? {} : { masterId: result.masterId }),
+      bindState: result.entry.bindState,
+      updatedAt: now,
+    })
+    return result.entry
+  }
+
+  /**
+       * Remove this session's v2 entry; a retiring master's profile is marked
+       * `retired` so a later revival can adopt its identity.
+       * @param agent - leaving live agent.
+       * @returns a synthetic entry describing the now-empty role set.
+       */
+  private async deregisterV2(agent: Agent): Promise<CoopV2RegistryEntry> {
+    const sessionId = String(agent.session.id)
+    const cwd = this.workspaceOf(agent)
+    const now = Date.now()
+    const root = await this.v2RootOf(agent)
+    const removed = await store.mutateV2Registry<CoopV2RegistryEntry | undefined>(
+      store.v2RegistryPath(root),
+      (current): { next?: CoopV2RegistryFile; value: CoopV2RegistryEntry | undefined } => {
+        const own = (current?.entries ?? []).find(candidate => candidate.sessionId === sessionId)
+        const next = current === undefined
+          ? undefined
+          : ({ version: 2, entries: current.entries.filter(candidate => candidate.sessionId !== sessionId) } satisfies CoopV2RegistryFile)
+        return next === undefined ? { value: own } : { next, value: own }
+      })
+    if (removed?.roles.includes('master') && removed.masterId !== undefined) {
+      const profilePath = store.masterProfilePath(root, String(removed.masterId))
+      const profile = await store.readMasterProfile(profilePath)
+      if (profile !== undefined) await store.writeMasterProfile(profilePath, { ...profile, status: 'retired' })
+    }
+    this.appendMirror(agent.session, 'coop/registry-v2', { op: 'off', roles: [], updatedAt: now })
+    return removed ?? { sessionId, roles: [], bindState: 'unbound', cwd, cwdScope: 'cwd', updatedAt: now, heartbeatAt: now }
+  }
+
+  /**
+       * Nodes visible to the caller under v2 isolation: a master sees itself, its
+       * bound nodes, and every `unbound` worker/reviewer (the only globally
+       * visible window); a worker/reviewer sees itself and its owning master.
+       * @param agent - querying live agent.
+       * @param opts - `unboundOnly` keeps just adoptable nodes.
+       * @returns fresh entries in scope.
+       */
+  async listNodesV2(agent: Agent, opts: { unboundOnly?: boolean } = {}): Promise<CoopV2RegistryEntry[]> {
+    await this.touchOwnEntryV2(agent)
+    const now = Date.now()
+    const entries = await this.v2Tables(await this.v2RootOf(agent))
+    const own = entries.find(entry => entry.sessionId === String(agent.session.id))
+    if (own === undefined || !this.isFreshV2(own, now)) {
+      throw new CoopError('this session holds no live v2 coop role — register first', 'COOP_NODE_NOT_FOUND')
+    }
+    if (!own.roles.includes('master')) {
+      const master = own.masterId === undefined
+        ? undefined
+        : entries.find(entry => entry.roles.includes('master') && String(entry.masterId) === String(own.masterId))
+      const visible = [own, ...(master === undefined ? [] : [master])].filter(entry => this.isFreshV2(entry, now))
+      return opts.unboundOnly ? [] : visible
+    }
+    const masterId = String(own.masterId)
+    const visible = entries.filter((entry) => {
+      if (!this.isFreshV2(entry, now)) return false
+      if (entry.sessionId === own.sessionId) return true
+      if (entry.roles.includes('master')) return false
+      if (entry.bindState === 'unbound') return canCommunicate({ cwd: own.cwd, cwdScope: own.cwdScope }, entry)
+      return String(entry.masterId) === masterId
+    })
+    return opts.unboundOnly ? visible.filter(entry => entry.bindState === 'unbound') : visible
+  }
+
+  /**
+       * Adopt one `unbound` worker/reviewer for the calling master. The bind
+       * commits under the registry writer lock; once bound, the node disappears
+       * from every other master's view — isolation is enforced by visibility, not
+       * by a second lock domain.
+       * @param agent - binding live master.
+       * @param sessionId - target node session id.
+       * @returns the bound entry.
+       */
+  async bindNode(agent: Agent, sessionId: string): Promise<CoopV2RegistryEntry> {
+    const callerId = String(agent.session.id)
+    const now = Date.now()
+    const root = await this.v2RootOf(agent)
+    const bound = await store.mutateV2Registry(store.v2RegistryPath(root), (current) => {
+      const entries = current?.entries ?? []
+      const caller = entries.find(candidate => candidate.sessionId === callerId)
+      if (caller === undefined || !caller.roles.includes('master') || !this.isFreshV2(caller, now)) {
+        throw new CoopError('binding requires this session to be a live v2 master', 'COOP_NODE_NOT_FOUND')
+      }
+      const masterId = caller.masterId
+      if (masterId === undefined) throw new CoopError('master entry lacks a masterId', 'COOP_CONFIG_UNSUPPORTED')
+      const target = entries.find(candidate => candidate.sessionId === sessionId)
+      if (target === undefined || !this.isFreshV2(target, now) || target.roles.includes('master') || target.bindState !== 'unbound' || !canCommunicate({ cwd: caller.cwd, cwdScope: caller.cwdScope }, target)) {
+        throw new CoopError(`"${sessionId}" is not a visible unbound v2 node`, 'COOP_NODE_NOT_FOUND')
+      }
+      const boundOthers = entries.filter(candidate => candidate.bindState === 'bound' && String(candidate.masterId) === String(masterId) && candidate.sessionId !== sessionId && this.isFreshV2(candidate, now))
+      this.assertCapacity(target.roles, boundOthers)
+      const next: CoopV2RegistryEntry = { ...target, masterId, bindState: 'bound', updatedAt: now }
+      return {
+        next: { version: 2, entries: entries.map(candidate => candidate.sessionId === sessionId ? next : candidate) },
+        value: next,
+      }
+    })
+    this.appendMirror(agent.session, 'coop/registry-v2', { op: 'bind', roles: bound.roles, masterId: String(bound.masterId), bindState: 'bound', updatedAt: now })
+    await this.deliverV2(callerId, sessionId, root, `bound by master ${String(bound.masterId)} — you now take task signals from this master only`)
+    return bound
+  }
+
+  /**
+       * Return one bound node to the `unbound` pool; only its owning master may.
+       * @param agent - releasing live master.
+       * @param sessionId - target node session id.
+       */
+  async releaseNode(agent: Agent, sessionId: string): Promise<void> {
+    const callerId = String(agent.session.id)
+    const now = Date.now()
+    const root = await this.v2RootOf(agent)
+    const masterId = await store.mutateV2Registry(store.v2RegistryPath(root), (current) => {
+      const entries = current?.entries ?? []
+      const caller = entries.find(candidate => candidate.sessionId === callerId)
+      if (caller === undefined || !caller.roles.includes('master') || caller.masterId === undefined) {
+        throw new CoopError('release requires this session to be a v2 master', 'COOP_NODE_NOT_FOUND')
+      }
+      const target = entries.find(candidate => candidate.sessionId === sessionId)
+      if (target === undefined || target.bindState !== 'bound' || String(target.masterId) !== String(caller.masterId)) {
+        throw new CoopError(`"${sessionId}" is not bound to this master`, 'COOP_NOT_YOUR_NODE')
+      }
+      const { masterId: _dropped, ...rest } = target
+      const released: CoopV2RegistryEntry = { ...rest, bindState: 'unbound', updatedAt: now }
+      return {
+        next: { version: 2, entries: entries.map(candidate => candidate.sessionId === sessionId ? released : candidate) },
+        value: String(caller.masterId),
+      }
+    })
+    this.appendMirror(agent.session, 'coop/registry-v2', { op: 'release', roles: [], masterId, updatedAt: now })
+    await this.deliverV2(callerId, sessionId, root, 'released by your master — you are unbound and visible to every master again')
+  }
+
+  /**
+       * Human/model summary across the workspace: live masters, the caller's own
+       * nodes, and the adoptable unbound count. Cross-master detail stays
+       * summarized — isolation applies to agents, not to the human operator.
+       * @param agent - querying live agent.
+       * @returns the caller's entry, master ids, own nodes, and unbound count.
+       */
+  async statusV2(agent: Agent): Promise<{
+    self: CoopV2RegistryEntry | undefined
+    masters: string[]
+    own: CoopV2RegistryEntry[]
+    unbound: number
+  }> {
+    await this.touchOwnEntryV2(agent)
+    const now = Date.now()
+    const entries = (await this.v2Tables(await this.v2RootOf(agent))).filter(entry => this.isFreshV2(entry, now))
+    const own = entries.find(entry => entry.sessionId === String(agent.session.id))
+    const masters = [...new Set(entries.filter(entry => entry.roles.includes('master')).map(entry => String(entry.masterId)))]
+    const ownNodes = own?.roles.includes('master') === true && own.masterId !== undefined
+      ? entries.filter(entry => entry.bindState === 'bound' && String(entry.masterId) === String(own.masterId))
+      : []
+    const unbound = entries.filter(entry => entry.bindState === 'unbound' && !entry.roles.includes('master')).length
+    return { self: own, masters, own: ownNodes, unbound }
+  }
+
+  /**
+       * Append one v2 node signal and drain the target when it is live in-process.
+       * @param fromId - sending session id.
+       * @param targetId - receiving session id.
+       * @param root - absolute v2 root carrying the inbox.
+       * @param summary - one-line notice text.
+       */
+  private async deliverV2(fromId: string, targetId: string, root: string, summary: string): Promise<void> {
+    await store.appendSignal(store.inboxPath(root, targetId), {
+      time: Date.now(),
+      from: fromId,
+      planId: '',
+      kind: 'node',
+      summary,
+      docPath: '',
+    })
+    const target = this.ctx.agents.get(SessionId(targetId))
+    if (target !== undefined) await this.drainAgentInbox(target, root)
   }
 }

@@ -36,6 +36,7 @@ The [format references](persistence-changes/historical-formats/README.md) cover 
 | `event:coop/execution` | event | `d58dc29ce75ccbccb1fcfb3de5296c9fbd7325a26c52262c643b30ab47b9d805` | [`{ type: "coop/execution" }`](#persistence-type-sha256-d58dc29ce75ccbccb1fcfb3de5296c9fbd7325a26c52262c643b30ab47b9d805) |
 | `event:coop/plan-change` | event | `66cf0b0cc9172823313d2b41617091638ed72b901b9cea202b9a9e872938d95e` | [`{ type: "coop/plan-change" }`](#persistence-type-sha256-66cf0b0cc9172823313d2b41617091638ed72b901b9cea202b9a9e872938d95e) |
 | `event:coop/registry` | event | `1f0bbc160d1c97dc77b07dd38d6dc54298a157b028e3f3bf6aa174d9388d5ada` | [`{ type: "coop/registry" }`](#persistence-type-sha256-1f0bbc160d1c97dc77b07dd38d6dc54298a157b028e3f3bf6aa174d9388d5ada) |
+| `event:coop/registry-v2` | event | `0ce6406452e6fb7f9def9a448b566be4390c402890eaeef72596a64d246c4a57` | [`{ type: "coop/registry-v2" }`](#persistence-type-sha256-0ce6406452e6fb7f9def9a448b566be4390c402890eaeef72596a64d246c4a57) |
 | `event:coop/review` | event | `0cf589f0abe2af957a5222b7d13b5e9603643027c321a11fd9528e0c894a286e` | [`{ type: "coop/review" }`](#persistence-type-sha256-0cf589f0abe2af957a5222b7d13b5e9603643027c321a11fd9528e0c894a286e) |
 | `event:deliverables/presented` | event | `13d3d180f977bf78081d487ffa0ecb75857349bcab29a5a3fb48189fca2a6176` | [`{ type: "deliverables/presented" }`](#persistence-type-sha256-13d3d180f977bf78081d487ffa0ecb75857349bcab29a5a3fb48189fca2a6176) |
 | `event:developer/message` | event | `7d4ab2fa959f079201773ecb62b3b60c9f8b11bd92122158eb1bfc8032005a15` | [`{ type: "developer/message" }`](#persistence-type-sha256-7d4ab2fa959f079201773ecb62b3b60c9f8b11bd92122158eb1bfc8032005a15) |
@@ -483,7 +484,7 @@ Source: [`packages/compaction/compaction/src/types.ts:34`](../packages/compactio
 'coop/execution': CoopExecutionEventData
 ```
 
-Source: [`packages/coop/coop/src/types.ts:153`](../packages/coop/coop/src/types.ts)
+Source: [`packages/coop/coop/src/types.ts:159`](../packages/coop/coop/src/types.ts)
 
 <a id="coopplan-change--log-only"></a>
 
@@ -494,7 +495,7 @@ Source: [`packages/coop/coop/src/types.ts:153`](../packages/coop/coop/src/types.
 'coop/plan-change': CoopPlanChangeEventData
 ```
 
-Source: [`packages/coop/coop/src/types.ts:149`](../packages/coop/coop/src/types.ts)
+Source: [`packages/coop/coop/src/types.ts:155`](../packages/coop/coop/src/types.ts)
 
 <a id="coopregistry--log-only"></a>
 
@@ -505,7 +506,18 @@ Source: [`packages/coop/coop/src/types.ts:149`](../packages/coop/coop/src/types.
 'coop/registry': CoopRegistryEventData
 ```
 
-Source: [`packages/coop/coop/src/types.ts:147`](../packages/coop/coop/src/types.ts)
+Source: [`packages/coop/coop/src/types.ts:151`](../packages/coop/coop/src/types.ts)
+
+<a id="coopregistry-v2--log-only"></a>
+
+#### `coop/registry-v2` — log-only
+
+```ts persistence-catalog
+/** v2 registry mutation mirror (roles, bind, release). */
+'coop/registry-v2': CoopV2RegistryEventData
+```
+
+Source: [`packages/coop/coop/src/types.ts:153`](../packages/coop/coop/src/types.ts)
 
 <a id="coopreview--log-only"></a>
 
@@ -516,7 +528,7 @@ Source: [`packages/coop/coop/src/types.ts:147`](../packages/coop/coop/src/types.
 'coop/review': CoopReviewEventData
 ```
 
-Source: [`packages/coop/coop/src/types.ts:151`](../packages/coop/coop/src/types.ts)
+Source: [`packages/coop/coop/src/types.ts:157`](../packages/coop/coop/src/types.ts)
 
 ### `deliverables/*`
 
@@ -1519,6 +1531,14 @@ SHA-256: `8a5fc6b966718b4f4ab877b4d16366fed8a5aecb69087e436a34d1afd4062feb`
 
 `"begin"`
 
+<a id="persistence-type-sha256-0c82007861a2592592f9ea29e78e6b2f3a61415908ef3c4e54f46d99d4f52ba9"></a>
+
+### `"bind"`
+
+SHA-256: `0c82007861a2592592f9ea29e78e6b2f3a61415908ef3c4e54f46d99d4f52ba9`
+
+`"bind"`
+
 <a id="persistence-type-sha256-1e346446e183ee76f48d7994c97ecb302bddc682abb60b8a10ea0bb26223a69c"></a>
 
 ### `"block"`
@@ -1550,6 +1570,14 @@ SHA-256: `cbca49bde16b656d5b8fbe4a8a507769f7b594c6287782b809c03814941bc5e3`
 SHA-256: `254dce209e735f9cb6f6b7aec0354712b1611759ec02af4d35a96f2081e666f6`
 
 `"blocked"`
+
+<a id="persistence-type-sha256-898111ebe8e5eec479d78fe8526df5e0e039d785cae83c93f547261cfedd48bd"></a>
+
+### `"bound"`
+
+SHA-256: `898111ebe8e5eec479d78fe8526df5e0e039d785cae83c93f547261cfedd48bd`
+
+`"bound"`
 
 <a id="persistence-type-sha256-d4e4d575abeb4b72d616dc65c17ac0eaa943cc135609395044c38d5afcb10e31"></a>
 
@@ -1734,6 +1762,14 @@ SHA-256: `e8fb3d80e0179c2645d7e0dde7ff334552f3f696c89561103d90f8c4ef936512`
 SHA-256: `84eada35824329740ba1f970fd44eea87d571818d8b120641e5a5c5ceefe0acd`
 
 `"coop/registry"`
+
+<a id="persistence-type-sha256-675ba628ce917fe16bca43b2558840086a5bc2cfed8fa6669993b988fefccd61"></a>
+
+### `"coop/registry-v2"`
+
+SHA-256: `675ba628ce917fe16bca43b2558840086a5bc2cfed8fa6669993b988fefccd61`
+
+`"coop/registry-v2"`
 
 <a id="persistence-type-sha256-b54fae34f1948b8328e6674fe7b99df7993ab1ecdcd59592a95d27f6e213618c"></a>
 
@@ -2269,6 +2305,14 @@ SHA-256: `52583b32919d6cb95a37ed859952d4ece4e624072bb1a399710b478726e93b9b`
 
 `"notify"`
 
+<a id="persistence-type-sha256-48afb9ebc9ec5fe87592a70caa35fb7da4adb05cada0eb9dabeb3a7dce35e421"></a>
+
+### `"off"`
+
+SHA-256: `48afb9ebc9ec5fe87592a70caa35fb7da4adb05cada0eb9dabeb3a7dce35e421`
+
+`"off"`
+
 <a id="persistence-type-sha256-d28765f87d6b6ab408e0b2f3e7e297791b004b806d8e302c49903ebae815feb2"></a>
 
 ### `"one-shot"`
@@ -2461,6 +2505,14 @@ SHA-256: `383cf73ae4748e5beb281ae74857ba1ffb92ae01075b9fbf51af78b666007a8f`
 
 `"recall"`
 
+<a id="persistence-type-sha256-dca66b4f3ac10b061ec9647a286697903a3be2504e71641c8051dd2a7304ce54"></a>
+
+### `"register"`
+
+SHA-256: `dca66b4f3ac10b061ec9647a286697903a3be2504e71641c8051dd2a7304ce54`
+
+`"register"`
+
 <a id="persistence-type-sha256-fab35c4520883c0d69e42d079c9f543fc5ac7a2d15b537b5572fcd99059c7018"></a>
 
 ### `"rejected"`
@@ -2476,6 +2528,14 @@ SHA-256: `fab35c4520883c0d69e42d079c9f543fc5ac7a2d15b537b5572fcd99059c7018`
 SHA-256: `16d0507cb94b4cfc84a87446b1ba7652d6ec1d65ee1684789e747e30d542800e`
 
 `"relay"`
+
+<a id="persistence-type-sha256-471581d8cce4fb2263106aa3eb0390056e110cbedb3b57fe15a5fa27d39305d6"></a>
+
+### `"release"`
+
+SHA-256: `471581d8cce4fb2263106aa3eb0390056e110cbedb3b57fe15a5fa27d39305d6`
+
+`"release"`
 
 <a id="persistence-type-sha256-7382c4fc95fe8c5db65ca4d9da572b115d0dbb818b7f32c22ab040318ffbb4bc"></a>
 
@@ -2548,6 +2608,14 @@ SHA-256: `5bd310104cfe448e530beb11422d2f791e2e32e8e95fdc528a15f9ca693dae75`
 SHA-256: `34d1ab5c5df378186d6054b1a1beea9a41e41965d6f336f0bc0025c441a82e66`
 
 `"resume"`
+
+<a id="persistence-type-sha256-8d0cc4a8fd38b61c46b484360352e3fd45332eee6c6f0896cff9f707350a9653"></a>
+
+### `"reviewer"`
+
+SHA-256: `8d0cc4a8fd38b61c46b484360352e3fd45332eee6c6f0896cff9f707350a9653`
+
+`"reviewer"`
 
 <a id="persistence-type-sha256-24b10f7cdae64928f89c49afc2eca0af9eb4a2f135e16f3416e6b8461fef1748"></a>
 
@@ -3068,6 +3136,14 @@ SHA-256: `0af3ecfb8c60d416fc40a7cc4fb2c4851a8e46608b2b38ab9e510670c971aa1f`
 SHA-256: `2c4c21f19f426a58f2dac914e34313aa43f8408972de857a486d1f086d5adb6c`
 
 `"unavailable"`
+
+<a id="persistence-type-sha256-f34f155376a33081be80777d4d2ca0d2f5732564618e87d49692773a79d30554"></a>
+
+### `"unbound"`
+
+SHA-256: `f34f155376a33081be80777d4d2ca0d2f5732564618e87d49692773a79d30554`
+
+`"unbound"`
 
 <a id="persistence-type-sha256-05a2796621b1ee6c03ef7abe560b25116bb4da4d592312117242a78415a32b04"></a>
 
@@ -3607,6 +3683,26 @@ Sources: [`packages/coop/coop/src/types.ts:116`](../packages/coop/coop/src/types
 | `phase` | required | [`union (3 variants)`](#persistence-type-sha256-ef585d3c32b848745bc66eb84161e68ec3e4030eaee70427c4cc75ddbd605d08) |
 | `planId` | required | `string` |
 | `summary` | optional | `string` |
+
+<a id="persistence-type-sha256-223ac5339a1a41764a72f1f3bc676a36305b2659a6bb13910e84c23a6c919d1f"></a>
+
+<a id="persistence-type-coopv2registryeventdata"></a>
+
+<a id="persistence-type-packagescoopcoopsrctypestscoopv2registryeventdata"></a>
+
+### `CoopV2RegistryEventData`
+
+SHA-256: `223ac5339a1a41764a72f1f3bc676a36305b2659a6bb13910e84c23a6c919d1f`
+
+Sources: [`packages/coop/coop/src/types.ts:216`](../packages/coop/coop/src/types.ts)
+
+| Property | Presence | Type |
+|---|---|---|
+| `bindState` | optional | [`union (2 variants)`](#persistence-type-sha256-39eb8076a5c96994386f7a18395bf0d3ec224f7e54df52afc1273120b5d0133a) |
+| `masterId` | optional | `string` |
+| `op` | required | [`union (4 variants)`](#persistence-type-sha256-5df34d962a8b04509216e38a95f8e597d1b901c3a91c0c8fa35ca9f411c94fdf) |
+| `roles` | required | [`V2Role[]`](#persistence-type-sha256-367695c3f6620b1673ba0d7cdf9180d1751ecd11b432c918713326a6ca3c3fc9) |
+| `updatedAt` | required | `number` |
 
 <a id="persistence-type-sha256-2517ba143a271508d3ca35126d5aca8f7f1facf5aaddce4adf011832042fa2b9"></a>
 
@@ -5567,6 +5663,32 @@ SHA-256: `6a0a18fb54eff45ffceefdc36cfa252cb2879bd80c53966868599147127efb17`
 
 Array of [`UserMessage`](#persistence-type-sha256-bf8ecfb9c92f3b28f2327779328bcf0e6ae879504bc9f19238a3925f5bf4fe93).
 
+<a id="persistence-type-sha256-2b90fe43705b8adad5eb8fa18c7f72aeceb3796f982dbd160544bf0f8bbf7f1b"></a>
+
+<a id="persistence-type-packagescoopcoopsrctypestsv2role"></a>
+
+<a id="persistence-type-v2role"></a>
+
+### `V2Role`
+
+SHA-256: `2b90fe43705b8adad5eb8fa18c7f72aeceb3796f982dbd160544bf0f8bbf7f1b`
+
+Sources: [`packages/coop/coop/src/types.ts:163`](../packages/coop/coop/src/types.ts)
+
+One of:
+
+- `"master"`
+- `"reviewer"`
+- `"worker"`
+
+<a id="persistence-type-sha256-367695c3f6620b1673ba0d7cdf9180d1751ecd11b432c918713326a6ca3c3fc9"></a>
+
+### `V2Role[]`
+
+SHA-256: `367695c3f6620b1673ba0d7cdf9180d1751ecd11b432c918713326a6ca3c3fc9`
+
+Array of [`V2Role`](#persistence-type-sha256-2b90fe43705b8adad5eb8fa18c7f72aeceb3796f982dbd160544bf0f8bbf7f1b).
+
 <a id="persistence-type-sha256-c2deb7c9183735d4e0fffddf5c623f4e34daa1c8e96b111982e957dfcbbcf896"></a>
 
 <a id="persistence-type-packagesworkflowworkflowsrctypestsworkflowagentoutcome"></a>
@@ -5814,6 +5936,17 @@ One of:
 - `"error"`
 - `"success"`
 
+<a id="persistence-type-sha256-39eb8076a5c96994386f7a18395bf0d3ec224f7e54df52afc1273120b5d0133a"></a>
+
+### `union (2 variants)`
+
+SHA-256: `39eb8076a5c96994386f7a18395bf0d3ec224f7e54df52afc1273120b5d0133a`
+
+One of:
+
+- `"bound"`
+- `"unbound"`
+
 <a id="persistence-type-sha256-50cf02d875f8a1f1411f4a6fbcffab9120ccef5f74a47331fbf29480e5f68f48"></a>
 
 ### `union (2 variants)`
@@ -5920,6 +6053,19 @@ One of:
 - `"completed"`
 - `"in_progress"`
 - `"pending"`
+
+<a id="persistence-type-sha256-5df34d962a8b04509216e38a95f8e597d1b901c3a91c0c8fa35ca9f411c94fdf"></a>
+
+### `union (4 variants)`
+
+SHA-256: `5df34d962a8b04509216e38a95f8e597d1b901c3a91c0c8fa35ca9f411c94fdf`
+
+One of:
+
+- `"bind"`
+- `"off"`
+- `"register"`
+- `"release"`
 
 <a id="persistence-type-sha256-8f85febc2614dec88a92b7f786f83ba0ec6f870c8cedc1b66bb0c29c11d6c6b4"></a>
 
@@ -8468,6 +8614,22 @@ SHA-256: `1f0bbc160d1c97dc77b07dd38d6dc54298a157b028e3f3bf6aa174d9388d5ada`
 | `seq` | required | `number` |
 | `time` | required | `number` |
 | `type` | required | `"coop/registry"` |
+
+<a id="persistence-type-sha256-0ce6406452e6fb7f9def9a448b566be4390c402890eaeef72596a64d246c4a57"></a>
+
+<a id="persistence-type-eventcoopregistry-v2"></a>
+
+### `{ type: "coop/registry-v2" }`
+
+SHA-256: `0ce6406452e6fb7f9def9a448b566be4390c402890eaeef72596a64d246c4a57`
+
+| Property | Presence | Type |
+|---|---|---|
+| `data` | required | [`CoopV2RegistryEventData`](#persistence-type-sha256-223ac5339a1a41764a72f1f3bc676a36305b2659a6bb13910e84c23a6c919d1f) |
+| `ignorable` | optional | `true` |
+| `seq` | required | `number` |
+| `time` | required | `number` |
+| `type` | required | `"coop/registry-v2"` |
 
 <a id="persistence-type-sha256-0cf589f0abe2af957a5222b7d13b5e9603643027c321a11fd9528e0c894a286e"></a>
 

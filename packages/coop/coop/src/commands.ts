@@ -38,7 +38,8 @@ function parseInput(raw: string): ParsedInput {
 const USAGE = 'usage: /coop role <master|worker> [--level <strict|standard|lenient>] [--any-cwd] · role list [--all] · role off · plan notify <planId> [--worker <sessionId>] · abort <planId> [--reason <text>]'
 
 /**
- * Register the `/coop` command family. Plan creation stays model-facing
+ * Register the `/coop` command family. The deployed mode selects the v1
+ * plan grammar or the v2 node grammar; plan creation stays model-facing
  * (`coop_plan_create`) because its objective payload does not fit a slash line.
  * @param ctx - context carrying the commands child.
  * @param service - owning coop service performing the transitions.
@@ -46,10 +47,21 @@ const USAGE = 'usage: /coop role <master|worker> [--level <strict|standard|lenie
 export function registerCoopCommands(ctx: Context, service: CoopService): void {
   ctx.commands.register({
     name: 'coop',
-    description: 'Cross-session cooperation: /coop role master|worker|off|list, plan notify, abort',
-    input: { hint: 'role <master|worker> [--level L] [--any-cwd] | role list [--all] | role off | plan notify <planId> | abort <planId> [--reason text]' },
+    description: service.mode === 'v2'
+      ? 'Cross-session cooperation (v2): master/worker/reviewer nodes, bind/release, workspace anchor'
+      : 'Cross-session cooperation: /coop role master|worker|off|list, plan notify, abort',
+    input: { hint: service.mode === 'v2'
+      ? 'master [--any-cwd] | worker|reviewer [--master <id>] [--model <route>] | off | list [--unbound] | status | bind <sessionId> | release <sessionId> | workspace init [path]'
+      : 'role <master|worker> [--level L] [--any-cwd] | role list [--all] | role off | plan notify <planId> | abort <planId> [--reason text]' },
     async handler(invocation) {
       const parsed = parseInput(invocation.rawInput)
+      if (service.mode === 'v2') {
+        try {
+          return { kind: 'success', text: await runV2(service, invocation.agent, parsed) }
+        } catch (error) {
+          return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+        }
+      }
       const [head, sub, ...rest] = parsed.positional
       try {
         if (head === 'role') {
@@ -109,4 +121,61 @@ async function runRole(
     return `This session is now registered as: ${roles.join(', ')}.`
   }
   return USAGE
+}
+const V2_USAGE = 'usage: /coop master [--any-cwd] · worker|reviewer [--master <masterId>] [--model <route>] [--any-cwd] · off · list [--unbound] · status · bind <sessionId> · release <sessionId> · workspace init [path]'
+/** Dispatch the v2 `/coop` grammar for one live agent. */
+async function runV2(
+  service: CoopService,
+  agent: Agent,
+  parsed: ParsedInput,
+): Promise<string> {
+  const [head, sub] = parsed.positional
+  const cwdScope = parsed.flags.has('any-cwd') ? 'any' as const : undefined
+  if (head === 'master') {
+    const entry = await service.registerV2(agent, { roles: ['master'], ...(cwdScope === undefined ? {} : { cwdScope }) })
+    return `Master registered: ${String(entry.masterId)}.`
+  }
+  if (head === 'worker' || head === 'reviewer') {
+    const master = parsed.flags.get('master')
+    const model = parsed.flags.get('model')
+    const entry = await service.registerV2(agent, {
+      roles: [head],
+      ...(typeof master === 'string' ? { masterId: master } : {}),
+      ...(typeof model === 'string' ? { model } : {}),
+      ...(cwdScope === undefined ? {} : { cwdScope }),
+    })
+    return `${head} registered (${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}).`
+  }
+  if (head === 'off') {
+    await service.registerV2(agent, { roles: [] })
+    return 'Coop v2 node deregistered for this session.'
+  }
+  if (head === 'list') {
+    const entries = await service.listNodesV2(agent, { ...(parsed.flags.has('unbound') ? { unboundOnly: true } : {}) })
+    if (entries.length === 0) return 'No visible coop nodes.'
+    return entries.map(entry => `${entry.sessionId}: ${entry.roles.join('+')} [${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}]`).join('\n')
+  }
+  if (head === 'status') {
+    const status = await service.statusV2(agent)
+    return [
+      `self: ${status.self === undefined ? 'unregistered' : `${status.self.roles.join('+')} [${status.self.bindState}${status.self.masterId === undefined ? '' : ` → ${String(status.self.masterId)}`}]`}`,
+      `masters: ${status.masters.join(', ') || '(none)'}`,
+      `your nodes: ${String(status.own.length)}`,
+      `unbound: ${String(status.unbound)}`,
+    ].join('\n')
+  }
+  if (head === 'bind' && sub !== undefined) {
+    const bound = await service.bindNode(agent, sub)
+    return `Node ${bound.sessionId} bound to ${String(bound.masterId)}.`
+  }
+  if (head === 'release' && sub !== undefined) {
+    await service.releaseNode(agent, sub)
+    return `Node ${sub} released to the unbound pool.`
+  }
+  if (head === 'workspace' && sub === 'init') {
+    const target = parsed.positional[2]
+    const root = await service.initWorkspace(agent, target)
+    return `Workspace anchored at ${root}.`
+  }
+  return V2_USAGE
 }

@@ -852,6 +852,41 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         parameters: [{ name: 'agent', description: 'receiving live agent.' }],
         returns: 'how many previously undelivered signals were delivered.',
       },
+      {
+        signature: 'async initWorkspace(agent: Agent, target?: string): Promise<string>',
+        description: 'Explicitly anchor a workspace root for this session\'s directory tree. Never invoked implicitly — the anchor file is the only marker later sessions use to adopt this root (spec §3.1/§12.5: a parent directory is never claimed silently).',
+        parameters: [{ name: 'agent', description: 'anchoring live agent.' }, { name: 'target', description: 'explicit root; defaults to the session cwd\'s parent.' }],
+        returns: 'the anchored workspace root.',
+      },
+      {
+        signature: 'async registerV2( agent: Agent, req: { roles: V2Role[]; masterId?: string; model?: string; cwdScope?: CwdScope }, ): Promise<CoopV2RegistryEntry>',
+        description: 'Register this session as a v2 node. A master mints (or resumes) its masterId and profile; a worker/reviewer lands `unbound` for any master to adopt, or pre-bound when `masterId` names a live master with spare capacity. Empty roles deregister.',
+        parameters: [{ name: 'agent', description: 'registering live agent.' }, { name: 'req', description: 'target roles, optional owning master, model route, and directory scope.' }],
+        returns: 'the committed registry entry.',
+      },
+      {
+        signature: 'async listNodesV2(agent: Agent, opts: { unboundOnly?: boolean } = {}): Promise<CoopV2RegistryEntry[]>',
+        description: 'Nodes visible to the caller under v2 isolation: a master sees itself, its bound nodes, and every `unbound` worker/reviewer (the only globally visible window); a worker/reviewer sees itself and its owning master.',
+        parameters: [{ name: 'agent', description: 'querying live agent.' }, { name: 'opts', description: '`unboundOnly` keeps just adoptable nodes.' }],
+        returns: 'fresh entries in scope.',
+      },
+      {
+        signature: 'async bindNode(agent: Agent, sessionId: string): Promise<CoopV2RegistryEntry>',
+        description: 'Adopt one `unbound` worker/reviewer for the calling master. The bind commits under the registry writer lock; once bound, the node disappears from every other master\'s view — isolation is enforced by visibility, not by a second lock domain.',
+        parameters: [{ name: 'agent', description: 'binding live master.' }, { name: 'sessionId', description: 'target node session id.' }],
+        returns: 'the bound entry.',
+      },
+      {
+        signature: 'async releaseNode(agent: Agent, sessionId: string): Promise<void>',
+        description: 'Return one bound node to the `unbound` pool; only its owning master may.',
+        parameters: [{ name: 'agent', description: 'releasing live master.' }, { name: 'sessionId', description: 'target node session id.' }],
+      },
+      {
+        signature: 'async statusV2(agent: Agent): Promise<{ self: CoopV2RegistryEntry | undefined masters: string[] own: CoopV2RegistryEntry[] unbound: number }>',
+        description: 'Human/model summary across the workspace: live masters, the caller\'s own nodes, and the adoptable unbound count. Cross-master detail stays summarized — isolation applies to agents, not to the human operator.',
+        parameters: [{ name: 'agent', description: 'querying live agent.' }],
+        returns: 'the caller\'s entry, master ids, own nodes, and unbound count.',
+      },
     ],
   },
   {
@@ -4586,6 +4621,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface BashEnvVariableInfo extends BashEnvVariable {\n    contributor: string;\n    key: DshEnvironmentKey;\n}',
   },
   {
+    name: 'BindState',
+    declaration: 'export type BindState = \'unbound\' | \'bound\';',
+  },
+  {
     name: 'Branded',
     declaration: 'export type Branded<B extends string> = string & {\n    readonly [BRAND]: B;\n};',
   },
@@ -4792,6 +4831,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'CoopReviewEventData',
     declaration: 'export interface CoopReviewEventData {\n    planId: string;\n    phase: \'pre_review\' | \'verify\' | \'abort_ack\';\n    decision: \'pass\' | \'request_changes\' | \'ack\';\n    summary?: string;\n}',
+  },
+  {
+    name: 'CoopV2RegistryEntry',
+    declaration: 'export interface CoopV2RegistryEntry {\n    sessionId: string;\n    roles: V2Role[];\n    masterId?: MasterId;\n    bindState: BindState;\n    cwd: string;\n    cwdScope: CwdScope;\n    updatedAt: number;\n    heartbeatAt: number;\n    meta?: {\n        model?: string;\n        provider?: string;\n        pid?: number;\n        host?: string;\n    };\n}',
   },
   {
     name: 'CordisDynamicPackageId',
@@ -5552,6 +5595,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'ManualCompactAgentContext',
     declaration: 'export interface ManualCompactAgentContext extends CompactionAgentContext {\n    runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>;\n}',
+  },
+  {
+    name: 'MasterId',
+    declaration: 'export type MasterId = Branded<\'CoopMasterId\'>;',
   },
   {
     name: 'McpResourceProvider',
@@ -7584,6 +7631,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'UserMessage',
     declaration: 'export interface UserMessage extends MessageBase {\n    readonly role: \'user\';\n}',
+  },
+  {
+    name: 'V2Role',
+    declaration: 'export type V2Role = \'master\' | \'worker\' | \'reviewer\';',
   },
   {
     name: 'VerifiedWebhookDelivery',
