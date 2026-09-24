@@ -11,7 +11,7 @@
 import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { writeFileAtomic, withFileLock } from '@deepseek-ai/dsh-atomic-write'
-import type { CoopInboxEntry, CoopPlanFile, CoopRegistryEntry, CoopRegistryFile, CoopV2MasterProfile, CoopV2PlanFile, CoopV2RegistryFile, CoopWorkspaceFile } from './types.ts'
+import type { CoopInboxEntry, CoopPlanFile, CoopRegistryEntry, CoopRegistryFile, CoopV2MasterProfile, CoopV2PlanFile, CoopV2RegistryFile, CoopWtRegistryFile, CoopWorkspaceFile } from './types.ts'
 
 /** Whether one caught read failure is the plain absence of the file. */
 function isMissing(error: unknown): boolean {
@@ -627,6 +627,67 @@ export async function readV2PlanFile(path: string): Promise<CoopV2PlanFile | und
 export async function writeV2PlanFile(path: string, plan: CoopV2PlanFile): Promise<void> {
   await writeFileAtomic(path, `${JSON.stringify(plan, null, 2)}\n`, { mode: FILE_MODE, dirMode: DIR_MODE })
 }
+
+// ---- v2 namespace: worktree occupancy table ----
+
+/**
+ * The global worktree occupancy path.
+ * @param root - absolute v2 root.
+ * @returns the wt-registry file path.
+ */
+export function wtRegistryPath(root: string): string {
+  return join(root, 'wt-registry.json')
+}
+
+/**
+ * Read the worktree occupancy table.
+ * @param path - wt-registry file path.
+ * @returns the parsed table, or `undefined` when absent.
+ * @throws when the file exists but is not a version-1 table.
+ */
+export async function readWtRegistry(path: string): Promise<CoopWtRegistryFile | undefined> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
+    if (isMissing(error)) return undefined
+    throw error
+  }
+  const parsed = JSON.parse(raw) as Partial<CoopWtRegistryFile> & Record<string, unknown>
+  if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+    throw new Error(`coop wt-registry at ${path} is not a version-1 table`)
+  }
+  return parsed as CoopWtRegistryFile
+}
+
+/**
+ * Atomically replace the worktree occupancy table.
+ * @param path - wt-registry file path.
+ * @param file - complete next table.
+ */
+export async function writeWtRegistry(path: string, file: CoopWtRegistryFile): Promise<void> {
+  await writeFileAtomic(path, `${JSON.stringify(file, null, 2)}\n`, { mode: FILE_MODE, dirMode: DIR_MODE })
+}
+
+/**
+ * Run one locked read-check-write cycle over the worktree occupancy table.
+ * @param path - wt-registry file path.
+ * @param mutate - locked transition returning `{ next, value }`.
+ * @returns the mutator's value.
+ */
+export async function mutateWtRegistry<T>(
+  path: string,
+  mutate: (current: CoopWtRegistryFile | undefined) => { next?: CoopWtRegistryFile; value: T },
+): Promise<T> {
+  await mkdir(dirname(path), { recursive: true, mode: DIR_MODE })
+  return withFileLock(path, async () => {
+    const current = await readWtRegistry(path)
+    const { next, value } = mutate(current)
+    if (next !== undefined && next !== current) await writeWtRegistry(path, next)
+    return value
+  })
+}
+
 
 /**
  * Run one locked read-check-write cycle over a v2 plan. The mutator sees the

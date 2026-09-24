@@ -912,4 +912,120 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       }
     },
   }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_worktree_create',
+    description: 'Create a git worktree for a plan (master only) under <workspace>/wt/<masterId>/; the name is unique per master and the occupancy row rides the global wt-registry lock. Defaults: base = the repo HEAD, branch = coop/<masterId>/<seq>-<slug>.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Plan the worktree serves.' },
+      from: { type: 'string', description: 'Base ref (branch or HEAD); default HEAD of the plan repo.' },
+      branch: { type: 'string', description: 'Branch to check out in the worktree; default coop/<masterId>/<seq>-<slug>.' },
+      purpose: { type: 'string', description: 'Short purpose slug used in the directory and branch name.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          dir: { type: 'string', required: true },
+          branch: { type: 'string', required: true },
+          baseBranch: { type: 'string', required: true },
+          status: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => textOut(`worktree ${value.dir} on ${value.branch} (base ${value.baseBranch}, ${value.status})`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const entry = await service.createWorktreeV2(agent, args.planId, {
+          ...(args.from === undefined ? {} : { from: args.from }),
+          ...(args.branch === undefined ? {} : { branch: args.branch }),
+          ...(args.purpose === undefined ? {} : { purpose: args.purpose }),
+        })
+        return { dir: entry.dir, branch: entry.branch, baseBranch: entry.baseBranch, status: entry.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Create coop worktree', kind: 'other', rawInput: args.planId }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_worktree_list',
+    description: 'List your worktree occupancy rows (optionally narrowed to one plan) with their status: active, merged, or cleaned.',
+    parameters: {
+      planId: { type: 'string', description: 'Optional plan filter.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          count: { type: 'integer', required: true },
+          detail: { type: 'array', required: true, items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => textOut(value.count === 0 ? 'No worktrees.' : `${value.count} worktree(s):\n${value.detail.join('\n')}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      const entries = await service.listWorktreesV2(agent, args.planId)
+      return {
+        count: entries.length,
+        detail: entries.map(entry => `${entry.dir} [${entry.status}] ${entry.branch} ← ${entry.baseBranch} (${entry.planId})`),
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_worktree_merge',
+    description: 'Merge one active worktree back into its base branch (git merge --no-ff, master only). Conflicts abort and fail loud — resolve manually or send the task to rework.',
+    parameters: {
+      dir: { type: 'string', required: true, description: 'Worktree directory from coop_worktree_list.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { dir: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`worktree ${value.dir} → ${value.status}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const entry = await service.mergeWorktreeV2(agent, args.dir)
+        return { dir: entry.dir, status: entry.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_worktree_clean',
+    description: 'Remove one worktree (git worktree remove, master only) and mark its occupancy row cleaned; pass force to discard local modifications.',
+    parameters: {
+      dir: { type: 'string', required: true, description: 'Worktree directory from coop_worktree_list.' },
+      force: { type: 'boolean', description: 'Discard local modifications.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { dir: { type: 'string', required: true }, cleaned: { type: 'boolean', required: true } },
+      },
+      render: (_args, value) => textOut(`worktree ${value.dir} removed`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        await service.cleanWorktreeV2(agent, args.dir, { ...(args.force === true ? { force: true } : {}) })
+        return { dir: args.dir, cleaned: true }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
 }

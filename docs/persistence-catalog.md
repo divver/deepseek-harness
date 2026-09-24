@@ -484,7 +484,7 @@ Source: [`packages/compaction/compaction/src/types.ts:34`](../packages/compactio
 'coop/execution': CoopExecutionEventData
 ```
 
-Source: [`packages/coop/coop/src/types.ts:161`](../packages/coop/coop/src/types.ts)
+Source: [`packages/coop/coop/src/types.ts:164`](../packages/coop/coop/src/types.ts)
 
 <a id="coopplan-change--log-only"></a>
 
@@ -495,7 +495,7 @@ Source: [`packages/coop/coop/src/types.ts:161`](../packages/coop/coop/src/types.
 'coop/plan-change': CoopPlanChangeEventData
 ```
 
-Source: [`packages/coop/coop/src/types.ts:157`](../packages/coop/coop/src/types.ts)
+Source: [`packages/coop/coop/src/types.ts:160`](../packages/coop/coop/src/types.ts)
 
 <a id="coopregistry--log-only"></a>
 
@@ -506,7 +506,7 @@ Source: [`packages/coop/coop/src/types.ts:157`](../packages/coop/coop/src/types.
 'coop/registry': CoopRegistryEventData
 ```
 
-Source: [`packages/coop/coop/src/types.ts:153`](../packages/coop/coop/src/types.ts)
+Source: [`packages/coop/coop/src/types.ts:156`](../packages/coop/coop/src/types.ts)
 
 <a id="coopregistry-v2--log-only"></a>
 
@@ -517,7 +517,7 @@ Source: [`packages/coop/coop/src/types.ts:153`](../packages/coop/coop/src/types.
 'coop/registry-v2': CoopV2RegistryEventData
 ```
 
-Source: [`packages/coop/coop/src/types.ts:155`](../packages/coop/coop/src/types.ts)
+Source: [`packages/coop/coop/src/types.ts:158`](../packages/coop/coop/src/types.ts)
 
 <a id="coopreview--log-only"></a>
 
@@ -528,7 +528,7 @@ Source: [`packages/coop/coop/src/types.ts:155`](../packages/coop/coop/src/types.
 'coop/review': CoopReviewEventData
 ```
 
-Source: [`packages/coop/coop/src/types.ts:159`](../packages/coop/coop/src/types.ts)
+Source: [`packages/coop/coop/src/types.ts:162`](../packages/coop/coop/src/types.ts)
 
 ### `deliverables/*`
 
@@ -3694,7 +3694,7 @@ Sources: [`packages/coop/coop/src/types.ts:116`](../packages/coop/coop/src/types
 
 SHA-256: `223ac5339a1a41764a72f1f3bc676a36305b2659a6bb13910e84c23a6c919d1f`
 
-Sources: [`packages/coop/coop/src/types.ts:220`](../packages/coop/coop/src/types.ts)
+Sources: [`packages/coop/coop/src/types.ts:223`](../packages/coop/coop/src/types.ts)
 
 | Property | Presence | Type |
 |---|---|---|
@@ -5673,7 +5673,7 @@ Array of [`UserMessage`](#persistence-type-sha256-bf8ecfb9c92f3b28f2327779328bcf
 
 SHA-256: `2b90fe43705b8adad5eb8fa18c7f72aeceb3796f982dbd160544bf0f8bbf7f1b`
 
-Sources: [`packages/coop/coop/src/types.ts:165`](../packages/coop/coop/src/types.ts)
+Sources: [`packages/coop/coop/src/types.ts:168`](../packages/coop/coop/src/types.ts)
 
 One of:
 

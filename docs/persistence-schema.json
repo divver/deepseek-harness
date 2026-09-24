@@ -34318,7 +34318,7 @@
         "packages/coop/coop/src/types.ts#CoopV2RegistryEventData"
       ],
       "sources": [
-        "packages/coop/coop/src/types.ts:220"
+        "packages/coop/coop/src/types.ts:223"
       ]
     },
     {
@@ -38378,7 +38378,7 @@
         "packages/coop/coop/src/types.ts#V2Role"
       ],
       "sources": [
-        "packages/coop/coop/src/types.ts:165"
+        "packages/coop/coop/src/types.ts:168"
       ]
     },
     {

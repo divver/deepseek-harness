@@ -146,6 +146,9 @@ export type CoopErrorCode =
     | 'COOP_NOT_YOUR_NODE'
     | 'COOP_DAG_CYCLE_REJECTED'
     | 'COOP_TASK_NOT_FOUND'
+    | 'COOP_WORKTREE_NOT_FOUND'
+    | 'COOP_WORKTREE_NAME_TAKEN'
+    | 'COOP_WORKTREE_MERGE_CONFLICT'
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
@@ -252,6 +255,8 @@ export interface CoopV2Task {
   dependsOn: string[]
   /** Bound worker session currently owning the task. */
   assignee?: string
+  /** Worktree directory the task runs in, once one is allocated. */
+  worktreeId?: string
   /** Executor style the task declares; subagent arrives with P3. */
   executor: 'inline' | 'subagent'
   /** Skills the assigned worker must cover. */
@@ -294,4 +299,32 @@ export interface CoopV2PlanFile {
   /** DAG edges; `from` finishing unblocks `to`. */
   edges: { from: string; to: string }[]
   history: CoopV2PlanHistoryEntry[]
+}
+/** Lifecycle of one coop-managed worktree. */
+export type CoopWtStatus = 'active' | 'merged' | 'cleaned'
+
+/** One entry of the global worktree occupancy table `v2/wt-registry.json`. */
+export interface CoopWtEntry {
+  /** Absolute worktree directory (`<workspace>/wt/<masterId>/<seq>-<slug>`). */
+  dir: string
+  /** Owning master id. */
+  masterId: string
+  /** Plan the worktree was created for. */
+  planId: string
+  /** Git repo root the worktree branches from (§12.1). */
+  repoRoot: string
+  /** Branch checked out in the worktree. */
+  branch: string
+  /** Branch the worktree is merged back into. */
+  baseBranch: string
+  /** Free-form purpose recorded at creation. */
+  purpose?: string
+  createdAt: number
+  status: CoopWtStatus
+}
+
+/** On-disk shape of `.dsh/coop/v2/wt-registry.json`. */
+export interface CoopWtRegistryFile {
+  version: 1
+  entries: CoopWtEntry[]
 }

@@ -193,6 +193,12 @@ async function runV2(
       : await service.abortPlanV2(agent, planId)
     return `Plan ${plan.planId} → ${plan.status}.`
   }
+  if (head === 'worktree' && (sub === 'list' || sub === undefined)) {
+    const planId = parsed.positional[2]
+    const entries = await service.listWorktreesV2(agent, planId)
+    if (entries.length === 0) return 'No worktrees.'
+    return entries.map(entry => `${entry.dir} [${entry.status}] ${entry.branch} ← ${entry.baseBranch} (${entry.planId})`).join('\n')
+  }
   if (head === 'workspace' && sub === 'init') {
     const target = parsed.positional[2]
     const root = await service.initWorkspace(agent, target)

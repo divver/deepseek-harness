@@ -27,6 +27,8 @@ import type {
   CoopV2RegistryEntry,
   CoopV2RegistryFile,
   CoopV2Task,
+  CoopWtEntry,
+  CoopWtRegistryFile,
   CwdScope,
   MasterId,
   PlanStatus,
@@ -1401,6 +1403,8 @@ export class CoopService extends Service {
     }
     const planIds = names.filter(name => name.endsWith('.json')).map(name => name.replace(/\.json$/u, ''))
     const busy = new Set<string>()
+    const usedWorktrees = new Set<string>()
+    const wtEntries = (await store.readWtRegistry(store.wtRegistryPath(root)))?.entries ?? []
     let inflight = 0
     for (const planId of planIds) {
       const plan = await store.readV2PlanFile(store.v2PlanPath(root, masterId, planId))
@@ -1409,6 +1413,9 @@ export class CoopService extends Service {
         if (task.assignee !== undefined && (task.status === 'assigned' || task.status === 'executing')) {
           busy.add(task.assignee)
           inflight++
+        }
+        if (task.worktreeId !== undefined && task.status !== 'done' && task.status !== 'cancelled') {
+          usedWorktrees.add(task.worktreeId)
         }
       }
     }
@@ -1427,7 +1434,23 @@ export class CoopService extends Service {
                 && task.skills.every(skill => (worker.skills ?? []).includes(skill)))
           const match = free[0]
           if (match === undefined) continue
-          const next: CoopV2Task = { ...task, status: 'assigned', assignee: match.sessionId, updatedAt: Date.now() }
+          let worktreeId = task.worktreeId
+          if (worktreeId === undefined) {
+            const freeWorktree = wtEntries.find(candidate => candidate.planId === planId
+              && candidate.status === 'active'
+              && !usedWorktrees.has(candidate.dir))
+            if (freeWorktree !== undefined) {
+              worktreeId = freeWorktree.dir
+              usedWorktrees.add(freeWorktree.dir)
+            }
+          }
+          const next: CoopV2Task = {
+            ...task,
+            status: 'assigned',
+            assignee: match.sessionId,
+            updatedAt: Date.now(),
+            ...(worktreeId === undefined ? {} : { worktreeId }),
+          }
           plan = {
             ...plan,
             tasks: plan.tasks.map(candidate => candidate.taskId === task.taskId ? next : candidate),
@@ -1442,7 +1465,7 @@ export class CoopService extends Service {
         busy.add(task.assignee)
         assigned++
         await this.deliverTask(root, masterId, task.assignee, planId, masterId, task,
-          `task assigned — call coop_execute_begin(planId="${planId}", taskId="${task.taskId}"), do the work per the spec, then coop_execute_report`)
+          `task assigned — call coop_execute_begin(planId="${planId}", taskId="${task.taskId}"), do the work per the spec${task.worktreeId === undefined ? '' : ` in worktree ${task.worktreeId}`}, then coop_execute_report`)
       }
     }
     return assigned
@@ -1561,7 +1584,7 @@ export class CoopService extends Service {
   async addTaskV2(
     agent: Agent,
     planId: string,
-    req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[] },
+    req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[]; worktreeId?: string },
   ): Promise<CoopV2Task> {
     const { masterId, root } = await this.requireV2Master(agent)
     const sessionId = String(agent.session.id)
@@ -1593,6 +1616,7 @@ export class CoopService extends Service {
           dependsOn,
           executor: req.executor ?? 'inline',
           skills: req.skills ?? [],
+          ...(req.worktreeId === undefined ? {} : { worktreeId: req.worktreeId }),
           attempts: 0,
           createdAt: now,
           updatedAt: now,
@@ -1941,6 +1965,13 @@ export class CoopService extends Service {
   async closePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile> {
     const { masterId, root } = await this.requireV2Master(agent)
     const sessionId = String(agent.session.id)
+    // §6.4: merge every still-active worktree of this plan before closing;
+    // a conflicted merge rejects here and the plan stays active.
+    const wtEntries = (await store.readWtRegistry(store.wtRegistryPath(root)))?.entries ?? []
+    for (const entry of wtEntries) {
+      if (entry.planId !== planId || entry.status !== 'active') continue
+      await this.mergeOneWorktree(root, entry)
+    }
     const closed = await store.mutateV2Plan(
       store.v2PlanPath(root, String(masterId), planId),
       (current): { next?: CoopV2PlanFile; value: CoopV2PlanFile } => {
@@ -1999,6 +2030,197 @@ export class CoopService extends Service {
     }
     await store.appendDocSection(store.v2DocPath(root, String(masterId), planId), `- ${new Date().toISOString()} aborted by ${sessionId}\n`)
     return plan
+  }
+
+  /**
+       * Run one git command through the mounted shell seam (never a raw
+       * `child_process`) and collect its exit code and trimmed output.
+       * @param workdir - absolute working directory.
+       * @param args - git arguments.
+       * @returns exit code plus stdout/stderr text.
+       */
+  private async runGit(workdir: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    const shell = this.ctx.get('shell') as {
+      resolve: (request: Record<string, unknown>) => unknown
+      execute: (spec: unknown) => Promise<{ result: () => Promise<{
+        exitCode: number | null
+        stdout: { text: string }
+        stderr: { text: string }
+      }> }>
+    } | undefined
+    if (shell === undefined) {
+      throw new CoopError('worktree operations require a mounted shell provider (ctx.shell)', 'COOP_CONFIG_UNSUPPORTED')
+    }
+    const spec = shell.resolve({
+      command: ['git', ...args].map(shellQuote).join(' '),
+      workdir,
+      timeoutMs: 30_000,
+      stdoutMaxBytes: 1_000_000,
+    })
+    const result = await (await shell.execute(spec)).result()
+    return { code: result.exitCode, stdout: result.stdout.text.trim(), stderr: result.stderr.text.trim() }
+  }
+
+  /**
+       * Create one worktree for a plan (master only). The directory lands under
+       * `<workspace>/wt/<masterId>/<seq>-<slug>`; the seq is monotonic per master
+       * and the directory name is claimed under the wt-registry writer lock, so
+       * concurrent masters can never collide (§3.2).
+       * @param agent - creating live master.
+       * @param planId - plan the worktree serves.
+       * @param req - base ref (default HEAD), optional branch name, and purpose slug.
+       * @returns the committed occupancy entry.
+       */
+  async createWorktreeV2(
+    agent: Agent,
+    planId: string,
+    req: { from?: string; branch?: string; purpose?: string } = {},
+  ): Promise<CoopWtEntry> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const masterIdStr = String(masterId)
+    const plan = await store.readV2PlanFile(store.v2PlanPath(root, masterIdStr, planId))
+    if (plan === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+    if (plan.status === 'closed' || plan.status === 'aborted') {
+      throw new CoopError(`plan "${planId}" is terminal (${plan.status})`, 'COOP_INVALID_TRANSITION')
+    }
+    const anchor = await store.findWorkspaceRoot(this.workspaceOf(agent), this.resolved.docRoot)
+    const wtRoot = join(anchor.root, 'wt')
+    const base = req.from ?? 'HEAD'
+    const baseBranch = base === 'HEAD'
+      ? (await this.runGit(plan.repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout
+      : base
+    if (baseBranch.length === 0) {
+      throw new CoopError(`cannot resolve the base branch of ${plan.repoRoot}`, 'COOP_CONFIG_UNSUPPORTED')
+    }
+    const entry = await store.mutateWtRegistry(
+      store.wtRegistryPath(root),
+      (current): { next?: CoopWtRegistryFile; value: { dir: string; branch: string } } => {
+        const entries = current?.entries ?? []
+        const seq = entries.filter(candidate => candidate.masterId === masterIdStr).length + 1
+        const slug = (req.purpose ?? req.branch ?? 'task')
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/gu, '-')
+          .replace(/^-+|-+$/gu, '')
+          .slice(0, 24) || 'task'
+        const dir = join(wtRoot, masterIdStr, `${String(seq).padStart(2, '0')}-${slug}`)
+        if (entries.some(candidate => candidate.dir === dir)) {
+          throw new CoopError(`worktree directory "${dir}" is already registered`, 'COOP_WORKTREE_NAME_TAKEN')
+        }
+        const branch = req.branch ?? `coop/${masterIdStr}/${String(seq).padStart(2, '0')}-${slug}`
+        return {
+          next: { version: 1, entries: [...entries, {
+            dir,
+            masterId: masterIdStr,
+            planId,
+            repoRoot: plan.repoRoot,
+            branch,
+            baseBranch,
+            ...(req.purpose === undefined ? {} : { purpose: req.purpose }),
+            createdAt: Date.now(),
+            status: 'active' as const,
+          }] },
+          value: { dir, branch },
+        }
+      })
+    const addArgs = base === 'HEAD'
+      ? ['worktree', 'add', '-b', entry.branch, entry.dir]
+      : ['worktree', 'add', '-b', entry.branch, entry.dir, base]
+    const run = await this.runGit(plan.repoRoot, addArgs)
+    if (run.code !== 0) {
+      // Roll the occupancy row back so the name stays claimable.
+      await store.mutateWtRegistry(store.wtRegistryPath(root), (current) => {
+        if (current === undefined) return { value: undefined }
+        const entries = current.entries.filter(candidate => candidate.dir !== entry.dir)
+        return { next: { version: 1, entries }, value: undefined }
+      })
+      throw new CoopError(`git worktree add failed (${String(run.code)}): ${run.stderr}`, 'COOP_CONFIG_UNSUPPORTED')
+    }
+    return { dir: entry.dir, masterId: masterIdStr, planId, repoRoot: plan.repoRoot, branch: entry.branch, baseBranch, createdAt: Date.now(), status: 'active' }
+  }
+
+  /**
+       * List the caller's worktree occupancy rows, optionally narrowed to a plan.
+       * @param agent - querying live master.
+       * @param planId - optional plan filter.
+       * @returns the matching entries.
+       */
+  async listWorktreesV2(agent: Agent, planId?: string): Promise<CoopWtEntry[]> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const entries = (await store.readWtRegistry(store.wtRegistryPath(root)))?.entries ?? []
+    return entries.filter(entry => entry.masterId === String(masterId) && (planId === undefined || entry.planId === planId))
+  }
+
+  /**
+       * Merge one active worktree's branch back into its base branch
+       * (`git merge --no-ff`). A moved base checkout or a conflicted merge aborts
+       * fail-loud with `COOP_WORKTREE_MERGE_CONFLICT` (§6.4: no auto-resolution).
+       * @param agent - merging live master.
+       * @param dir - worktree directory.
+       * @returns the merged occupancy entry.
+       */
+  async mergeWorktreeV2(agent: Agent, dir: string): Promise<CoopWtEntry> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const entry = (await store.readWtRegistry(store.wtRegistryPath(root)))?.entries.find(candidate => candidate.dir === dir)
+    if (entry === undefined || entry.masterId !== String(masterId)) {
+      throw new CoopError(`worktree "${dir}" is not one of your registered worktrees`, 'COOP_WORKTREE_NOT_FOUND')
+    }
+    return this.mergeOneWorktree(root, entry)
+  }
+
+  /**
+       * Remove one worktree (`git worktree remove`) and mark its row `cleaned`.
+       * @param agent - cleaning live master.
+       * @param dir - worktree directory.
+       * @param opts - `force` discards local modifications.
+       */
+  async cleanWorktreeV2(agent: Agent, dir: string, opts: { force?: boolean } = {}): Promise<void> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const entry = (await store.readWtRegistry(store.wtRegistryPath(root)))?.entries.find(candidate => candidate.dir === dir)
+    if (entry === undefined || entry.masterId !== String(masterId)) {
+      throw new CoopError(`worktree "${dir}" is not one of your registered worktrees`, 'COOP_WORKTREE_NOT_FOUND')
+    }
+    const run = await this.runGit(entry.repoRoot, ['worktree', 'remove', ...(opts.force === true ? ['--force'] : []), entry.dir])
+    if (run.code !== 0) {
+      throw new CoopError(`git worktree remove failed (${String(run.code)}): ${run.stderr} — pass force to discard modifications`, 'COOP_CONFIG_UNSUPPORTED')
+    }
+    await store.mutateWtRegistry(store.wtRegistryPath(root), (current) => {
+      if (current === undefined) return { value: undefined }
+      return {
+        next: { version: 1, entries: current.entries.map(candidate => candidate.dir === dir ? { ...candidate, status: 'cleaned' as const } : candidate) },
+        value: undefined,
+      }
+    })
+  }
+
+  /**
+       * Merge one active worktree row into its base and mark it `merged`.
+       * @param root - absolute v2 root.
+       * @param entry - occupancy row to merge.
+       * @returns the merged row.
+       */
+  private async mergeOneWorktree(root: string, entry: CoopWtEntry): Promise<CoopWtEntry> {
+    if (entry.status === 'merged') return entry
+    if (entry.status !== 'active') {
+      throw new CoopError(`worktree "${entry.dir}" is ${entry.status}`, 'COOP_WORKTREE_NOT_FOUND')
+    }
+    const head = await this.runGit(entry.repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])
+    if (head.code !== 0 || head.stdout !== entry.baseBranch) {
+      throw new CoopError(`repo HEAD is "${head.stdout || '?'}" but the worktree merges into "${entry.baseBranch}" — move the checkout back first`, 'COOP_WORKTREE_MERGE_CONFLICT')
+    }
+    const run = await this.runGit(entry.repoRoot, ['merge', '--no-ff', entry.branch, '-m', `coop: merge ${entry.branch}`])
+    if (run.code !== 0) {
+      await this.runGit(entry.repoRoot, ['merge', '--abort'])
+      throw new CoopError(`merging "${entry.branch}" into "${entry.baseBranch}" conflicted — resolve manually or rework: ${run.stdout} ${run.stderr}`, 'COOP_WORKTREE_MERGE_CONFLICT')
+    }
+    const merged: CoopWtEntry = { ...entry, status: 'merged' }
+    await store.mutateWtRegistry(store.wtRegistryPath(root), (current) => {
+      if (current === undefined) return { value: undefined }
+      return {
+        next: { version: 1, entries: current.entries.map(candidate => candidate.dir === entry.dir ? merged : candidate) },
+        value: undefined,
+      }
+    })
+    return merged
   }
 
 }
@@ -2078,4 +2300,8 @@ function recomputeReady(plan: CoopV2PlanFile, now: number): CoopV2PlanFile {
     return task
   })
   return { ...plan, tasks }
+}
+/** Quote one argv element for the shell-string seam; plain tokens stay bare. */
+function shellQuote(part: string): string {
+  return /^[\w.\/@:%+=^,-]+$/u.test(part) ? part : `'${part.replaceAll("'", '\'\\\'\'')}'`
 }

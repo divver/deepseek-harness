@@ -900,7 +900,7 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the committed active plan.',
       },
       {
-        signature: 'async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: \'inline\' | \'subagent\'; skills?: string[] }, ): Promise<CoopV2Task>',
+        signature: 'async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: \'inline\' | \'subagent\'; skills?: string[]; worktreeId?: string }, ): Promise<CoopV2Task>',
         description: 'Add one task to a non-terminal plan; `dependsOn` becomes DAG edges and a cycle is rejected under the plan lock. Schedules afterwards.',
         parameters: [{ name: 'agent', description: 'adding live master.' }, { name: 'planId', description: 'target plan.' }, { name: 'req', description: 'title, spec, dependencies, executor style, and skill demands.' }],
         returns: 'the committed task.',
@@ -956,6 +956,29 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         description: 'Abort a plan: any non-terminal status cancels every open task (in-flight assignees are signalled to stop) and the plan lands `aborted`.',
         parameters: [{ name: 'agent', description: 'aborting live master.' }, { name: 'planId', description: 'plan to abort.' }],
         returns: 'the committed aborted plan.',
+      },
+      {
+        signature: 'async createWorktreeV2( agent: Agent, planId: string, req: { from?: string; branch?: string; purpose?: string } = {}, ): Promise<CoopWtEntry>',
+        description: 'Create one worktree for a plan (master only). The directory lands under `<workspace>/wt/<masterId>/<seq>-<slug>`; the seq is monotonic per master and the directory name is claimed under the wt-registry writer lock, so concurrent masters can never collide (§3.2).',
+        parameters: [{ name: 'agent', description: 'creating live master.' }, { name: 'planId', description: 'plan the worktree serves.' }, { name: 'req', description: 'base ref (default HEAD), optional branch name, and purpose slug.' }],
+        returns: 'the committed occupancy entry.',
+      },
+      {
+        signature: 'async listWorktreesV2(agent: Agent, planId?: string): Promise<CoopWtEntry[]>',
+        description: 'List the caller\'s worktree occupancy rows, optionally narrowed to a plan.',
+        parameters: [{ name: 'agent', description: 'querying live master.' }, { name: 'planId', description: 'optional plan filter.' }],
+        returns: 'the matching entries.',
+      },
+      {
+        signature: 'async mergeWorktreeV2(agent: Agent, dir: string): Promise<CoopWtEntry>',
+        description: 'Merge one active worktree\'s branch back into its base branch (`git merge --no-ff`). A moved base checkout or a conflicted merge aborts fail-loud with `COOP_WORKTREE_MERGE_CONFLICT` (§6.4: no auto-resolution).',
+        parameters: [{ name: 'agent', description: 'merging live master.' }, { name: 'dir', description: 'worktree directory.' }],
+        returns: 'the merged occupancy entry.',
+      },
+      {
+        signature: 'async cleanWorktreeV2(agent: Agent, dir: string, opts: { force?: boolean } = {}): Promise<void>',
+        description: 'Remove one worktree (`git worktree remove`) and mark its row `cleaned`.',
+        parameters: [{ name: 'agent', description: 'cleaning live master.' }, { name: 'dir', description: 'worktree directory.' }, { name: 'opts', description: '`force` discards local modifications.' }],
       },
     ],
   },
@@ -4916,7 +4939,15 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'CoopV2Task',
-    declaration: 'export interface CoopV2Task {\n    taskId: string;\n    title: string;\n    spec: string;\n    status: V2TaskStatus;\n    dependsOn: string[];\n    assignee?: string;\n    executor: \'inline\' | \'subagent\';\n    skills: string[];\n    attempts: number;\n    createdAt: number;\n    updatedAt: number;\n    verify?: {\n        decision: \'pass\' | \'request_changes\';\n        summary?: string;\n        by: string;\n        at: number;\n    };\n    report?: {\n        summary: string;\n        by: string;\n        at: number;\n    };\n}',
+    declaration: 'export interface CoopV2Task {\n    taskId: string;\n    title: string;\n    spec: string;\n    status: V2TaskStatus;\n    dependsOn: string[];\n    assignee?: string;\n    worktreeId?: string;\n    executor: \'inline\' | \'subagent\';\n    skills: string[];\n    attempts: number;\n    createdAt: number;\n    updatedAt: number;\n    verify?: {\n        decision: \'pass\' | \'request_changes\';\n        summary?: string;\n        by: string;\n        at: number;\n    };\n    report?: {\n        summary: string;\n        by: string;\n        at: number;\n    };\n}',
+  },
+  {
+    name: 'CoopWtEntry',
+    declaration: 'export interface CoopWtEntry {\n    dir: string;\n    masterId: string;\n    planId: string;\n    repoRoot: string;\n    branch: string;\n    baseBranch: string;\n    purpose?: string;\n    createdAt: number;\n    status: CoopWtStatus;\n}',
+  },
+  {
+    name: 'CoopWtStatus',
+    declaration: 'export type CoopWtStatus = \'active\' | \'merged\' | \'cleaned\';',
   },
   {
     name: 'CordisDynamicPackageId',

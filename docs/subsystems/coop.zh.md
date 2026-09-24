@@ -276,7 +276,7 @@ async activatePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
      * @param req - title, spec, dependencies, executor style, and skill demands.
      * @returns the committed task.
      */
-async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[] }, ): Promise<CoopV2Task>
+async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[]; worktreeId?: string }, ): Promise<CoopV2Task>
 
 /**
      * Update a task's brief while it is not in flight (executing/reporting/
@@ -370,6 +370,44 @@ async closePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
      * @returns the committed aborted plan.
      */
 async abortPlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
+
+/**
+     * Create one worktree for a plan (master only). The directory lands under
+     * `<workspace>/wt/<masterId>/<seq>-<slug>`; the seq is monotonic per master
+     * and the directory name is claimed under the wt-registry writer lock, so
+     * concurrent masters can never collide (§3.2).
+     * @param agent - creating live master.
+     * @param planId - plan the worktree serves.
+     * @param req - base ref (default HEAD), optional branch name, and purpose slug.
+     * @returns the committed occupancy entry.
+     */
+async createWorktreeV2( agent: Agent, planId: string, req: { from?: string; branch?: string; purpose?: string } = {}, ): Promise<CoopWtEntry>
+
+/**
+     * List the caller's worktree occupancy rows, optionally narrowed to a plan.
+     * @param agent - querying live master.
+     * @param planId - optional plan filter.
+     * @returns the matching entries.
+     */
+async listWorktreesV2(agent: Agent, planId?: string): Promise<CoopWtEntry[]>
+
+/**
+     * Merge one active worktree's branch back into its base branch
+     * (`git merge --no-ff`). A moved base checkout or a conflicted merge aborts
+     * fail-loud with `COOP_WORKTREE_MERGE_CONFLICT` (§6.4: no auto-resolution).
+     * @param agent - merging live master.
+     * @param dir - worktree directory.
+     * @returns the merged occupancy entry.
+     */
+async mergeWorktreeV2(agent: Agent, dir: string): Promise<CoopWtEntry>
+
+/**
+     * Remove one worktree (`git worktree remove`) and mark its row `cleaned`.
+     * @param agent - cleaning live master.
+     * @param dir - worktree directory.
+     * @param opts - `force` discards local modifications.
+     */
+async cleanWorktreeV2(agent: Agent, dir: string, opts: { force?: boolean } = {}): Promise<void>
 ```
 
 Types: [Agent](core.zh.md)

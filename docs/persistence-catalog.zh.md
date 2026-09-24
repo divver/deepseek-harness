@@ -486,7 +486,7 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 'coop/execution': CoopExecutionEventData
 ```
 
-来源：[`packages/coop/coop/src/types.ts:161`](../packages/coop/coop/src/types.ts)
+来源：[`packages/coop/coop/src/types.ts:164`](../packages/coop/coop/src/types.ts)
 
 <a id="coopplan-change--log-only"></a>
 
@@ -497,7 +497,7 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 'coop/plan-change': CoopPlanChangeEventData
 ```
 
-来源：[`packages/coop/coop/src/types.ts:157`](../packages/coop/coop/src/types.ts)
+来源：[`packages/coop/coop/src/types.ts:160`](../packages/coop/coop/src/types.ts)
 
 <a id="coopregistry--log-only"></a>
 
@@ -508,7 +508,7 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 'coop/registry': CoopRegistryEventData
 ```
 
-来源：[`packages/coop/coop/src/types.ts:153`](../packages/coop/coop/src/types.ts)
+来源：[`packages/coop/coop/src/types.ts:156`](../packages/coop/coop/src/types.ts)
 
 <a id="coopregistry-v2--log-only"></a>
 
@@ -519,7 +519,7 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 'coop/registry-v2': CoopV2RegistryEventData
 ```
 
-来源：[`packages/coop/coop/src/types.ts:155`](../packages/coop/coop/src/types.ts)
+来源：[`packages/coop/coop/src/types.ts:158`](../packages/coop/coop/src/types.ts)
 
 <a id="coopreview--log-only"></a>
 
@@ -530,7 +530,7 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 'coop/review': CoopReviewEventData
 ```
 
-来源：[`packages/coop/coop/src/types.ts:159`](../packages/coop/coop/src/types.ts)
+来源：[`packages/coop/coop/src/types.ts:162`](../packages/coop/coop/src/types.ts)
 
 ### `deliverables/*`
 
@@ -3696,7 +3696,7 @@ SHA-256: `b90fb1ad3949cec37ff212e89b0f8a2a1cd70b01d0f975dde5e3d12f8401430c`
 
 SHA-256: `223ac5339a1a41764a72f1f3bc676a36305b2659a6bb13910e84c23a6c919d1f`
 
-来源：[`packages/coop/coop/src/types.ts:220`](../packages/coop/coop/src/types.ts)
+来源：[`packages/coop/coop/src/types.ts:223`](../packages/coop/coop/src/types.ts)
 
 | 属性 | 存在性 | 类型 |
 |---|---|---|
@@ -5675,7 +5675,7 @@ SHA-256: `6a0a18fb54eff45ffceefdc36cfa252cb2879bd80c53966868599147127efb17`
 
 SHA-256: `2b90fe43705b8adad5eb8fa18c7f72aeceb3796f982dbd160544bf0f8bbf7f1b`
 
-来源：[`packages/coop/coop/src/types.ts:165`](../packages/coop/coop/src/types.ts)
+来源：[`packages/coop/coop/src/types.ts:168`](../packages/coop/coop/src/types.ts)
 
 以下类型之一：
 
