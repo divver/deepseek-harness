@@ -45,6 +45,8 @@ All fields optional; enum and positivity rules fail loud at load.
 | `mode` | `v1` | `v2` selects the multi-master node registry (see below) |
 | `maxWorkers` | `4` | v2 per-master worker capacity enforced at bind and registration |
 | `maxReviewers` | `2` | v2 per-master reviewer capacity enforced at bind and registration |
+| `maxParallelTasks` | `3` | v2 per-master limit on concurrently assigned+executing tasks across plans |
+| `allowSelfReview` | `false` | v2 let the master verify its own tasks when no reviewer is bound (§12.4) |
 
 ## v2 mode (P0 shipped)
 
@@ -55,6 +57,7 @@ Set `mode: "v2"` to switch to the multi-master node registry ([spec](../../../.a
 - **Workspace anchor** — nodes resolve the nearest `.dsh/coop/workspace.json` walking up from the session cwd, else the cwd itself. A parent directory becomes a workspace only via `/coop workspace init [path]` — never silently.
 - **Commands** — `/coop master|worker|reviewer [--master <id>] [--model <route>] [--any-cwd]`, `/coop list [--unbound]`, `/coop bind|release <sessionId>`, `/coop status`, `/coop off`, `/coop workspace init [path]`.
 - **Tools** — `coop_register`, `coop_list`, `coop_bind`, `coop_release`, `coop_status`; the v1 eleven are not registered in v2 mode.
+- **Plans are task DAGs (P1)** — `coop_plan_create` (bound to one `repoRoot`, §12.1) → `coop_task_add`/`coop_task_link`/`coop_task_cancel` (cycle-checked under the plan lock) → `coop_plan_activate`. Readiness derives from the DAG; the scheduler assigns ready tasks to idle bound workers (skill demands ⊆ declared skills, `maxParallelTasks`) and wakes them with `task assigned` signals. Workers run `coop_execute_begin` → `coop_execute_report`; a bound reviewer verifies with `coop_task_verify` (`pass` → done and downstream goes ready; `request_changes` → rework for the same worker). `coop_board` is the kanban projection; `coop_plan_close` requires every task done/cancelled; `coop_plan_abort` cancels open tasks and signals in-flight assignees. Worktrees, plan-review gating, subagent executors, and memory arrive with P2–P4.
 
 ## Human commands
 

@@ -122,7 +122,7 @@ async function runRole(
   }
   return USAGE
 }
-const V2_USAGE = 'usage: /coop master [--any-cwd] · worker|reviewer [--master <masterId>] [--model <route>] [--any-cwd] · off · list [--unbound] · status · bind <sessionId> · release <sessionId> · workspace init [path]'
+const V2_USAGE = 'usage: /coop master [--any-cwd] · worker|reviewer [--master <masterId>] [--model <route>] [--skills a,b] [--any-cwd] · off · list [--unbound] · status · bind <sessionId> · release <sessionId> · board [planId] · plan close|abort <planId> · workspace init [path]'
 /** Dispatch the v2 `/coop` grammar for one live agent. */
 async function runV2(
   service: CoopService,
@@ -138,10 +138,15 @@ async function runV2(
   if (head === 'worker' || head === 'reviewer') {
     const master = parsed.flags.get('master')
     const model = parsed.flags.get('model')
+    const skillsFlag = parsed.flags.get('skills')
+    const skills = typeof skillsFlag === 'string'
+      ? skillsFlag.split(',').map(part => part.trim()).filter(part => part.length > 0)
+      : undefined
     const entry = await service.registerV2(agent, {
       roles: [head],
       ...(typeof master === 'string' ? { masterId: master } : {}),
       ...(typeof model === 'string' ? { model } : {}),
+      ...(skills === undefined ? {} : { skills }),
       ...(cwdScope === undefined ? {} : { cwdScope }),
     })
     return `${head} registered (${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}).`
@@ -171,6 +176,22 @@ async function runV2(
   if (head === 'release' && sub !== undefined) {
     await service.releaseNode(agent, sub)
     return `Node ${sub} released to the unbound pool.`
+  }
+  if (head === 'board') {
+    const plans = await service.boardV2(agent, sub)
+    if (plans.length === 0) return 'No plans yet.'
+    return plans.map(plan => [
+      `${plan.planId} ${plan.title} [${plan.status}]`,
+      plan.tasks.map(task => `  ${task.taskId} ${task.title} [${task.status}${task.assignee === undefined ? '' : ` → ${task.assignee}`}]`).join('\n') || '  (no tasks)',
+    ].join('\n')).join('\n\n')
+  }
+  if (head === 'plan' && (sub === 'close' || sub === 'abort')) {
+    const planId = parsed.positional[2]
+    if (planId === undefined) return V2_USAGE
+    const plan = sub === 'close'
+      ? await service.closePlanV2(agent, planId)
+      : await service.abortPlanV2(agent, planId)
+    return `Plan ${plan.planId} → ${plan.status}.`
   }
   if (head === 'workspace' && sub === 'init') {
     const target = parsed.positional[2]

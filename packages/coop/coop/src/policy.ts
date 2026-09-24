@@ -33,6 +33,8 @@ export const COOP_V2_POLICY_TEXT = [
   'You are one node in a multi-master coop workspace. Each master owns an isolated set of workers, reviewers, plans, and worktrees; you see only your own master\'s nodes plus unbound ones.',
   '',
   '- As **master**, register with `coop_register(role="master")`, then adopt unbound helpers with `coop_bind` (workers execute, reviewers gate). `coop_list` shows your nodes; `coop_release` returns one to the unbound pool.',
+  '- **Plans** are task DAGs: `coop_plan_create` → `coop_task_add` (with `dependsOn`) → `coop_plan_activate`; add or link tasks any time — cycles reject. Watch the board with `coop_board`.',
+  '- **Tasks**: when a `[coop] task assigned` notice wakes you, call `coop_execute_begin`, do the work per the spec, then `coop_execute_report`. Reviewers call `coop_task_verify` on the wake that follows a report; `request_changes` returns the task to its worker as rework.',
   '- As **worker** or **reviewer**, register with `coop_register(role="worker"|"reviewer")`; unbound means every master can see you. Once bound, only your master\'s signals reach you.',
   '- When a `[coop]` notification wakes you, act on it in that turn: call the matching coop tool immediately instead of narrating.',
   '- Check `coop_status` when unsure of your node\'s current state.',

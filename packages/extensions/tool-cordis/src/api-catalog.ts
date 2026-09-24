@@ -859,7 +859,7 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the anchored workspace root.',
       },
       {
-        signature: 'async registerV2( agent: Agent, req: { roles: V2Role[]; masterId?: string; model?: string; cwdScope?: CwdScope }, ): Promise<CoopV2RegistryEntry>',
+        signature: 'async registerV2( agent: Agent, req: { roles: V2Role[]; masterId?: string; model?: string; cwdScope?: CwdScope; skills?: string[] }, ): Promise<CoopV2RegistryEntry>',
         description: 'Register this session as a v2 node. A master mints (or resumes) its masterId and profile; a worker/reviewer lands `unbound` for any master to adopt, or pre-bound when `masterId` names a live master with spare capacity. Empty roles deregister.',
         parameters: [{ name: 'agent', description: 'registering live agent.' }, { name: 'req', description: 'target roles, optional owning master, model route, and directory scope.' }],
         returns: 'the committed registry entry.',
@@ -886,6 +886,76 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         description: 'Human/model summary across the workspace: live masters, the caller\'s own nodes, and the adoptable unbound count. Cross-master detail stays summarized — isolation applies to agents, not to the human operator.',
         parameters: [{ name: 'agent', description: 'querying live agent.' }],
         returns: 'the caller\'s entry, master ids, own nodes, and unbound count.',
+      },
+      {
+        signature: 'async createPlanV2(agent: Agent, req: { title: string; objective: string; repoRoot?: string }): Promise<CoopV2PlanFile>',
+        description: 'Create a v2 plan bound to one repo root (§12.1: no cross-repo plans). Master-only; the plan lands `designing` with an empty DAG and a markdown trail. P3 routes activation through reviewer sign-off.',
+        parameters: [{ name: 'agent', description: 'creating live master.' }, { name: 'req', description: 'title, objective, and optional repo root (defaults to the cwd).' }],
+        returns: 'the committed designing plan.',
+      },
+      {
+        signature: 'async activatePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>',
+        description: 'designing → active: recompute readiness from the DAG and schedule.',
+        parameters: [{ name: 'agent', description: 'activating live master.' }, { name: 'planId', description: 'plan to activate.' }],
+        returns: 'the committed active plan.',
+      },
+      {
+        signature: 'async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: \'inline\' | \'subagent\'; skills?: string[] }, ): Promise<CoopV2Task>',
+        description: 'Add one task to a non-terminal plan; `dependsOn` becomes DAG edges and a cycle is rejected under the plan lock. Schedules afterwards.',
+        parameters: [{ name: 'agent', description: 'adding live master.' }, { name: 'planId', description: 'target plan.' }, { name: 'req', description: 'title, spec, dependencies, executor style, and skill demands.' }],
+        returns: 'the committed task.',
+      },
+      {
+        signature: 'async updateTaskV2( agent: Agent, planId: string, taskId: string, req: { title?: string; spec?: string; executor?: \'inline\' | \'subagent\'; skills?: string[] }, ): Promise<CoopV2Task>',
+        description: 'Update a task\'s brief while it is not in flight (executing/reporting/ verifying tasks are locked).',
+        parameters: [{ name: 'agent', description: 'updating live master.' }, { name: 'planId', description: 'owning plan.' }, { name: 'taskId', description: 'target task.' }, { name: 'req', description: 'optional title, spec, executor style, and skill demands.' }],
+        returns: 'the committed task.',
+      },
+      {
+        signature: 'async linkTaskV2(agent: Agent, planId: string, req: { from: string; to: string }): Promise<void>',
+        description: 'Add one dependency edge (`from` finishing unblocks `to`) to a non-terminal plan; cycles reject under the lock. Idempotent.',
+        parameters: [{ name: 'agent', description: 'linking live master.' }, { name: 'planId', description: 'owning plan.' }, { name: 'req', description: 'upstream and downstream task ids.' }],
+      },
+      {
+        signature: 'async cancelTaskV2(agent: Agent, planId: string, taskId: string): Promise<void>',
+        description: 'Cancel one task of a non-terminal plan; an in-flight task\'s assignee is signalled, downstream dependencies go blocked, and capacity is freed.',
+        parameters: [{ name: 'agent', description: 'cancelling live master.' }, { name: 'planId', description: 'owning plan.' }, { name: 'taskId', description: 'target task.' }],
+      },
+      {
+        signature: 'async boardV2(agent: Agent, planId?: string): Promise<CoopV2PlanFile[]>',
+        description: 'Kanban projection: one plan (or every plan of the caller\'s master) with lazily recomputed readiness. Read-only for the caller.',
+        parameters: [{ name: 'agent', description: 'querying live master.' }, { name: 'planId', description: 'optional single plan id.' }],
+        returns: 'the plan snapshots.',
+      },
+      {
+        signature: 'async executeBeginV2(agent: Agent, planId: string, taskId: string): Promise<CoopV2Task>',
+        description: 'Assigned worker starts (or restarts after rework): assigned/rework → executing. Only the task\'s assignee may begin.',
+        parameters: [{ name: 'agent', description: 'assigned live worker.' }, { name: 'planId', description: 'owning plan.' }, { name: 'taskId', description: 'target task.' }],
+        returns: 'the committed executing task.',
+      },
+      {
+        signature: 'async executeReportV2(agent: Agent, planId: string, taskId: string, summary: string): Promise<CoopV2Task>',
+        description: 'Assigned worker reports finished execution: executing → verifying, then the master and every fresh bound reviewer are woken to verify and the freed worker becomes schedulable again.',
+        parameters: [{ name: 'agent', description: 'reporting live worker.' }, { name: 'planId', description: 'owning plan.' }, { name: 'taskId', description: 'target task.' }, { name: 'summary', description: 'what was done.' }],
+        returns: 'the committed verifying task.',
+      },
+      {
+        signature: 'async verifyTaskV2( agent: Agent, planId: string, taskId: string, decision: \'pass\' | \'request_changes\', summary?: string, ): Promise<CoopV2Task>',
+        description: 'Verify one reported task. Gate: a reviewer bound to the owning master, or the master itself when `allowSelfReview` is on (§12.4, default off). pass → done (downstream goes ready, capacity freed, scheduler runs); request_changes → rework with `attempts` incremented and the assignee re-signalled to begin again.',
+        parameters: [{ name: 'agent', description: 'verifying live reviewer (or self-reviewing master).' }, { name: 'planId', description: 'owning plan.' }, { name: 'taskId', description: 'target task.' }, { name: 'decision', description: 'pass or request_changes.' }, { name: 'summary', description: 'acceptance rationale or rework demand.' }],
+        returns: 'the committed task.',
+      },
+      {
+        signature: 'async closePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>',
+        description: 'Close a finished plan: every task must be done or cancelled. P2 inserts worktree merge/clean ahead of this step.',
+        parameters: [{ name: 'agent', description: 'closing live master.' }, { name: 'planId', description: 'plan to close.' }],
+        returns: 'the committed closed plan.',
+      },
+      {
+        signature: 'async abortPlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>',
+        description: 'Abort a plan: any non-terminal status cancels every open task (in-flight assignees are signalled to stop) and the plan lands `aborted`.',
+        parameters: [{ name: 'agent', description: 'aborting live master.' }, { name: 'planId', description: 'plan to abort.' }],
+        returns: 'the committed aborted plan.',
       },
     ],
   },
@@ -4833,8 +4903,20 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface CoopReviewEventData {\n    planId: string;\n    phase: \'pre_review\' | \'verify\' | \'abort_ack\';\n    decision: \'pass\' | \'request_changes\' | \'ack\';\n    summary?: string;\n}',
   },
   {
+    name: 'CoopV2PlanFile',
+    declaration: 'export interface CoopV2PlanFile {\n    version: 2;\n    planId: string;\n    masterId: MasterId;\n    repoRoot: string;\n    title: string;\n    objective: string;\n    status: V2PlanStatus;\n    createdBy: string;\n    cwd: string;\n    createdAt: number;\n    tasks: CoopV2Task[];\n    edges: {\n        from: string;\n        to: string;\n    }[];\n    history: CoopV2PlanHistoryEntry[];\n}',
+  },
+  {
+    name: 'CoopV2PlanHistoryEntry',
+    declaration: 'export interface CoopV2PlanHistoryEntry {\n    time: number;\n    sessionId: string;\n    op: string;\n    summary?: string;\n}',
+  },
+  {
     name: 'CoopV2RegistryEntry',
-    declaration: 'export interface CoopV2RegistryEntry {\n    sessionId: string;\n    roles: V2Role[];\n    masterId?: MasterId;\n    bindState: BindState;\n    cwd: string;\n    cwdScope: CwdScope;\n    updatedAt: number;\n    heartbeatAt: number;\n    meta?: {\n        model?: string;\n        provider?: string;\n        pid?: number;\n        host?: string;\n    };\n}',
+    declaration: 'export interface CoopV2RegistryEntry {\n    sessionId: string;\n    roles: V2Role[];\n    masterId?: MasterId;\n    bindState: BindState;\n    cwd: string;\n    cwdScope: CwdScope;\n    updatedAt: number;\n    heartbeatAt: number;\n    skills?: string[];\n    meta?: {\n        model?: string;\n        provider?: string;\n        pid?: number;\n        host?: string;\n    };\n}',
+  },
+  {
+    name: 'CoopV2Task',
+    declaration: 'export interface CoopV2Task {\n    taskId: string;\n    title: string;\n    spec: string;\n    status: V2TaskStatus;\n    dependsOn: string[];\n    assignee?: string;\n    executor: \'inline\' | \'subagent\';\n    skills: string[];\n    attempts: number;\n    createdAt: number;\n    updatedAt: number;\n    verify?: {\n        decision: \'pass\' | \'request_changes\';\n        summary?: string;\n        by: string;\n        at: number;\n    };\n    report?: {\n        summary: string;\n        by: string;\n        at: number;\n    };\n}',
   },
   {
     name: 'CordisDynamicPackageId',
@@ -7633,8 +7715,16 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface UserMessage extends MessageBase {\n    readonly role: \'user\';\n}',
   },
   {
+    name: 'V2PlanStatus',
+    declaration: 'export type V2PlanStatus = \'designing\' | \'reviewing\' | \'active\' | \'closing\' | \'closed\' | \'aborted\';',
+  },
+  {
     name: 'V2Role',
     declaration: 'export type V2Role = \'master\' | \'worker\' | \'reviewer\';',
+  },
+  {
+    name: 'V2TaskStatus',
+    declaration: 'export type V2TaskStatus = \'pending\' | \'ready\' | \'assigned\' | \'executing\' | \'reporting\' | \'verifying\' | \'done\' | \'rework\' | \'blocked\' | \'cancelled\';',
   },
   {
     name: 'VerifiedWebhookDelivery',

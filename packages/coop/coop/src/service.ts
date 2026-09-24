@@ -23,12 +23,17 @@ import type {
   CoopInboxEntry,
   CoopPlanFile,
   CoopRegistryEntry,
+  CoopV2PlanFile,
   CoopV2RegistryEntry,
   CoopV2RegistryFile,
+  CoopV2Task,
+  CwdScope,
+  MasterId,
   PlanStatus,
   ReviewLevel,
   Role,
-  V2Role, CwdScope } from './types.ts'
+  V2Role,
+} from './types.ts'
 import {
   CoopError,
   PlanId as brandPlanId,
@@ -79,6 +84,10 @@ export interface Config {
   maxWorkers?: number
   /** v2 per-master reviewer capacity enforced at bind and registration. */
   maxReviewers?: number
+  /** v2 per-master limit on concurrently assigned+executing tasks across plans. */
+  maxParallelTasks?: number
+  /** v2 whether the master may verify its own tasks when no reviewer is bound (§12.4; default off). */
+  allowSelfReview?: boolean
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -95,6 +104,8 @@ export const Config: z<Config> = z.object({
   mode: z.string(),
   maxWorkers: z.number(),
   maxReviewers: z.number(),
+  maxParallelTasks: z.number(),
+  allowSelfReview: z.boolean(),
   inboxPollMs: z.number(),
   mirrorEvents: z.boolean(),
 }) as unknown as z<Config>
@@ -862,6 +873,8 @@ export class CoopService extends Service {
         return `[coop] ABORT plan "${entry.planId}"${entry.reason === undefined ? '' : ` — reason: ${entry.reason}`} — stop all further work for this plan immediately, clean up, then call coop_abort_ack(planId).`
       case 'node':
         return `[coop] Node notice: ${entry.summary}`
+      case 'task':
+        return `[coop] Task notice (${entry.planId}): ${entry.summary}. Plan document: ${entry.docPath}. Act on it in this turn.`
       default:
         return `[coop] Plan "${entry.planId}" notification: ${entry.summary}`
     }
@@ -1053,7 +1066,7 @@ export class CoopService extends Service {
        */
   async registerV2(
     agent: Agent,
-    req: { roles: V2Role[]; masterId?: string; model?: string; cwdScope?: CwdScope },
+    req: { roles: V2Role[]; masterId?: string; model?: string; cwdScope?: CwdScope; skills?: string[] },
   ): Promise<CoopV2RegistryEntry> {
     if (req.roles.length === 0) return this.deregisterV2(agent)
     const sessionId = String(agent.session.id)
@@ -1077,6 +1090,7 @@ export class CoopService extends Service {
           updatedAt: now,
           heartbeatAt: now,
           ...meta,
+          ...(req.skills === undefined ? {} : { skills: req.skills }),
         }
         return {
           next: { version: 2, entries: [...(current?.entries ?? []).filter(candidate => candidate.sessionId !== sessionId), next] },
@@ -1107,6 +1121,7 @@ export class CoopService extends Service {
         updatedAt: now,
         heartbeatAt: now,
         ...meta,
+        ...(req.skills === undefined ? {} : { skills: req.skills }),
       }
       if (req.masterId === undefined) {
         return { next: { version: 2, entries: [...others, next] }, value: { entry: next, masterId: undefined as string | undefined } }
@@ -1315,4 +1330,752 @@ export class CoopService extends Service {
     const target = this.ctx.agents.get(SessionId(targetId))
     if (target !== undefined) await this.drainAgentInbox(target, root)
   }
+
+  /**
+       * The caller's live master entry plus the v2 root; every master-owned plan
+       * operation funnels through this gate.
+       * @param agent - acting live agent.
+       * @returns the master id and v2 root.
+       */
+  private async requireV2Master(agent: Agent): Promise<{ masterId: MasterId; root: string }> {
+    const root = await this.v2RootOf(agent)
+    const now = Date.now()
+    const own = (await this.v2Tables(root)).find(entry => entry.sessionId === String(agent.session.id))
+    if (own === undefined || !own.roles.includes('master') || !this.isFreshV2(own, now)) {
+      throw new CoopError('this operation requires this session to be a live v2 master', 'COOP_NODE_NOT_FOUND')
+    }
+    const { masterId } = own
+    if (masterId === undefined) throw new CoopError('master entry lacks a masterId', 'COOP_CONFIG_UNSUPPORTED')
+    return { masterId, root }
+  }
+
+  /**
+       * Resolve one plan visible to the calling node: masters reach their own
+       * plans; bound workers/reviewers reach their owning master's plans. Unbound
+       * nodes and cross-master ids see nothing (isolation by visibility).
+       * @param agent - acting live node.
+       * @param planId - plan to resolve.
+       * @returns the plan snapshot and the v2 root.
+       */
+  private async planForNode(agent: Agent, planId: string): Promise<{ plan: CoopV2PlanFile; root: string }> {
+    const root = await this.v2RootOf(agent)
+    const now = Date.now()
+    const own = (await this.v2Tables(root)).find(entry => entry.sessionId === String(agent.session.id))
+    if (own === undefined || !this.isFreshV2(own, now)) {
+      throw new CoopError('this session holds no live v2 coop role — register first', 'COOP_NODE_NOT_FOUND')
+    }
+    const masterId = own.masterId
+    if (masterId === undefined) {
+      throw new CoopError('this node is not bound to a master', 'COOP_NODE_NOT_FOUND')
+    }
+    const plan = await store.readV2PlanFile(store.v2PlanPath(root, String(masterId), planId))
+    if (plan === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+    return { plan, root }
+  }
+
+  /**
+       * Assign ready tasks of the master's active plans to idle bound workers.
+       * Single-writer per master (the acting process); each assignment commits
+       * under its plan's writer lock and the busy set is rebuilt from a fresh scan
+       * of every active plan, so `maxParallelTasks` holds across plans. A worker
+       * without declared skills only receives tasks with no skill demand.
+       * @param root - absolute v2 root.
+       * @param masterId - owning master id.
+       * @returns how many tasks were assigned.
+       */
+  private async scheduleV2(root: string, masterId: string): Promise<number> {
+    const now = Date.now()
+    const entries = await this.v2Tables(root)
+    const workers = entries.filter(entry => entry.bindState === 'bound'
+          && String(entry.masterId) === masterId
+          && entry.roles.includes('worker')
+          && this.isFreshV2(entry, now))
+    if (workers.length === 0) return 0
+    const dir = store.v2PlansDir(root, masterId)
+    let names: string[]
+    try {
+      names = await readdir(dir)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return 0
+      throw error
+    }
+    const planIds = names.filter(name => name.endsWith('.json')).map(name => name.replace(/\.json$/u, ''))
+    const busy = new Set<string>()
+    let inflight = 0
+    for (const planId of planIds) {
+      const plan = await store.readV2PlanFile(store.v2PlanPath(root, masterId, planId))
+      if (plan?.status !== 'active') continue
+      for (const task of plan.tasks) {
+        if (task.assignee !== undefined && (task.status === 'assigned' || task.status === 'executing')) {
+          busy.add(task.assignee)
+          inflight++
+        }
+      }
+    }
+    let assigned = 0
+    for (const planId of planIds) {
+      if (inflight + assigned >= this.resolved.maxParallelTasks) break
+      const path = store.v2PlanPath(root, masterId, planId)
+      const taken = await store.mutateV2Plan(path, (current): { next?: CoopV2PlanFile; value: CoopV2Task[] } => {
+        if (current === undefined || current.status !== 'active') return { value: [] }
+        let plan = recomputeReady(current, Date.now())
+        const picked: CoopV2Task[] = []
+        for (const task of plan.tasks) {
+          if (task.status !== 'ready') continue
+          if (inflight + picked.length >= this.resolved.maxParallelTasks) break
+          const free = workers.filter(worker => !busy.has(worker.sessionId)
+                && task.skills.every(skill => (worker.skills ?? []).includes(skill)))
+          const match = free[0]
+          if (match === undefined) continue
+          const next: CoopV2Task = { ...task, status: 'assigned', assignee: match.sessionId, updatedAt: Date.now() }
+          plan = {
+            ...plan,
+            tasks: plan.tasks.map(candidate => candidate.taskId === task.taskId ? next : candidate),
+          }
+          picked.push(next)
+        }
+        if (picked.length === 0) return plan === current ? { value: [] } : { next: plan, value: [] }
+        return { next: plan, value: picked }
+      })
+      for (const task of taken) {
+        if (task.assignee === undefined) continue
+        busy.add(task.assignee)
+        assigned++
+        await this.deliverTask(root, masterId, task.assignee, planId, masterId, task,
+          `task assigned — call coop_execute_begin(planId="${planId}", taskId="${task.taskId}"), do the work per the spec, then coop_execute_report`)
+      }
+    }
+    return assigned
+  }
+
+  /**
+       * Append one task signal and drain the target when it is live in-process.
+       * @param root - absolute v2 root.
+       * @param fromId - acting node id (master id or session id).
+       * @param targetId - receiving session id.
+       * @param planId - owning plan id.
+       * @param masterId - owning master id (for the doc path).
+       * @param task - task the notice is about.
+       * @param text - one-line notice text.
+       */
+  private async deliverTask(
+    root: string,
+    fromId: string,
+    targetId: string,
+    planId: string,
+    masterId: string,
+    task: CoopV2Task,
+    text: string,
+  ): Promise<void> {
+    await store.appendSignal(store.inboxPath(root, targetId), {
+      time: Date.now(),
+      from: fromId,
+      planId,
+      kind: 'task',
+      summary: `${task.taskId} (${task.title}) — ${text}`,
+      docPath: store.v2DocPath(root, masterId, planId),
+    })
+    const target = this.ctx.agents.get(SessionId(targetId))
+    if (target !== undefined) await this.drainAgentInbox(target, root)
+  }
+
+  /**
+       * Create a v2 plan bound to one repo root (§12.1: no cross-repo plans).
+       * Master-only; the plan lands `designing` with an empty DAG and a markdown
+       * trail. P3 routes activation through reviewer sign-off.
+       * @param agent - creating live master.
+       * @param req - title, objective, and optional repo root (defaults to the cwd).
+       * @returns the committed designing plan.
+       */
+  async createPlanV2(agent: Agent, req: { title: string; objective: string; repoRoot?: string }): Promise<CoopV2PlanFile> {
+    const sessionId = String(agent.session.id)
+    const cwd = this.workspaceOf(agent)
+    const { masterId, root } = await this.requireV2Master(agent)
+    const planId = `plan-${randomUUID()}`
+    const now = Date.now()
+    const plan: CoopV2PlanFile = {
+      version: 2,
+      planId,
+      masterId,
+      repoRoot: normalizeCwd(req.repoRoot ?? cwd),
+      title: req.title,
+      objective: req.objective,
+      status: 'designing',
+      createdBy: sessionId,
+      cwd,
+      createdAt: now,
+      tasks: [],
+      edges: [],
+      history: [{ time: now, sessionId, op: 'create' }],
+    }
+    await store.appendDocSection(store.v2DocPath(root, String(masterId), planId), [
+      `# ${req.title}`,
+      '',
+      '## Objective',
+      '',
+      req.objective,
+      '',
+      `Plan ${planId} · master ${String(masterId)} · repo ${plan.repoRoot}`,
+      '',
+      '## Changelog',
+      '',
+      `- ${new Date(now).toISOString()} created by ${sessionId} (designing)`,
+      '',
+    ].join('\n'))
+    await store.writeV2PlanFile(store.v2PlanPath(root, String(masterId), planId), plan)
+    return plan
+  }
+
+  /**
+       * designing → active: recompute readiness from the DAG and schedule.
+       * @param agent - activating live master.
+       * @param planId - plan to activate.
+       * @returns the committed active plan.
+       */
+  async activatePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const sessionId = String(agent.session.id)
+    const now = Date.now()
+    const plan = await store.mutateV2Plan(
+      store.v2PlanPath(root, String(masterId), planId),
+      (current): { next?: CoopV2PlanFile; value: CoopV2PlanFile } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        if (current.status !== 'designing') {
+          throw new CoopError(`plan "${planId}" is "${current.status}", expected designing`, 'COOP_INVALID_TRANSITION')
+        }
+        const next = recomputeReady({ ...current, status: 'active' }, now)
+        return { next: { ...next, history: [...current.history, { time: now, sessionId, op: 'activate' }] }, value: next }
+      })
+    await this.scheduleV2(root, String(masterId))
+    return plan
+  }
+
+  /**
+       * Add one task to a non-terminal plan; `dependsOn` becomes DAG edges and a
+       * cycle is rejected under the plan lock. Schedules afterwards.
+       * @param agent - adding live master.
+       * @param planId - target plan.
+       * @param req - title, spec, dependencies, executor style, and skill demands.
+       * @returns the committed task.
+       */
+  async addTaskV2(
+    agent: Agent,
+    planId: string,
+    req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[] },
+  ): Promise<CoopV2Task> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const sessionId = String(agent.session.id)
+    const task = await store.mutateV2Plan(
+      store.v2PlanPath(root, String(masterId), planId),
+      (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        if (current.status === 'closed' || current.status === 'aborted') {
+          throw new CoopError(`plan "${planId}" is terminal (${current.status})`, 'COOP_INVALID_TRANSITION')
+        }
+        const taskId = `t${current.tasks.length + 1}`
+        const dependsOn = req.dependsOn ?? []
+        for (const dep of dependsOn) {
+          if (!current.tasks.some(candidate => candidate.taskId === dep)) {
+            throw new CoopError(`task "${dep}" does not exist in plan "${planId}"`, 'COOP_TASK_NOT_FOUND')
+          }
+        }
+        const edges = [...current.edges, ...dependsOn.map(from => ({ from, to: taskId }))]
+        const cycle = detectCycle(edges)
+        if (cycle !== undefined) {
+          throw new CoopError(`edge would create a cycle: ${cycle.join(' → ')}`, 'COOP_DAG_CYCLE_REJECTED')
+        }
+        const now = Date.now()
+        const fresh: CoopV2Task = {
+          taskId,
+          title: req.title,
+          spec: req.spec,
+          status: 'pending',
+          dependsOn,
+          executor: req.executor ?? 'inline',
+          skills: req.skills ?? [],
+          attempts: 0,
+          createdAt: now,
+          updatedAt: now,
+        }
+        const staged: CoopV2PlanFile = {
+          ...current,
+          tasks: [...current.tasks, fresh],
+          edges,
+          history: [...current.history, { time: now, sessionId, op: `task_add ${taskId}` }],
+        }
+        const next = recomputeReady(staged, now)
+        const committed = next.tasks.find(candidate => candidate.taskId === taskId)
+        if (committed === undefined) throw new CoopError('task vanished in commit', 'COOP_CONFIG_UNSUPPORTED')
+        return { next, value: committed }
+      })
+    await this.scheduleV2(root, String(masterId))
+    return task
+  }
+
+  /**
+       * Update a task's brief while it is not in flight (executing/reporting/
+       * verifying tasks are locked).
+       * @param agent - updating live master.
+       * @param planId - owning plan.
+       * @param taskId - target task.
+       * @param req - optional title, spec, executor style, and skill demands.
+       * @returns the committed task.
+       */
+  async updateTaskV2(
+    agent: Agent,
+    planId: string,
+    taskId: string,
+    req: { title?: string; spec?: string; executor?: 'inline' | 'subagent'; skills?: string[] },
+  ): Promise<CoopV2Task> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const sessionId = String(agent.session.id)
+    return store.mutateV2Plan(
+      store.v2PlanPath(root, String(masterId), planId),
+      (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        const task = current.tasks.find(candidate => candidate.taskId === taskId)
+        if (task === undefined) throw new CoopError(`task "${taskId}" not found in plan "${planId}"`, 'COOP_TASK_NOT_FOUND')
+        if (task.status === 'executing' || task.status === 'reporting' || task.status === 'verifying') {
+          throw new CoopError(`task "${taskId}" is "${task.status}" and locked while in flight`, 'COOP_INVALID_TRANSITION')
+        }
+        const now = Date.now()
+        const next: CoopV2Task = {
+          ...task,
+          ...(req.title === undefined ? {} : { title: req.title }),
+          ...(req.spec === undefined ? {} : { spec: req.spec }),
+          ...(req.executor === undefined ? {} : { executor: req.executor }),
+          ...(req.skills === undefined ? {} : { skills: req.skills }),
+          updatedAt: now,
+        }
+        const plan: CoopV2PlanFile = {
+          ...current,
+          tasks: current.tasks.map(candidate => candidate.taskId === taskId ? next : candidate),
+          history: [...current.history, { time: now, sessionId, op: `task_update ${taskId}` }],
+        }
+        return { next: plan, value: next }
+      })
+  }
+
+  /**
+       * Add one dependency edge (`from` finishing unblocks `to`) to a
+       * non-terminal plan; cycles reject under the lock. Idempotent.
+       * @param agent - linking live master.
+       * @param planId - owning plan.
+       * @param req - upstream and downstream task ids.
+       */
+  async linkTaskV2(agent: Agent, planId: string, req: { from: string; to: string }): Promise<void> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const sessionId = String(agent.session.id)
+    await store.mutateV2Plan(store.v2PlanPath(root, String(masterId), planId), (current): { next?: CoopV2PlanFile; value: undefined } => {
+      if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+      if (current.status === 'closed' || current.status === 'aborted') {
+        throw new CoopError(`plan "${planId}" is terminal (${current.status})`, 'COOP_INVALID_TRANSITION')
+      }
+      const { from, to } = req
+      const target = current.tasks.find(candidate => candidate.taskId === to)
+      if (target === undefined || !current.tasks.some(candidate => candidate.taskId === from)) {
+        throw new CoopError(`link targets "${from}"/"${to}" do not both exist in plan "${planId}"`, 'COOP_TASK_NOT_FOUND')
+      }
+      if (current.edges.some(edge => edge.from === from && edge.to === to)) return { value: undefined }
+      const edges = [...current.edges, { from, to }]
+      const cycle = detectCycle(edges)
+      if (cycle !== undefined) {
+        throw new CoopError(`edge would create a cycle: ${cycle.join(' → ')}`, 'COOP_DAG_CYCLE_REJECTED')
+      }
+      const now = Date.now()
+      const staged: CoopV2PlanFile = {
+        ...current,
+        tasks: current.tasks.map(candidate => candidate.taskId === to
+          ? { ...candidate, dependsOn: [...new Set([...candidate.dependsOn, from])] }
+          : candidate),
+        edges,
+        history: [...current.history, { time: now, sessionId, op: `task_link ${from}→${to}` }],
+      }
+      return { next: recomputeReady(staged, now), value: undefined }
+    })
+    await this.scheduleV2(root, String(masterId))
+  }
+
+  /**
+       * Cancel one task of a non-terminal plan; an in-flight task's assignee is
+       * signalled, downstream dependencies go blocked, and capacity is freed.
+       * @param agent - cancelling live master.
+       * @param planId - owning plan.
+       * @param taskId - target task.
+       */
+  async cancelTaskV2(agent: Agent, planId: string, taskId: string): Promise<void> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const sessionId = String(agent.session.id)
+    const outcome = await store.mutateV2Plan(
+      store.v2PlanPath(root, String(masterId), planId),
+      (current): { next?: CoopV2PlanFile; value: { task?: CoopV2Task; changed: boolean } } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        if (current.status === 'closed' || current.status === 'aborted') {
+          throw new CoopError(`plan "${planId}" is terminal (${current.status})`, 'COOP_INVALID_TRANSITION')
+        }
+        const task = current.tasks.find(candidate => candidate.taskId === taskId)
+        if (task === undefined) throw new CoopError(`task "${taskId}" not found in plan "${planId}"`, 'COOP_TASK_NOT_FOUND')
+        if (task.status === 'done' || task.status === 'cancelled') return { value: { task, changed: false } }
+        const now = Date.now()
+        const next: CoopV2Task = { ...task, status: 'cancelled', updatedAt: now }
+        const staged: CoopV2PlanFile = {
+          ...current,
+          tasks: current.tasks.map(candidate => candidate.taskId === taskId ? next : candidate),
+          history: [...current.history, { time: now, sessionId, op: `task_cancel ${taskId}` }],
+        }
+        return { next: recomputeReady(staged, now), value: { task: next, changed: true } }
+      })
+    if (outcome.changed && outcome.task !== undefined && outcome.task.assignee !== undefined) {
+      await this.deliverTask(root, String(masterId), outcome.task.assignee, planId, String(masterId), outcome.task,
+        'task cancelled — drop it and stand by for the next assignment')
+    }
+    if (outcome.changed) await this.scheduleV2(root, String(masterId))
+  }
+
+  /**
+       * Kanban projection: one plan (or every plan of the caller's master) with
+       * lazily recomputed readiness. Read-only for the caller.
+       * @param agent - querying live master.
+       * @param planId - optional single plan id.
+       * @returns the plan snapshots.
+       */
+  async boardV2(agent: Agent, planId?: string): Promise<CoopV2PlanFile[]> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const dir = store.v2PlansDir(root, String(masterId))
+    let names: string[]
+    try {
+      names = await readdir(dir)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
+        if (planId !== undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        return []
+      }
+      throw error
+    }
+    const ids = planId === undefined
+      ? names.filter(name => name.endsWith('.json')).map(name => name.replace(/\.json$/u, ''))
+      : [planId]
+    const plans: CoopV2PlanFile[] = []
+    for (const id of ids) {
+      const plan = await store.mutateV2Plan(
+        store.v2PlanPath(root, String(masterId), id),
+        (current): { next?: CoopV2PlanFile; value: CoopV2PlanFile | undefined } => {
+          if (current === undefined) {
+            if (planId !== undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+            return { value: undefined }
+          }
+          const next = recomputeReady(current, Date.now())
+          return next === current ? { value: current } : { next, value: next }
+        })
+      if (plan !== undefined) plans.push(plan)
+    }
+    return plans
+  }
+
+  /**
+       * Assigned worker starts (or restarts after rework): assigned/rework →
+       * executing. Only the task's assignee may begin.
+       * @param agent - assigned live worker.
+       * @param planId - owning plan.
+       * @param taskId - target task.
+       * @returns the committed executing task.
+       */
+  async executeBeginV2(agent: Agent, planId: string, taskId: string): Promise<CoopV2Task> {
+    const sessionId = String(agent.session.id)
+    const { plan, root } = await this.planForNode(agent, planId)
+    return store.mutateV2Plan(
+      store.v2PlanPath(root, String(plan.masterId), planId),
+      (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        const task = current.tasks.find(candidate => candidate.taskId === taskId)
+        if (task === undefined) throw new CoopError(`task "${taskId}" not found in plan "${planId}"`, 'COOP_TASK_NOT_FOUND')
+        if (task.assignee !== sessionId) {
+          throw new CoopError(`task "${taskId}" is assigned to "${task.assignee ?? 'nobody'}"`, 'COOP_NOT_ASSIGNED_WORKER')
+        }
+        if (task.status !== 'assigned' && task.status !== 'rework') {
+          throw new CoopError(`task "${taskId}" is "${task.status}", expected assigned/rework`, 'COOP_INVALID_TRANSITION')
+        }
+        const now = Date.now()
+        const next: CoopV2Task = { ...task, status: 'executing', updatedAt: now }
+        const planNext: CoopV2PlanFile = {
+          ...current,
+          tasks: current.tasks.map(candidate => candidate.taskId === taskId ? next : candidate),
+          history: [...current.history, { time: now, sessionId, op: `execute_begin ${taskId}` }],
+        }
+        return { next: planNext, value: next }
+      })
+  }
+
+  /**
+       * Assigned worker reports finished execution: executing → verifying, then
+       * the master and every fresh bound reviewer are woken to verify and the
+       * freed worker becomes schedulable again.
+       * @param agent - reporting live worker.
+       * @param planId - owning plan.
+       * @param taskId - target task.
+       * @param summary - what was done.
+       * @returns the committed verifying task.
+       */
+  async executeReportV2(agent: Agent, planId: string, taskId: string, summary: string): Promise<CoopV2Task> {
+    const sessionId = String(agent.session.id)
+    const { plan, root } = await this.planForNode(agent, planId)
+    const masterId = String(plan.masterId)
+    const reported = await store.mutateV2Plan(
+      store.v2PlanPath(root, masterId, planId),
+      (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        const task = current.tasks.find(candidate => candidate.taskId === taskId)
+        if (task === undefined) throw new CoopError(`task "${taskId}" not found in plan "${planId}"`, 'COOP_TASK_NOT_FOUND')
+        if (task.assignee !== sessionId) {
+          throw new CoopError(`task "${taskId}" is assigned to "${task.assignee ?? 'nobody'}"`, 'COOP_NOT_ASSIGNED_WORKER')
+        }
+        if (task.status !== 'executing') {
+          throw new CoopError(`task "${taskId}" is "${task.status}", expected executing`, 'COOP_INVALID_TRANSITION')
+        }
+        const now = Date.now()
+        const next: CoopV2Task = {
+          ...task,
+          status: 'verifying',
+          updatedAt: now,
+          report: { summary, by: sessionId, at: now },
+        }
+        const planNext: CoopV2PlanFile = {
+          ...current,
+          tasks: current.tasks.map(candidate => candidate.taskId === taskId ? next : candidate),
+          history: [...current.history, { time: now, sessionId, op: `execute_report ${taskId}`, summary }],
+        }
+        return { next: planNext, value: next }
+      })
+    const now = Date.now()
+    const entries = await this.v2Tables(root)
+    const masterEntry = entries.find(entry => entry.roles.includes('master') && String(entry.masterId) === masterId)
+    const reviewers = entries.filter(entry => entry.bindState === 'bound'
+          && String(entry.masterId) === masterId
+          && entry.roles.includes('reviewer')
+          && this.isFreshV2(entry, now))
+    const text = `execution reported — call coop_task_verify(planId="${planId}", taskId="${taskId}", decision)`
+    if (masterEntry !== undefined) {
+      await this.deliverTask(root, sessionId, masterEntry.sessionId, planId, masterId, reported, text)
+    }
+    for (const reviewer of reviewers) {
+      await this.deliverTask(root, sessionId, reviewer.sessionId, planId, masterId, reported, text)
+    }
+    await this.scheduleV2(root, masterId)
+    return reported
+  }
+
+  /**
+       * Verify one reported task. Gate: a reviewer bound to the owning master,
+       * or the master itself when `allowSelfReview` is on (§12.4, default off).
+       * pass → done (downstream goes ready, capacity freed, scheduler runs);
+       * request_changes → rework with `attempts` incremented and the assignee
+       * re-signalled to begin again.
+       * @param agent - verifying live reviewer (or self-reviewing master).
+       * @param planId - owning plan.
+       * @param taskId - target task.
+       * @param decision - pass or request_changes.
+       * @param summary - acceptance rationale or rework demand.
+       * @returns the committed task.
+       */
+  async verifyTaskV2(
+    agent: Agent,
+    planId: string,
+    taskId: string,
+    decision: 'pass' | 'request_changes',
+    summary?: string,
+  ): Promise<CoopV2Task> {
+    const sessionId = String(agent.session.id)
+    const { plan, root } = await this.planForNode(agent, planId)
+    const masterId = String(plan.masterId)
+    const now = Date.now()
+    const own = (await this.v2Tables(root)).find(entry => entry.sessionId === sessionId)
+    if (own === undefined || !this.isFreshV2(own, now)) {
+      throw new CoopError('this session holds no live v2 coop role — register first', 'COOP_NODE_NOT_FOUND')
+    }
+    const isReviewer = own.roles.includes('reviewer') && String(own.masterId) === masterId
+    const isMaster = own.roles.includes('master') && String(own.masterId) === masterId
+    if (!isReviewer && !(isMaster && this.resolved.allowSelfReview)) {
+      throw new CoopError('task verification requires a reviewer bound to this master (or allowSelfReview)', 'COOP_NOT_ASSIGNED_WORKER')
+    }
+    const verified = await store.mutateV2Plan(
+      store.v2PlanPath(root, masterId, planId),
+      (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        const task = current.tasks.find(candidate => candidate.taskId === taskId)
+        if (task === undefined) throw new CoopError(`task "${taskId}" not found in plan "${planId}"`, 'COOP_TASK_NOT_FOUND')
+        if (task.status !== 'verifying') {
+          throw new CoopError(`task "${taskId}" is "${task.status}", expected verifying`, 'COOP_INVALID_TRANSITION')
+        }
+        const at = Date.now()
+        const next: CoopV2Task = {
+          ...task,
+          status: decision === 'pass' ? 'done' : 'rework',
+          updatedAt: at,
+          ...(decision === 'pass' ? {} : { attempts: task.attempts + 1 }),
+          verify: { decision, ...(summary === undefined ? {} : { summary }), by: sessionId, at },
+        }
+        const staged: CoopV2PlanFile = {
+          ...current,
+          tasks: current.tasks.map(candidate => candidate.taskId === taskId ? next : candidate),
+          history: [...current.history, { time: at, sessionId, op: `task_verify ${taskId} ${decision}`, ...(summary === undefined ? {} : { summary }) }],
+        }
+        return { next: recomputeReady(staged, at), value: next }
+      })
+    if (verified.assignee !== undefined) {
+      const text = decision === 'pass'
+        ? 'verify passed — task done; you are free for the next assignment'
+        : `rework requested${summary === undefined ? '' : `: ${summary}`} — call coop_execute_begin again, address the feedback, then coop_execute_report`
+      await this.deliverTask(root, sessionId, verified.assignee, planId, masterId, verified, text)
+    }
+    if (decision === 'pass') await this.scheduleV2(root, masterId)
+    return verified
+  }
+
+  /**
+       * Close a finished plan: every task must be done or cancelled. P2 inserts
+       * worktree merge/clean ahead of this step.
+       * @param agent - closing live master.
+       * @param planId - plan to close.
+       * @returns the committed closed plan.
+       */
+  async closePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const sessionId = String(agent.session.id)
+    const closed = await store.mutateV2Plan(
+      store.v2PlanPath(root, String(masterId), planId),
+      (current): { next?: CoopV2PlanFile; value: CoopV2PlanFile } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        if (current.status === 'closed') return { value: current }
+        if (current.status !== 'active') {
+          throw new CoopError(`plan "${planId}" is "${current.status}", expected active`, 'COOP_INVALID_TRANSITION')
+        }
+        const open = current.tasks.filter(task => task.status !== 'done' && task.status !== 'cancelled')
+        if (open.length > 0) {
+          throw new CoopError(`plan "${planId}" still has ${open.length} open task(s): ${open.map(task => task.taskId).join(', ')}`, 'COOP_INVALID_TRANSITION')
+        }
+        const now = Date.now()
+        const next: CoopV2PlanFile = { ...current, status: 'closed', history: [...current.history, { time: now, sessionId, op: 'close' }] }
+        return { next, value: next }
+      })
+    await store.appendDocSection(store.v2DocPath(root, String(masterId), planId), `- ${new Date().toISOString()} closed by ${sessionId}\n`)
+    return closed
+  }
+
+  /**
+       * Abort a plan: any non-terminal status cancels every open task (in-flight
+       * assignees are signalled to stop) and the plan lands `aborted`.
+       * @param agent - aborting live master.
+       * @param planId - plan to abort.
+       * @returns the committed aborted plan.
+       */
+  async abortPlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    const sessionId = String(agent.session.id)
+    const outcome = await store.mutateV2Plan(
+      store.v2PlanPath(root, String(masterId), planId),
+      (current): { next?: CoopV2PlanFile; value: { plan?: CoopV2PlanFile; signalled: CoopV2Task[] } } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        if (current.status === 'aborted') return { value: { plan: current, signalled: [] } }
+        if (current.status === 'closed') {
+          throw new CoopError(`plan "${planId}" is closed`, 'COOP_INVALID_TRANSITION')
+        }
+        const now = Date.now()
+        const signalled: CoopV2Task[] = []
+        const tasks = current.tasks.map((task) => {
+          if (task.status === 'done' || task.status === 'cancelled') return task
+          const next: CoopV2Task = { ...task, status: 'cancelled', updatedAt: now }
+          if (next.assignee !== undefined) signalled.push(next)
+          return next
+        })
+        const next: CoopV2PlanFile = { ...current, status: 'aborted', tasks, history: [...current.history, { time: now, sessionId, op: 'abort' }] }
+        return { next, value: { plan: next, signalled } }
+      })
+    const plan = outcome.plan
+    if (plan === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+    for (const task of outcome.signalled) {
+      if (task.assignee === undefined) continue
+      await this.deliverTask(root, String(masterId), task.assignee, planId, String(masterId), task,
+        'plan aborted — drop this task and stop all further work for the plan')
+    }
+    await store.appendDocSection(store.v2DocPath(root, String(masterId), planId), `- ${new Date().toISOString()} aborted by ${sessionId}\n`)
+    return plan
+  }
+
+}
+/**
+ * Whether the edge set contains a cycle; returns the cycle path for the
+ * rejection message, or `undefined` when the graph is acyclic.
+ * @param edges - complete candidate edge set.
+ * @returns the cycle node path, or `undefined`.
+ */
+function detectCycle(edges: { from: string; to: string }[]): string[] | undefined {
+  const graph = new Map<string, string[]>()
+  for (const { from, to } of edges) {
+    const list = graph.get(from)
+    if (list === undefined) graph.set(from, [to])
+    else list.push(to)
+  }
+  const state = new Map<string, 0 | 1 | 2>()
+  const stack: string[] = []
+  const visit = (node: string): string[] | undefined => {
+    const mark = state.get(node)
+    if (mark === 2) return undefined
+    if (mark === 1) return [...stack.slice(stack.indexOf(node)), node]
+    state.set(node, 1)
+    stack.push(node)
+    for (const next of graph.get(node) ?? []) {
+      const cycle = visit(next)
+      if (cycle !== undefined) return cycle
+    }
+    stack.pop()
+    state.set(node, 2)
+    return undefined
+  }
+  for (const from of graph.keys()) {
+    const cycle = visit(from)
+    if (cycle !== undefined) return cycle
+  }
+  return undefined
+}
+
+/**
+ * Recompute `pending`/`ready`/`blocked` from the DAG: every dependency done
+ * ⇒ ready, any dependency cancelled/blocked ⇒ blocked, else pending. Tasks in
+ * flight or terminal stay fixed. Returns the same reference when nothing
+ * moved so locked writes can skip the rewrite.
+ * @param plan - plan whose idle tasks need recomputation.
+ * @param now - epoch ms stamped onto moved tasks.
+ * @returns the plan with refreshed idle-task statuses.
+ */
+function recomputeReady(plan: CoopV2PlanFile, now: number): CoopV2PlanFile {
+  const byId = new Map(plan.tasks.map(task => [task.taskId, task]))
+  const tasks = plan.tasks.map((task) => {
+    if (task.status !== 'pending' && task.status !== 'ready' && task.status !== 'blocked') return task
+    let missing = false
+    let dead = false
+    let allDone = true
+    for (const dep of task.dependsOn) {
+      const upstream = byId.get(dep)
+      if (upstream === undefined) {
+        missing = true
+        continue
+      }
+      if (upstream.status === 'cancelled' || upstream.status === 'blocked') dead = true
+      if (upstream.status !== 'done') allDone = false
+    }
+    if (missing) return task
+    if (dead) {
+      if (task.status === 'blocked') return task
+      return { ...task, status: 'blocked' as const, updatedAt: now }
+    }
+    if (allDone) {
+      if (task.status === 'ready') return task
+      return { ...task, status: 'ready' as const, updatedAt: now }
+    }
+    if (task.status !== 'pending') {
+      return { ...task, status: 'pending' as const, updatedAt: now }
+    }
+    return task
+  })
+  return { ...plan, tasks }
 }

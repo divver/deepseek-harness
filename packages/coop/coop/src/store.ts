@@ -11,7 +11,7 @@
 import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { writeFileAtomic, withFileLock } from '@deepseek-ai/dsh-atomic-write'
-import type { CoopInboxEntry, CoopPlanFile, CoopRegistryEntry, CoopRegistryFile, CoopV2MasterProfile, CoopV2RegistryFile, CoopWorkspaceFile } from './types.ts'
+import type { CoopInboxEntry, CoopPlanFile, CoopRegistryEntry, CoopRegistryFile, CoopV2MasterProfile, CoopV2PlanFile, CoopV2RegistryFile, CoopWorkspaceFile } from './types.ts'
 
 /** Whether one caught read failure is the plain absence of the file. */
 function isMissing(error: unknown): boolean {
@@ -563,6 +563,92 @@ export async function readMasterProfile(path: string): Promise<CoopV2MasterProfi
   }
   return parsed as CoopV2MasterProfile
 }
+
+// ---- v2 namespace: plan DAG files ----
+
+/**
+ * The v2 plans directory of one master.
+ * @param root - absolute v2 root.
+ * @param masterId - owning master id.
+ * @returns the plans directory path.
+ */
+export function v2PlansDir(root: string, masterId: string): string {
+  return join(root, 'masters', masterId, 'plans')
+}
+
+/**
+ * The authoritative v2 plan file path.
+ * @param root - absolute v2 root.
+ * @param masterId - owning master id.
+ * @param planId - plan identifier.
+ * @returns the plan JSON path.
+ */
+export function v2PlanPath(root: string, masterId: string, planId: string): string {
+  return join(v2PlansDir(root, masterId), `${planId}.json`)
+}
+
+/**
+ * The markdown trail document of one v2 plan.
+ * @param root - absolute v2 root.
+ * @param masterId - owning master id.
+ * @param planId - plan identifier.
+ * @returns the plan markdown path.
+ */
+export function v2DocPath(root: string, masterId: string, planId: string): string {
+  return join(root, 'masters', masterId, 'docs', `${planId}.md`)
+}
+
+/**
+ * Read and validate one v2 plan file.
+ * @param path - plan JSON path.
+ * @returns the parsed plan, or `undefined` when absent.
+ * @throws when the file exists but is not a version-2 plan.
+ */
+export async function readV2PlanFile(path: string): Promise<CoopV2PlanFile | undefined> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
+    if (isMissing(error)) return undefined
+    throw error
+  }
+  const parsed = JSON.parse(raw) as Partial<CoopV2PlanFile> & Record<string, unknown>
+  if (parsed.version !== 2 || typeof parsed.planId !== 'string' || !Array.isArray(parsed.tasks) || !Array.isArray(parsed.edges)) {
+    throw new Error(`coop v2 plan at ${path} is not a version-2 plan file`)
+  }
+  return parsed as CoopV2PlanFile
+}
+
+/**
+ * Atomically replace one v2 plan file.
+ * @param path - plan JSON path.
+ * @param plan - complete next plan state.
+ */
+export async function writeV2PlanFile(path: string, plan: CoopV2PlanFile): Promise<void> {
+  await writeFileAtomic(path, `${JSON.stringify(plan, null, 2)}\n`, { mode: FILE_MODE, dirMode: DIR_MODE })
+}
+
+/**
+ * Run one locked read-check-write cycle over a v2 plan. The mutator sees the
+ * current plan and returns the next plan (same reference leaves the file
+ * untouched) plus a value computed from the locked state.
+ * @param path - plan JSON path.
+ * @param mutate - locked transition returning `{ next, value }`.
+ * @returns the mutator's value.
+ */
+export async function mutateV2Plan<T>(
+  path: string,
+  mutate: (current: CoopV2PlanFile | undefined) => { next?: CoopV2PlanFile; value: T },
+): Promise<T> {
+  await mkdir(dirname(path), { recursive: true, mode: DIR_MODE })
+  return withFileLock(path, async () => {
+    const current = await readV2PlanFile(path)
+    const { next, value } = mutate(current)
+    if (next !== undefined && next !== current) await writeV2PlanFile(path, next)
+    return value
+  })
+}
+
 
 /**
  * Atomically write one master profile.

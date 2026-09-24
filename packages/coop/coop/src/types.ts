@@ -91,7 +91,7 @@ export interface CoopInboxEntry {
   time: number
   from: string
   planId: string
-  kind: 'drive' | 'notify' | 'pre_review' | 'verify' | 'execution' | 'abort' | 'node'
+  kind: 'drive' | 'notify' | 'pre_review' | 'verify' | 'execution' | 'abort' | 'node' | 'task'
   summary: string
   docPath: string
   reason?: string
@@ -144,6 +144,8 @@ export type CoopErrorCode =
     | 'COOP_NODE_ALREADY_BOUND'
     | 'COOP_NODE_LIMIT_REACHED'
     | 'COOP_NOT_YOUR_NODE'
+    | 'COOP_DAG_CYCLE_REJECTED'
+    | 'COOP_TASK_NOT_FOUND'
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
@@ -186,6 +188,8 @@ export interface CoopV2RegistryEntry {
   updatedAt: number
   /** Liveness heartbeat touched by the owning session, epoch ms. */
   heartbeatAt: number
+  /** Skills this node declares; the scheduler matches task skill demands against them. */
+  skills?: string[]
   /** Optional registration metadata; `model` is the LlmAdapter route string. */
   meta?: { model?: string; provider?: string; pid?: number; host?: string }
 }
@@ -219,4 +223,75 @@ export interface CoopV2RegistryEventData {
   masterId?: string
   bindState?: BindState
   updatedAt: number
+}
+/** Lifecycle of one v2 plan (review gate arrives with P3). */
+export type V2PlanStatus = 'designing' | 'reviewing' | 'active' | 'closing' | 'closed' | 'aborted'
+
+/** Lifecycle of one v2 task inside a plan DAG. */
+export type V2TaskStatus =
+  | 'pending'
+  | 'ready'
+  | 'assigned'
+  | 'executing'
+  | 'reporting'
+  | 'verifying'
+  | 'done'
+  | 'rework'
+  | 'blocked'
+  | 'cancelled'
+
+/** One task node of a v2 plan DAG. */
+export interface CoopV2Task {
+  /** Short per-plan task id (`t<n>`), unique inside the plan. */
+  taskId: string
+  title: string
+  /** Full task brief handed to the assigned worker. */
+  spec: string
+  status: V2TaskStatus
+  /** Upstream task ids derived from the plan's edges; all done ⇒ ready. */
+  dependsOn: string[]
+  /** Bound worker session currently owning the task. */
+  assignee?: string
+  /** Executor style the task declares; subagent arrives with P3. */
+  executor: 'inline' | 'subagent'
+  /** Skills the assigned worker must cover. */
+  skills: string[]
+  /** Rework round count; verify request_changes increments. */
+  attempts: number
+  createdAt: number
+  updatedAt: number
+  /** Latest verify conclusion, once one exists. */
+  verify?: { decision: 'pass' | 'request_changes'; summary?: string; by: string; at: number }
+  /** Latest worker report text, once one exists. */
+  report?: { summary: string; by: string; at: number }
+}
+
+/** One append to a v2 plan's history trail. */
+export interface CoopV2PlanHistoryEntry {
+  time: number
+  sessionId: string
+  op: string
+  summary?: string
+}
+
+/** On-disk authoritative v2 plan: `v2/masters/<masterId>/plans/<planId>.json`. */
+export interface CoopV2PlanFile {
+  version: 2
+  planId: string
+  /** Owning master id; every operation filters on it. */
+  masterId: MasterId
+  /** Git repo root this plan is bound to (§12.1: no cross-repo plans). */
+  repoRoot: string
+  title: string
+  objective: string
+  status: V2PlanStatus
+  /** Creating master session id. */
+  createdBy: string
+  /** Normalized workspace cwd the plan was created in. */
+  cwd: string
+  createdAt: number
+  tasks: CoopV2Task[]
+  /** DAG edges; `from` finishing unblocks `to`. */
+  edges: { from: string; to: string }[]
+  history: CoopV2PlanHistoryEntry[]
 }

@@ -45,6 +45,8 @@ executing heartbeat timeout → needs_rework (worker may re-begin)
 | `mode` | `v1` | `v2` 启用多 master 节点注册表（见下） |
 | `maxWorkers` | `4` | v2 单 master 的 worker 容量上限（bind 与注册时校验） |
 | `maxReviewers` | `2` | v2 单 master 的 reviewer 容量上限（bind 与注册时校验） |
+| `maxParallelTasks` | `3` | v2 单 master 跨 plan 同时 assigned+executing 的任务上限 |
+| `allowSelfReview` | `false` | v2 无 reviewer 时允许 master 自验自己的任务（§12.4） |
 
 ## v2 模式（已交付 P0）
 
@@ -55,6 +57,7 @@ executing heartbeat timeout → needs_rework (worker may re-begin)
 - **Workspace 锚点** —— 节点自 session cwd 逐级向上找最近的 `.dsh/coop/workspace.json`，找不到则以 cwd 自身为 workspace。父目录只有通过 `/coop workspace init [path]` 才会成为 workspace —— 绝不静默创建。
 - **命令** —— `/coop master|worker|reviewer [--master <id>] [--model <route>] [--any-cwd]`、`/coop list [--unbound]`、`/coop bind|release <sessionId>`、`/coop status`、`/coop off`、`/coop workspace init [path]`。
 - **工具** —— `coop_register`、`coop_list`、`coop_bind`、`coop_release`、`coop_status`；v2 模式下不注册 v1 的十一个工具。
+- **Plan 即 task DAG（P1）** —— `coop_plan_create`（绑定单一 `repoRoot`，§12.1）→ `coop_task_add`/`coop_task_link`/`coop_task_cancel`（plan 锁内环检测）→ `coop_plan_activate`。就绪度由 DAG 推导；调度器把 ready 任务分派给空闲的被绑定 worker（skill 需求 ⊆ 声明技能，`maxParallelTasks`），并用 `task assigned` 信令唤醒。worker 执行 `coop_execute_begin` → `coop_execute_report`；被绑定的 reviewer 用 `coop_task_verify` 验收（`pass` → done 且下游转 ready；`request_changes` → 同一 worker 返工）。`coop_board` 是看板投影；`coop_plan_close` 要求全部任务 done/cancelled；`coop_plan_abort` 取消开放任务并通知执行中的 assignee。Worktree、plan 评审门控、subagent 执行器与 memory 随 P2–P4 交付。
 
 ## 人类命令
 

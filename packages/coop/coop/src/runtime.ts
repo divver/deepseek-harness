@@ -28,6 +28,10 @@ export interface ResolvedCoopConfig {
   maxWorkers: number
   /** v2 per-master reviewer capacity enforced at bind and registration. */
   maxReviewers: number
+  /** v2 per-master limit on concurrently assigned+executing tasks across plans. */
+  maxParallelTasks: number
+  /** v2 whether the master may verify its own tasks when no reviewer is bound (§12.4; default off). */
+  allowSelfReview: boolean
 }
 
 /**
@@ -51,6 +55,8 @@ export function resolveCoopConfig(config: {
   mode?: string
   maxWorkers?: number
   maxReviewers?: number
+  maxParallelTasks?: number
+  allowSelfReview?: boolean
 }): ResolvedCoopConfig {
   const positive = (value: number | undefined, name: string): number | undefined => {
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
@@ -76,6 +82,8 @@ export function resolveCoopConfig(config: {
     mirrorEvents: config.mirrorEvents ?? false,
     maxWorkers: positive(config.maxWorkers, 'maxWorkers') ?? 4,
     maxReviewers: positive(config.maxReviewers, 'maxReviewers') ?? 2,
+    maxParallelTasks: positive(config.maxParallelTasks, 'maxParallelTasks') ?? 3,
+    allowSelfReview: config.allowSelfReview ?? false,
   }
 }
 

@@ -411,6 +411,11 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
         type: 'string',
         description: 'Model route string recorded on your node for orchestration defaults.',
       },
+      skills: {
+        type: 'array',
+        description: 'Skills this node declares; the scheduler assigns only tasks whose skill demands you cover.',
+        items: { type: 'string' },
+      },
     },
     output: {
       schema: {
@@ -431,6 +436,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
           roles: args.roles,
           ...(args.masterId === undefined ? {} : { masterId: args.masterId }),
           ...(args.model === undefined ? {} : { model: args.model }),
+          ...(args.skills === undefined ? {} : { skills: args.skills }),
         })
         return {
           roles: entry.roles,
@@ -553,6 +559,356 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
         masters: status.masters.length,
         ownNodes: status.own.length,
         unbound: status.unbound,
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_plan_create',
+    description: 'Create a v2 plan (master only): an empty task DAG bound to one repo root, in `designing` status with a markdown trail.',
+    parameters: {
+      title: { type: 'string', required: true, description: 'Short plan title.' },
+      objective: { type: 'string', required: true, description: 'What the plan must achieve and how success is judged.' },
+      repoRoot: { type: 'string', description: 'Absolute git repo root this plan is bound to; defaults to the current directory.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { planId: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`plan ${value.planId} created (${value.status})`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const plan = await service.createPlanV2(agent, {
+          title: args.title,
+          objective: args.objective,
+          ...(args.repoRoot === undefined ? {} : { repoRoot: args.repoRoot }),
+        })
+        return { planId: plan.planId, status: plan.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Create coop plan', kind: 'other', rawInput: args.title }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_plan_activate',
+    description: 'Activate a designing plan (master only): readiness is computed from the DAG and ready tasks are scheduled.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Plan id from coop_plan_create.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { planId: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`plan ${value.planId} → ${value.status}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const plan = await service.activatePlanV2(agent, args.planId)
+        return { planId: plan.planId, status: plan.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_task_add',
+    description: 'Add one task to a non-terminal plan (master only). `dependsOn` lists upstream task ids; a cycle rejects.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Owning plan id.' },
+      title: { type: 'string', required: true, description: 'Short task title.' },
+      spec: { type: 'string', required: true, description: 'Full task brief handed to the assigned worker.' },
+      dependsOn: { type: 'array', description: 'Upstream task ids that must be done first.', items: { type: 'string' } },
+      executor: { type: 'string', enum: ['inline', 'subagent'], description: 'Executor style; subagent arrives with P3.' },
+      skills: { type: 'array', description: 'Skills an assigned worker must cover.', items: { type: 'string' } },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { taskId: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`task ${value.taskId} added (${value.status})`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const task = await service.addTaskV2(agent, args.planId, {
+          title: args.title,
+          spec: args.spec,
+          ...(args.dependsOn === undefined ? {} : { dependsOn: args.dependsOn }),
+          ...(args.executor === undefined ? {} : { executor: args.executor }),
+          ...(args.skills === undefined ? {} : { skills: args.skills }),
+        })
+        return { taskId: task.taskId, status: task.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Add coop task', kind: 'other', rawInput: args.title }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_task_update',
+    description: 'Update a task brief (master only) while it is not executing/reporting/verifying.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Owning plan id.' },
+      taskId: { type: 'string', required: true, description: 'Target task id.' },
+      title: { type: 'string', description: 'New title.' },
+      spec: { type: 'string', description: 'New task brief.' },
+      executor: { type: 'string', enum: ['inline', 'subagent'], description: 'New executor style.' },
+      skills: { type: 'array', description: 'New skill demands.', items: { type: 'string' } },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { taskId: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`task ${value.taskId} updated (${value.status})`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const task = await service.updateTaskV2(agent, args.planId, args.taskId, {
+          ...(args.title === undefined ? {} : { title: args.title }),
+          ...(args.spec === undefined ? {} : { spec: args.spec }),
+          ...(args.executor === undefined ? {} : { executor: args.executor }),
+          ...(args.skills === undefined ? {} : { skills: args.skills }),
+        })
+        return { taskId: task.taskId, status: task.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_task_link',
+    description: 'Add one dependency edge to a non-terminal plan (master only): `from` finishing unblocks `to`. Cycles reject; idempotent.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Owning plan id.' },
+      from: { type: 'string', required: true, description: 'Upstream task id.' },
+      to: { type: 'string', required: true, description: 'Downstream task id.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { linked: { type: 'boolean', required: true } },
+      },
+      render: (_args, value) => textOut(value.linked ? `edge ${_args.from} → ${_args.to} recorded` : 'edge already present'),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        await service.linkTaskV2(agent, args.planId, { from: args.from, to: args.to })
+        return { linked: true }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_task_cancel',
+    description: 'Cancel one task of a non-terminal plan (master only); the assignee is signalled and downstream tasks go blocked.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Owning plan id.' },
+      taskId: { type: 'string', required: true, description: 'Target task id.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { cancelled: { type: 'boolean', required: true } },
+      },
+      render: args => textOut(`task ${args.taskId} cancelled`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        await service.cancelTaskV2(agent, args.planId, args.taskId)
+        return { cancelled: true }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_board',
+    description: 'Kanban view of one plan (or every plan of your master): tasks grouped by status, readiness recomputed.',
+    parameters: {
+      planId: { type: 'string', description: 'Single plan id; omit for every plan.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          plans: { type: 'integer', required: true },
+          detail: { type: 'array', required: true, items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => textOut(value.plans === 0 ? 'No plans yet.' : value.detail.join('\n')),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      const plans = await service.boardV2(agent, args.planId)
+      const detail: string[] = []
+      for (const plan of plans) {
+        detail.push(`# ${plan.planId} ${plan.title} [${plan.status}]`)
+        const byStatus = new Map<string, string[]>()
+        for (const task of plan.tasks) {
+          const column = byStatus.get(task.status) ?? []
+          column.push(`${task.taskId} ${task.title}${task.assignee === undefined ? '' : ` → ${task.assignee}`}`)
+          byStatus.set(task.status, column)
+        }
+        if (byStatus.size === 0) detail.push('  (no tasks)')
+        for (const [status, tasks] of byStatus) detail.push(`  ${status}: ${tasks.join(' · ')}`)
+      }
+      return { plans: plans.length, detail }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_execute_begin',
+    description: 'Assigned worker starts (or restarts after rework) a task: assigned/rework → executing.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Owning plan id.' },
+      taskId: { type: 'string', required: true, description: 'Target task id.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { taskId: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`task ${value.taskId} → ${value.status}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const task = await service.executeBeginV2(agent, args.planId, args.taskId)
+        return { taskId: task.taskId, status: task.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    description: 'Assigned worker reports finished execution: the task moves to verifying and the master/reviewers are woken.',
+    name: 'coop_execute_report',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Owning plan id.' },
+      taskId: { type: 'string', required: true, description: 'Target task id.' },
+      summary: { type: 'string', required: true, description: 'What was done and any notable outcomes.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { taskId: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`task ${value.taskId} → ${value.status}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const task = await service.executeReportV2(agent, args.planId, args.taskId, args.summary)
+        return { taskId: task.taskId, status: task.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_task_verify',
+    description: 'Verify a reported task (reviewer bound to the plan\'s master; the master itself only with allowSelfReview). pass → done; request_changes → rework for the assignee.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Owning plan id.' },
+      taskId: { type: 'string', required: true, description: 'Target task id.' },
+      decision: { type: 'string', required: true, enum: ['pass', 'request_changes'], description: 'Verification verdict.' },
+      summary: { type: 'string', description: 'Acceptance rationale or rework demand.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { taskId: { type: 'string', required: true }, status: { type: 'string', required: true }, attempts: { type: 'integer', required: true } },
+      },
+      render: (_args, value) => textOut(`task ${value.taskId} → ${value.status} (attempts ${String(value.attempts)})`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const task = await service.verifyTaskV2(agent, args.planId, args.taskId, args.decision,
+          args.summary === undefined ? undefined : args.summary)
+        return { taskId: task.taskId, status: task.status, attempts: task.attempts }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_plan_close',
+    description: 'Close a finished plan (master only): every task must be done or cancelled.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Plan id to close.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { planId: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`plan ${value.planId} → ${value.status}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const plan = await service.closePlanV2(agent, args.planId)
+        return { planId: plan.planId, status: plan.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_plan_abort',
+    description: 'Abort a plan (master only): every open task is cancelled, in-flight assignees are signalled to stop, and the plan lands aborted.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Plan id to abort.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { planId: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`plan ${value.planId} → ${value.status}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const plan = await service.abortPlanV2(agent, args.planId)
+        return { planId: plan.planId, status: plan.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
       }
     },
   }))

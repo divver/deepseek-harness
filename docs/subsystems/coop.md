@@ -211,7 +211,7 @@ async initWorkspace(agent: Agent, target?: string): Promise<string>
      * @param req - target roles, optional owning master, model route, and directory scope.
      * @returns the committed registry entry.
      */
-async registerV2( agent: Agent, req: { roles: V2Role[]; masterId?: string; model?: string; cwdScope?: CwdScope }, ): Promise<CoopV2RegistryEntry>
+async registerV2( agent: Agent, req: { roles: V2Role[]; masterId?: string; model?: string; cwdScope?: CwdScope; skills?: string[] }, ): Promise<CoopV2RegistryEntry>
 
 /**
      * Nodes visible to the caller under v2 isolation: a master sees itself, its
@@ -249,6 +249,127 @@ async releaseNode(agent: Agent, sessionId: string): Promise<void>
      * @returns the caller's entry, master ids, own nodes, and unbound count.
      */
 async statusV2(agent: Agent): Promise<{ self: CoopV2RegistryEntry | undefined masters: string[] own: CoopV2RegistryEntry[] unbound: number }>
+
+/**
+     * Create a v2 plan bound to one repo root (§12.1: no cross-repo plans).
+     * Master-only; the plan lands `designing` with an empty DAG and a markdown
+     * trail. P3 routes activation through reviewer sign-off.
+     * @param agent - creating live master.
+     * @param req - title, objective, and optional repo root (defaults to the cwd).
+     * @returns the committed designing plan.
+     */
+async createPlanV2(agent: Agent, req: { title: string; objective: string; repoRoot?: string }): Promise<CoopV2PlanFile>
+
+/**
+     * designing → active: recompute readiness from the DAG and schedule.
+     * @param agent - activating live master.
+     * @param planId - plan to activate.
+     * @returns the committed active plan.
+     */
+async activatePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
+
+/**
+     * Add one task to a non-terminal plan; `dependsOn` becomes DAG edges and a
+     * cycle is rejected under the plan lock. Schedules afterwards.
+     * @param agent - adding live master.
+     * @param planId - target plan.
+     * @param req - title, spec, dependencies, executor style, and skill demands.
+     * @returns the committed task.
+     */
+async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[] }, ): Promise<CoopV2Task>
+
+/**
+     * Update a task's brief while it is not in flight (executing/reporting/
+     * verifying tasks are locked).
+     * @param agent - updating live master.
+     * @param planId - owning plan.
+     * @param taskId - target task.
+     * @param req - optional title, spec, executor style, and skill demands.
+     * @returns the committed task.
+     */
+async updateTaskV2( agent: Agent, planId: string, taskId: string, req: { title?: string; spec?: string; executor?: 'inline' | 'subagent'; skills?: string[] }, ): Promise<CoopV2Task>
+
+/**
+     * Add one dependency edge (`from` finishing unblocks `to`) to a
+     * non-terminal plan; cycles reject under the lock. Idempotent.
+     * @param agent - linking live master.
+     * @param planId - owning plan.
+     * @param req - upstream and downstream task ids.
+     */
+async linkTaskV2(agent: Agent, planId: string, req: { from: string; to: string }): Promise<void>
+
+/**
+     * Cancel one task of a non-terminal plan; an in-flight task's assignee is
+     * signalled, downstream dependencies go blocked, and capacity is freed.
+     * @param agent - cancelling live master.
+     * @param planId - owning plan.
+     * @param taskId - target task.
+     */
+async cancelTaskV2(agent: Agent, planId: string, taskId: string): Promise<void>
+
+/**
+     * Kanban projection: one plan (or every plan of the caller's master) with
+     * lazily recomputed readiness. Read-only for the caller.
+     * @param agent - querying live master.
+     * @param planId - optional single plan id.
+     * @returns the plan snapshots.
+     */
+async boardV2(agent: Agent, planId?: string): Promise<CoopV2PlanFile[]>
+
+/**
+     * Assigned worker starts (or restarts after rework): assigned/rework →
+     * executing. Only the task's assignee may begin.
+     * @param agent - assigned live worker.
+     * @param planId - owning plan.
+     * @param taskId - target task.
+     * @returns the committed executing task.
+     */
+async executeBeginV2(agent: Agent, planId: string, taskId: string): Promise<CoopV2Task>
+
+/**
+     * Assigned worker reports finished execution: executing → verifying, then
+     * the master and every fresh bound reviewer are woken to verify and the
+     * freed worker becomes schedulable again.
+     * @param agent - reporting live worker.
+     * @param planId - owning plan.
+     * @param taskId - target task.
+     * @param summary - what was done.
+     * @returns the committed verifying task.
+     */
+async executeReportV2(agent: Agent, planId: string, taskId: string, summary: string): Promise<CoopV2Task>
+
+/**
+     * Verify one reported task. Gate: a reviewer bound to the owning master,
+     * or the master itself when `allowSelfReview` is on (§12.4, default off).
+     * pass → done (downstream goes ready, capacity freed, scheduler runs);
+     * request_changes → rework with `attempts` incremented and the assignee
+     * re-signalled to begin again.
+     * @param agent - verifying live reviewer (or self-reviewing master).
+     * @param planId - owning plan.
+     * @param taskId - target task.
+     * @param decision - pass or request_changes.
+     * @param summary - acceptance rationale or rework demand.
+     * @returns the committed task.
+     */
+async verifyTaskV2( agent: Agent, planId: string, taskId: string, decision: 'pass' | 'request_changes', summary?: string, ): Promise<CoopV2Task>
+
+/**
+     * Close a finished plan: every task must be done or cancelled. P2 inserts
+     * worktree merge/clean ahead of this step.
+     * @param agent - closing live master.
+     * @param planId - plan to close.
+     * @returns the committed closed plan.
+     */
+async closePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
+
+/**
+     * Abort a plan: any non-terminal status cancels every open task (in-flight
+     * assignees are signalled to stop) and the plan lands `aborted`.
+     * @param agent - aborting live master.
+     * @param planId - plan to abort.
+     * @returns the committed aborted plan.
+     */
+async abortPlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
 ```
 
 Types: [Agent](core.md)
