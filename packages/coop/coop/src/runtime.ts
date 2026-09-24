@@ -38,6 +38,12 @@ export interface ResolvedCoopConfig {
   memoryInjectTopK: number
   /** v2 memory trail retention budget per master; appends drop the oldest beyond it. */
   memoryRetainEntries: number
+  /** v2 node auto-creation transport: herdr pane when available, else in-process headless. */
+  spawn: 'auto' | 'herdr' | 'headless'
+  /** v2 command template run in a spawned herdr pane; `{cwd}` is replaced. */
+  spawnCommand: string
+  /** v2 regex herdr pane output must match before the registration line is sent (empty = send immediately). */
+  spawnReadyRegex: string
 }
 
 /**
@@ -66,6 +72,9 @@ export function resolveCoopConfig(config: {
   maxReworkAttempts?: number
   memoryInjectTopK?: number
   memoryRetainEntries?: number
+  spawn?: string
+  spawnCommand?: string
+  spawnReadyRegex?: string
 }): ResolvedCoopConfig {
   const positive = (value: number | undefined, name: string): number | undefined => {
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
@@ -75,6 +84,9 @@ export function resolveCoopConfig(config: {
   }
   if (config.mode !== undefined && config.mode !== 'v1' && config.mode !== 'v2') {
     throw new CoopError(`config mode must be "v1" or "v2", got "${config.mode}"`, 'COOP_CONFIG_UNSUPPORTED')
+  }
+  if (config.spawn !== undefined && config.spawn !== 'auto' && config.spawn !== 'herdr' && config.spawn !== 'headless') {
+    throw new CoopError(`config spawn must be "auto" | "herdr" | "headless", got "${config.spawn}"`, 'COOP_CONFIG_UNSUPPORTED')
   }
   return {
     mode: config.mode ?? 'v1',
@@ -96,6 +108,9 @@ export function resolveCoopConfig(config: {
     maxReworkAttempts: positive(config.maxReworkAttempts, 'maxReworkAttempts') ?? 3,
     memoryInjectTopK: positive(config.memoryInjectTopK, 'memoryInjectTopK') ?? 8,
     memoryRetainEntries: positive(config.memoryRetainEntries, 'memoryRetainEntries') ?? 256,
+    spawn: config.spawn === 'herdr' || config.spawn === 'headless' ? config.spawn : 'auto',
+    spawnCommand: config.spawnCommand ?? 'dsh --cwd {cwd}',
+    spawnReadyRegex: config.spawnReadyRegex ?? '',
   }
 }
 

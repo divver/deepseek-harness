@@ -448,6 +448,18 @@ async memoryLinesV2(agent: Agent): Promise<string[]>
      * @returns matching entries, newest first.
      */
 async searchMemoryV2(agent: Agent, req: { query: string; limit?: number }): Promise<CoopMemoryEntry[]>
+
+/**
+     * Auto-create one bound worker/reviewer node (§4.4, §8.2). With herdr
+     * reachable and the master running inside a herdr pane, the node lands in a
+     * freshly split pane running `spawnCommand`, then receives its
+     * `/coop <role> --master <id>` registration line (pre-bind). Otherwise the
+     * node is an in-process headless session registered bound directly.
+     * @param agent - creating live master.
+     * @param req - role, optional model route, and working directory.
+     * @returns the spawn outcome (herdr pane id, or the committed headless entry).
+     */
+async createNodeV2( agent: Agent, req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string }, ): Promise<{ spawned: 'herdr' | 'headless'; paneId?: string; entry?: CoopV2RegistryEntry }>
 ```
 
 Types: [Agent](core.md)

@@ -199,6 +199,17 @@ async function runV2(
     if (entries.length === 0) return 'No worktrees.'
     return entries.map(entry => `${entry.dir} [${entry.status}] ${entry.branch} ← ${entry.baseBranch} (${entry.planId})`).join('\n')
   }
+  if (head === 'spawn' && (sub === 'worker' || sub === 'reviewer')) {
+    const model = parsed.flags.get('model')
+    const workdir = parsed.flags.get('workdir')
+    const outcome = await service.createNodeV2(agent, {
+      role: sub,
+      ...(typeof model === 'string' ? { model } : {}),
+      ...(typeof workdir === 'string' ? { workdir } : {}),
+    })
+    if (outcome.spawned === 'herdr') return `Node spawned in herdr pane ${outcome.paneId} — registration line sent.`
+    return `Node spawned headless: ${outcome.entry?.sessionId ?? '?'} (${outcome.entry?.bindState ?? '?'}).`
+  }
   if (head === 'workspace' && sub === 'init') {
     const target = parsed.positional[2]
     const root = await service.initWorkspace(agent, target)

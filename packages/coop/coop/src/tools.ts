@@ -1123,4 +1123,45 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       }
     },
   }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_worker_create',
+    description: 'Auto-create one bound worker/reviewer node (master only). With herdr reachable from a herdr-hosted master, the node lands in a freshly split pane running spawnCommand and receives its /coop registration line; otherwise it is an in-process headless session (§8.2).',
+    parameters: {
+      role: { type: 'string', required: true, enum: ['worker', 'reviewer'], description: 'Node role to create.' },
+      model: { type: 'string', description: 'Model route recorded on the node (headless sessions also launch with it).' },
+      workdir: { type: 'string', description: 'Working directory for the spawned session (defaults to the workspace root).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          spawned: { type: 'string', required: true },
+          paneId: { type: 'string' },
+          sessionId: { type: 'string' },
+          bindState: { type: 'string' },
+        },
+      },
+      render: (_args, value) => textOut(`node spawned (${value.spawned}${value.paneId === undefined ? '' : `, pane ${value.paneId}`}${value.sessionId === undefined ? '' : `, session ${value.sessionId} [${String(value.bindState)}]`})`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const outcome = await service.createNodeV2(agent, {
+          role: args.role,
+          ...(args.model === undefined ? {} : { model: args.model }),
+          ...(args.workdir === undefined ? {} : { workdir: args.workdir }),
+        })
+        return {
+          spawned: outcome.spawned,
+          ...(outcome.paneId === undefined ? {} : { paneId: outcome.paneId }),
+          ...(outcome.entry === undefined ? {} : { sessionId: outcome.entry.sessionId, bindState: outcome.entry.bindState }),
+        }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Spawn coop node', kind: 'other', rawInput: args.role }),
+  }))
 }

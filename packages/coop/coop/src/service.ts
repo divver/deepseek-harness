@@ -97,6 +97,12 @@ export interface Config {
   memoryInjectTopK?: number
   /** v2 memory trail retention budget per master; appends drop the oldest beyond it. */
   memoryRetainEntries?: number
+  /** v2 node auto-creation transport: herdr pane when available, else in-process headless (§8.2). */
+  spawn?: 'auto' | 'herdr' | 'headless'
+  /** v2 command template run in a spawned herdr pane; `{cwd}` is replaced. */
+  spawnCommand?: string
+  /** v2 regex herdr pane output must match before the registration line is sent (empty = send immediately). */
+  spawnReadyRegex?: string
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -118,6 +124,9 @@ export const Config: z<Config> = z.object({
   maxReworkAttempts: z.number(),
   memoryInjectTopK: z.number(),
   memoryRetainEntries: z.number(),
+  spawn: z.string(),
+  spawnCommand: z.string(),
+  spawnReadyRegex: z.string(),
   inboxPollMs: z.number(),
   mirrorEvents: z.boolean(),
 }) as unknown as z<Config>
@@ -928,8 +937,10 @@ export class CoopService extends Service {
       if (this.draining.has(id)) continue
       this.draining.add(id)
       try {
-        await this.drainAgentInbox(agent, await this.activeRootOf(agent))
+        const root = await this.activeRootOf(agent)
+        await this.drainAgentInbox(agent, root)
         await this.touchActive(agent)
+        await this.reportNodeStates(root)
       } finally {
         this.draining.delete(id)
       }
@@ -1106,7 +1117,15 @@ export class CoopService extends Service {
     const now = Date.now()
     const root = await this.v2RootOf(agent)
     const localPath = store.v2RegistryPath(root)
-    const meta = req.model === undefined ? {} : { meta: { model: req.model } }
+    const paneEnv = process.env.HERDR_PANE_ID
+    const meta = req.model === undefined && paneEnv === undefined
+      ? {}
+      : {
+        meta: {
+          ...(req.model === undefined ? {} : { model: req.model }),
+          ...(paneEnv === undefined ? {} : { paneId: paneEnv, spawn: 'herdr' as const }),
+        },
+      }
     if (req.roles.includes('master')) {
       const entry = await store.mutateV2Registry(localPath, (current) => {
         const existing = (current?.entries ?? []).find(candidate => candidate.sessionId === sessionId && candidate.roles.includes('master'))
@@ -2504,6 +2523,221 @@ export class CoopService extends Service {
       this.memoryCache.set(sessionId, lines.length === 0 ? '' : ['## Coop memory (most recent first)', ...lines].join('\n'))
     } catch {
       this.memoryCache.delete(sessionId)
+    }
+  }
+
+  /** Cached herdr-binary probe; `undefined` until first checked. */
+  private herdrAvailableCache: boolean | undefined
+  /** Last state|summary reported to herdr per node, so only changes invoke the CLI. */
+  private readonly reportedNodeStates = new Map<string, string>()
+
+  /**
+       * Run one herdr CLI call through the mounted shell seam. Output is JSON for
+       * automation commands; callers parse what they need and treat nonzero exits
+       * per their own fail-loud policy.
+       * @param args - herdr arguments.
+       * @param opts - `quiet` never throws; failures surface as a nonzero code.
+       * @returns exit code plus trimmed stdout/stderr.
+       */
+  private async runHerdr(args: string[], opts: { quiet?: boolean } = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    const shell = this.ctx.get('shell') as {
+      resolve: (request: Record<string, unknown>) => unknown
+      execute: (spec: unknown) => Promise<{ result: () => Promise<{
+        exitCode: number | null
+        stdout: { text: string }
+        stderr: { text: string }
+      }> }>
+    } | undefined
+    if (shell === undefined) return { code: null, stdout: '', stderr: 'no shell provider mounted' }
+    const binary = process.env.HERDR_BIN_PATH ?? 'herdr'
+    const spec = shell.resolve({
+      command: [binary, ...args].map(shellQuote).join(' '),
+      workdir: process.cwd(),
+      timeoutMs: 30_000,
+      stdoutMaxBytes: 1_000_000,
+    })
+    const result = await (await shell.execute(spec)).result()
+    void opts
+    return { code: result.exitCode, stdout: result.stdout.text.trim(), stderr: result.stderr.text.trim() }
+  }
+
+  /**
+       * Whether a herdr binary is reachable through the shell seam (cached).
+       * @returns true once a `--version` probe succeeds.
+       */
+  private async herdrAvailable(): Promise<boolean> {
+    if (this.herdrAvailableCache !== undefined) return this.herdrAvailableCache
+    const probe = await this.runHerdr(['--version'], { quiet: true })
+    this.herdrAvailableCache = probe.code === 0
+    return this.herdrAvailableCache
+  }
+
+  /**
+       * Auto-create one bound worker/reviewer node (§4.4, §8.2). With herdr
+       * reachable and the master running inside a herdr pane, the node lands in a
+       * freshly split pane running `spawnCommand`, then receives its
+       * `/coop <role> --master <id>` registration line (pre-bind). Otherwise the
+       * node is an in-process headless session registered bound directly.
+       * @param agent - creating live master.
+       * @param req - role, optional model route, and working directory.
+       * @returns the spawn outcome (herdr pane id, or the committed headless entry).
+       */
+  async createNodeV2(
+    agent: Agent,
+    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string },
+  ): Promise<{ spawned: 'herdr' | 'headless'; paneId?: string; entry?: CoopV2RegistryEntry }> {
+    const { masterId, root } = await this.requireV2Master(agent)
+    void root
+    const masterPane = process.env.HERDR_PANE_ID
+    const inHerdr = masterPane !== undefined
+    const available = inHerdr ? await this.herdrAvailable() : false
+    const wantHerdr = (this.resolved.spawn === 'herdr' || (this.resolved.spawn === 'auto' && available))
+    if (!wantHerdr || (this.resolved.spawn === 'herdr' && (!inHerdr || !available))) {
+      if (this.resolved.spawn === 'herdr') {
+        throw new CoopError(
+          inHerdr
+            ? 'herdr spawn configured but no herdr binary is reachable'
+            : 'herdr spawn requires the master to run inside a herdr pane (HERDR_PANE_ID absent)',
+          'COOP_SPAWN_FAILED')
+      }
+      return this.createNodeHeadless(agent, req, masterId)
+    }
+    const cwd = req.workdir === undefined ? this.workspaceOf(agent) : normalizeCwd(req.workdir)
+    const split = await this.runHerdr(['pane', 'split', masterPane ?? '', '--direction', 'right', '--no-focus'])
+    if (split.code !== 0) {
+      throw new CoopError(`herdr pane split failed: ${split.stderr || split.stdout}`, 'COOP_SPAWN_FAILED')
+    }
+    let paneId: string | undefined
+    try {
+      const parsed = JSON.parse(split.stdout) as { result?: { pane?: { pane_id?: string } } }
+      paneId = parsed.result?.pane?.pane_id
+    } catch {
+      paneId = undefined
+    }
+    if (paneId === undefined) {
+      throw new CoopError(`herdr pane split returned no pane id: ${split.stdout}`, 'COOP_SPAWN_FAILED')
+    }
+    const run = await this.runHerdr(['pane', 'run', paneId, this.resolved.spawnCommand.replace('{cwd}', cwd)])
+    if (run.code !== 0) {
+      throw new CoopError(`herdr pane run failed: ${run.stderr || run.stdout}`, 'COOP_SPAWN_FAILED')
+    }
+    if (this.resolved.spawnReadyRegex.length > 0) {
+      const ready = await this.runHerdr(['pane', 'wait-output', paneId, '--regex', this.resolved.spawnReadyRegex, '--timeout', '30000'])
+      if (ready.code !== 0) {
+        throw new CoopError(`spawned pane never matched spawnReadyRegex: ${ready.stderr || ready.stdout}`, 'COOP_SPAWN_FAILED')
+      }
+    }
+    const line = `/coop ${req.role} --master ${String(masterId)}${req.model === undefined ? '' : ` --model ${req.model}`}`
+    const send = await this.runHerdr(['pane', 'send-text', paneId, line])
+    if (send.code !== 0) {
+      throw new CoopError(`herdr pane send-text failed: ${send.stderr || send.stdout}`, 'COOP_SPAWN_FAILED')
+    }
+    const enter = await this.runHerdr(['pane', 'send-keys', paneId, 'Enter'])
+    if (enter.code !== 0) {
+      throw new CoopError(`herdr pane send-keys failed: ${enter.stderr || enter.stdout}`, 'COOP_SPAWN_FAILED')
+    }
+    return { spawned: 'herdr', paneId }
+  }
+
+  /**
+       * The headless fallback: an in-process durable session created through the
+       * agent-loop seam and registered pre-bound to the calling master.
+       * @param agent - creating live master.
+       * @param req - role, optional model route, and working directory.
+       * @param masterId - owning master id.
+       * @returns the spawn outcome with the committed registry entry.
+       */
+  private async createNodeHeadless(
+    agent: Agent,
+    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string },
+    masterId: MasterId,
+  ): Promise<{ spawned: 'headless'; entry: CoopV2RegistryEntry }> {
+    const loop = this.ctx.get('agentLoop') as {
+      create: (id: SessionId, options: { provider?: string; model?: string }, meta: { cwd: string }) => Promise<Agent>
+    } | undefined
+    if (loop === undefined) {
+      throw new CoopError('headless spawn requires the agent-loop service', 'COOP_SPAWN_FAILED')
+    }
+    const route = agent.options as { provider?: string; model?: string }
+    const model = req.model ?? route.model
+    const spawned = await loop.create(
+      SessionId(`coop-${req.role}-${randomUUID().slice(0, 8)}`),
+      {
+        ...(route.provider === undefined ? {} : { provider: route.provider }),
+        ...(model === undefined ? {} : { model }),
+      },
+      { cwd: req.workdir === undefined ? this.workspaceOf(agent) : normalizeCwd(req.workdir) },
+    )
+    const entry = await this.registerV2(spawned, {
+      roles: [req.role],
+      masterId: String(masterId),
+      ...(req.model === undefined ? {} : { model: req.model }),
+    })
+    return { spawned: 'headless', entry }
+  }
+
+  /**
+       * Mirror coop node states into herdr for every bound node that self-reported
+       * a pane id (§8.3): workers/reviewers get working/blocked/idle plus a summary
+       * token, so herdr's sidebar aggregation becomes the node card row. Invoked
+       * from the poll tick; herdr CLI calls fire only on state changes.
+       * @param root - absolute v2 root.
+       */
+  private async reportNodeStates(root: string): Promise<void> {
+    if (this.resolved.mode !== 'v2') return
+    const now = Date.now()
+    const nodes = (await this.v2Tables(root)).filter(entry => this.isFreshV2(entry, now)
+          && entry.bindState === 'bound'
+          && entry.masterId !== undefined
+          && entry.meta?.paneId !== undefined
+          && !entry.roles.includes('master'))
+    if (nodes.length === 0) return
+    const plansByMaster = new Map<string, CoopV2PlanFile[]>()
+    for (const node of nodes) {
+      const key = String(node.masterId)
+      if (plansByMaster.has(key)) continue
+      const plans: CoopV2PlanFile[] = []
+      try {
+        const names = await readdir(store.v2PlansDir(root, key))
+        for (const name of names.filter(candidate => candidate.endsWith('.json'))) {
+          const plan = await store.readV2PlanFile(store.v2PlanPath(root, key, name.replace(/\.json$/u, '')))
+          if (plan?.status === 'active') plans.push(plan)
+        }
+      } catch {
+        // No plans directory yet for this master.
+      }
+      plansByMaster.set(key, plans)
+    }
+    for (const node of nodes) {
+      const plans = plansByMaster.get(String(node.masterId)) ?? []
+      let state = 'idle'
+      let summary = 'idle'
+      for (const plan of plans) {
+        for (const task of plan.tasks) {
+          if (node.roles.includes('worker') && task.assignee === node.sessionId) {
+            if (task.status === 'executing' || task.status === 'assigned' || task.status === 'rework') {
+              state = 'working'
+              summary = `${task.taskId} ${task.status}`
+            } else if (task.status === 'blocked') {
+              state = 'blocked'
+              summary = `${task.taskId} blocked`
+            }
+          }
+          if (node.roles.includes('reviewer') && task.status === 'verifying') {
+            state = 'working'
+            summary = `${task.taskId} verifying`
+          }
+        }
+      }
+      const key = `${state}|${summary}`
+      if (this.reportedNodeStates.get(node.sessionId) === key) continue
+      const paneId = node.meta?.paneId
+      if (paneId === undefined) continue
+      const report = await this.runHerdr(['pane', 'report-agent', paneId, '--source', 'coop', '--agent', 'dsh', '--state', state], { quiet: true })
+      const token = await this.runHerdr(['pane', 'report-metadata', paneId, '--source', 'coop', '--token', `summary=${summary}`], { quiet: true })
+      if (report.code === 0 || token.code === 0) {
+        this.reportedNodeStates.set(node.sessionId, key)
+      }
     }
   }
 

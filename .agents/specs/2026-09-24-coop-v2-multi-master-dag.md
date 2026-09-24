@@ -46,7 +46,7 @@ v1 已验证并**保留**的资产：workspace 共享文件为权威 + 锁内迁
 - G5 执行器：worker 按 task 声明 inline 执行或 spawn sub-agent 执行；sub-agent 失败/超时回落策略明确。
 - G6 Memory：task/plan 完成触发 summarizer，写结构化记忆并可被后续 session 检索/注入。
 - G7 Skill：任一节点（master/worker/reviewer，含 master 自动创建的）都能加载 skill；task 可声明所需 skill。
-- G8 GUI：header 插件呈现节点卡片与 kanban；terminal 面板可选，未打开的节点以**后台 session**运行，可随时打开观察。
+- G8 协作 UI：以 [Herdr](https://herdr.dev) TUI 为唯一首发载体——master 自动创建节点即调 herdr 开 pane，节点状态经 `pane report-agent` 上报（sidebar 聚合即节点卡片行），kanban 为 herdr 插件 overlay（2026-09-24 修订，web header 方案作废）。
 - G9 全程可观测：所有迁移双写（共享文件权威 + 本端镜像事件默认关，同 v1）。
 
 ### 非目标
@@ -230,23 +230,53 @@ Task {
 
 ---
 
-## 8. GUI
+## 8. 协作 UI：Herdr TUI（2026-09-24 修订：放弃 web header 方案）
 
-### 8.1 Header 插件（P5）
+> 原方案的 web/desktop header 插件作废（`dsh-client-ui-slots` 路线保留为远期可选）。v2 的协作 UI 以
+> [Herdr](https://herdr.dev)（终端工作区/多路复用器，带 pane、agent 状态、worktree 与插件体系）为
+> 唯一首发载体：节点即真实终端 pane，kanban 即插件 overlay。
 
-- client UI 贡献一个 header 区 slot（`@deepseek-ai/dsh-client-ui-slots` 的 runtime props 注入）：workspace 内存在 active master 时显示**节点卡片行**——master 一枚 + 其名下 worker/reviewer 卡片（状态色：idle/executing/verifying/stale），点击卡片跳转该 session 的 conversation 视图。
-- 数据源：host 侧消费 `ctx.coop.board/listNodes`（Typert remote method，hostBacked contribution 先例），不直读文件。
+### 8.1 运行形态
 
-### 8.2 Kanban 视图（P5）
+- 一个 **herdr workspace = 一个 coop workspace**（`herdr workspace create --cwd <workspace根>`）。
+- master 是用户所在的 dsh 交互 pane；worker/reviewer 是同 workspace 内独立 pane 里的 dsh 会话——手动开的节点与 master 自动创建的在 registry 里同构（P0 语义不变）。
+- coop 与 herdr 的全部交互走 CLI（优先 `HERDR_BIN_PATH` 指向的二进制，回退 PATH 上的 `herdr`），命令输出 JSON，ID 一律从响应读取（`.result.pane.pane_id` 等），不猜测。
 
-- plan 级 DAG/看板切换视图：列 = task 状态，卡 = task（assignee、worktree、attempts 徽标）。读侧只读，操作仍走工具/命令（GUI 不直接写共享文件）。
+### 8.2 master 自动创建节点 = 调 herdr 开 pane（`spawn: 'herdr'`）
 
-### 8.3 Terminal（可选）
+`coop_worker_create` / `coop_reviewer_create` 在 herdr 可用时改为三步（替代进程内 headless `agentLoop.create`；`spawn` 配置：`auto | herdr | headless`，默认 `auto`）：
 
-- 节点 = session。master auto-create 的 worker/reviewer 是 headless durable session：**不打开就在后台跑**（coop 信令照常驱动），随时在 GUI/TUI 中 attach（resume 该 session 的 conversation 流）。
-- 用户也可**手动**开多个终端窗口跑 `/coop worker` 等——手动/自动节点在 registry 里同构。
-- v2 不做多路复用终端面板控件；"打开" = 现有 session 打开能力的复用。
-- 交错语义（§12.2 裁决）：手动打开的 worker 里，用户输入与 coop 唤醒 turn 按 inbox 到达顺序 FIFO 排队；未提交 draft 不受影响、留到下一轮；coop turn 以 `[coop]` 来源标记呈现。不引入 inbox 优先级概念。
+1. **占位**：在 master pane 旁（或 coop 专用 tab 内）`herdr pane split <masterPane> --direction right --no-focus` → 取 `.result.pane.pane_id`；节点多时改 `herdr tab create` 建独立 tab。
+2. **启动**：`herdr pane run <pane> "dsh --cwd <worktree或workspace根>"`（pane 命令可配，`spawnCommand` 配置项），`pane wait-output` 等提示符就绪。
+3. **注册**：向该 pane 提交 `/coop worker --master <masterId>`（或 dsh 启动参数内置注册），注册成功后 registry entry 记 `meta.spawn: 'herdr'`。
+
+- **稳定目标用名字不用 pane id**：pane 跨 workspace/tab 移动后 pane id 会变；注册后即 `herdr agent rename <pane> <sessionId>`（名 = coop sessionId，`[a-z][a-z0-9_-]` 需映射），后续 focus/attach/prompt 全部按名寻址；`meta.paneId` 仅作展示初值。
+- **headless 后备**：herdr 不可用（无 `HERDR_BIN_PATH`/`herdr` 不在 PATH）时按 `spawn` 策略退回现行进程内 headless session——两种节点的 coop 语义完全一致（§4.4），GUI 可见性是唯一差别。
+- 失败语义：split/run/注册任一步失败 → fail-loud `COOP_SPAWN_FAILED`，不留半创建节点；已占用的 pane 记录在 registry 供人工清理。
+
+### 8.3 节点状态上报（herdr sidebar 即节点卡片行）
+
+dsh 不在 herdr 内置 agent kind 列表里，也不依赖屏幕检测；coop 在 host 进程内用既有 poll tick（1s）把 coop 状态映射为 herdr 语义并上报：
+
+- `herdr pane report-agent <目标> --source coop --agent dsh --state <idle|working|blocked>`：
+  task executing → `working`；assigned/verifying/reporting → `working`（summary 区分）；节点等待人工（审批/提问、blocked 任务、rework 耗尽）→ `blocked`；空闲 → `idle`。
+- `herdr pane report-metadata <目标> --source coop --token summary="<taskId> <status>"`：sidebar 行内摘要（当前 task、attempts、worktree 目录短名）。
+- 收益：herdr 把 blocked/working/done 上卷到 pane→tab→workspace 的聚合、通知与跳转全部免费获得——原"header 节点卡片行"的功能等价物。
+- 远期：dsh 自己实现 herdr 自定义集成（agent-loop 生命周期直报），coop 代理上报退为兜底。
+
+### 8.4 coop 插件：kanban board 与快捷动作（herdr plugin）
+
+发布一个 herdr 插件（`herdr-plugin.toml`；board 视图用 **Rust + [Ratatui](https://ratatui.rs)** 实现——清单声明 `[[build]] command = ["cargo", "build", "--release"]`，窗格命令指向 `target/release/` 产物；Ratatui 的全屏 alt-screen 渲染在 herdr overlay pane 中即普通终端程序，无检测冲突）：
+
+- `[[panes]] id = "board" placement = "overlay"`：kanban/DAG 投影——列 = task 状态，卡 = task（assignee、worktree、attempts 徽标）；数据源是**只读**的 coop 共享文件（P1 `coop_board` 投影逻辑复用为 `dsh coop board --watch` 流式输出），GUI 不写共享文件，操作仍走工具/命令。
+- `[[keys.command]]`（prefix+b 等）打开 board；`[[actions]]`：focus 节点 pane（`herdr agent focus <名>`）、bind/release（调 dsh coop 命令）、`worktree clean` 等高频动作。
+- `[[events]] on = "worktree.created"` 等 herdr 事件钩子：把 herdr 侧 worktree 生命周期与 coop 的 wt-registry 对齐展示（v2 不合并两套 worktree 管理，coop 自管 P2 实现不变）。
+
+### 8.5 交互语义（不变）
+
+- 手动打开的 worker pane 里，用户输入与 coop 唤醒 turn 按 inbox 到达顺序 FIFO（§12.2 裁决）；`[coop]` 来源标记呈现。
+- 观察后台节点：`herdr agent attach <名>`（或 `terminal attach`）直接附着任一节点终端；未打开的节点照常在各自 pane 里运行。
+- v2 不在 herdr 内做 web；`ui-coop` web slot 保留为后续可选项，非 P5 范围。
 
 ---
 
@@ -292,7 +322,7 @@ Task {
 | P2 | worktree 全生命周期（create/bind/merge/clean/孤儿回收） | P0（不依赖 P1，可并行） |
 | P3 | reviewer 双门控（plan review、task verify）+ subagent 执行器 + rework/deadline | P1 |
 | P4 | summarizer→memory（写入、注入段、检索工具） | P1 |
-| P5 | GUI：header 节点行、kanban、后台 session attach | P0–P3 的只读视图 |
+| P5 | Herdr TUI：spawn-herdr 节点创建、coop 状态上报（report-agent/metadata）、coop 插件（board overlay + 快捷动作） | P0（registry）+ P1（board 投影）；herdr 插件与 dsh CLI 可并行开发 |
 
 每阶段独立可发布、可回退（v2 目录自包含）。P0+P1 = 最小可用（多 master DAG 串并行）；P2 起才需要 git 仓库项目。
 

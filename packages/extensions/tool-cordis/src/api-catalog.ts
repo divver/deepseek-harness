@@ -1003,6 +1003,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         parameters: [{ name: 'agent', description: 'querying live node.' }, { name: 'req', description: 'query text and optional limit.' }],
         returns: 'matching entries, newest first.',
       },
+      {
+        signature: 'async createNodeV2( agent: Agent, req: { role: \'worker\' | \'reviewer\'; model?: string; workdir?: string }, ): Promise<{ spawned: \'herdr\' | \'headless\'; paneId?: string; entry?: CoopV2RegistryEntry }>',
+        description: 'Auto-create one bound worker/reviewer node (§4.4, §8.2). With herdr reachable and the master running inside a herdr pane, the node lands in a freshly split pane running `spawnCommand`, then receives its `/coop <role> --master <id>` registration line (pre-bind). Otherwise the node is an in-process headless session registered bound directly.',
+        parameters: [{ name: 'agent', description: 'creating live master.' }, { name: 'req', description: 'role, optional model route, and working directory.' }],
+        returns: 'the spawn outcome (herdr pane id, or the committed headless entry).',
+      },
     ],
   },
   {
@@ -4962,7 +4968,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'CoopV2RegistryEntry',
-    declaration: 'export interface CoopV2RegistryEntry {\n    sessionId: string;\n    roles: V2Role[];\n    masterId?: MasterId;\n    bindState: BindState;\n    cwd: string;\n    cwdScope: CwdScope;\n    updatedAt: number;\n    heartbeatAt: number;\n    skills?: string[];\n    meta?: {\n        model?: string;\n        provider?: string;\n        pid?: number;\n        host?: string;\n    };\n}',
+    declaration: 'export interface CoopV2RegistryEntry {\n    sessionId: string;\n    roles: V2Role[];\n    masterId?: MasterId;\n    bindState: BindState;\n    cwd: string;\n    cwdScope: CwdScope;\n    updatedAt: number;\n    heartbeatAt: number;\n    skills?: string[];\n    meta?: {\n        model?: string;\n        provider?: string;\n        pid?: number;\n        host?: string;\n        paneId?: string;\n        spawn?: string;\n    };\n}',
   },
   {
     name: 'CoopV2Task',

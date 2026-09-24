@@ -144,6 +144,7 @@ export type CoopErrorCode =
     | 'COOP_NODE_ALREADY_BOUND'
     | 'COOP_NODE_LIMIT_REACHED'
     | 'COOP_NOT_YOUR_NODE'
+    | 'COOP_SPAWN_FAILED'
     | 'COOP_DAG_CYCLE_REJECTED'
     | 'COOP_TASK_NOT_FOUND'
     | 'COOP_WORKTREE_NOT_FOUND'
@@ -193,8 +194,8 @@ export interface CoopV2RegistryEntry {
   heartbeatAt: number
   /** Skills this node declares; the scheduler matches task skill demands against them. */
   skills?: string[]
-  /** Optional registration metadata; `model` is the LlmAdapter route string. */
-  meta?: { model?: string; provider?: string; pid?: number; host?: string }
+  /** Optional registration metadata; `model` is the LlmAdapter route string, `paneId` self-reports a herdr pane. */
+  meta?: { model?: string; provider?: string; pid?: number; host?: string; paneId?: string; spawn?: string }
 }
 
 /** On-disk shape of `.dsh/coop/v2/registry.json` and the global any-scope v2 table. */
