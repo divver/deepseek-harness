@@ -41,6 +41,7 @@ This table connects model-visible tool names to the plugin package and service s
 | `@deepseek-ai/dsh-tool-subagent-control` | `interrupt_agent`, `list_agents`, `send_message` | `ctx.tools`, `ctx.subagents`, `ctx.agents and ctx.sessionProjections (list_agents only)` | `tool/call`, `tool/result`, `child session events through ctx.subagents` | - | The globally named control tools over continuable background subagents: provider-bound `tool-subagent` instances register distinct delegation tools, while this package registers `send_message` and `interrupt_agent` once, plus `list_agents` from its separately loaded `/list-agents` plugin (whose catalog rows use the sessionProjections and live Agent registries). |
 | `@deepseek-ai/dsh-tool-jobs` | `job_kill`, `job_list`, `job_output` | `ctx.tools`, `ctx.jobs`, `ctx.systemPrompt` | `tool/call`, `tool/result`, `user/message via agent.inject() for background completion notices` | - | The kind-agnostic background-job controller: background bash commands, PTY sends, and subagents are read, listed, and killed through the same three tools. Loading the plugin attaches the controller that arms producers' `ctx.jobs.start()`. |
 | `@deepseek-ai/dsh-experimental-tool-agent-team` | `interrupt_agent`, `list_agents`, `send_message`, `spawn_teammate`, `team_task_create`, `team_task_get`, `team_task_list`, `team_task_update`, `wait_agent` | `ctx.tools`, `ctx.systemPrompt`, `ctx.agentTeams`, `an exact live Team member Agent` | `tool/call`, `team/member`, `team/message/queued`, `team/message/delivered`, `team/task`, `tool/result` | - | All nine tools are scoped to implicit Team Leads and durable teammates. The shipped dsh-base bundle keeps the package disabled; the documented Agent Teams profile patch enables it while disabling the legacy continuable-child control names. |
+| `@deepseek-ai/dsh-coop` | `coop_abort`, `coop_abort_ack`, `coop_execute_begin`, `coop_execute_report`, `coop_list`, `coop_plan_create`, `coop_plan_notify`, `coop_pre_review`, `coop_register`, `coop_status`, `coop_verify` | `ctx.tools`, `ctx.agents`, `a workspace cwd shared by every participating session` | `tool/call`, `tool/result`, `user/message via Agent.followup() for cross-session notifications`, `coop/registry`, `coop/plan-change`, `coop/review`, `coop/execution` | - | Cross-session master/worker plan cooperation over a workspace-shared file store (.dsh/coop/). The session files are authoritative and per-session coop/* events are mirrors; notifications become inbox signal lines that drain into woken follow-up turns, so delivery works across dsh processes. |
 | `@deepseek-ai/dsh-tool-todo` | `todo_write` | `ctx.tools`, `owning Agent session` | `tool/call`, `todo/write`, `tool/result` | - | todo_write is session-owned state; UIs render the latest todo/write event as a checklist. `allowParallelInProgress` is required with no default, so the catalog states its choice: `true`, whose description invites several `in_progress` items. A deployment choosing `false` receives the same tool with a description asking for exactly one active task. |
 | `@deepseek-ai/dsh-tool-workflow` | `workflow` | `ctx.tools`, `ctx.workflowEngine`, `ctx.systemPrompt`, `a calling Agent (exec.agent parents the script children)` | `tool/call`, `tool/result` | - | - |
 | `@deepseek-ai/dsh-tool-workspace-dependencies` | `load_workspace_dependencies` | `ctx.tools` | `tool/call`, `tool/result` | - | - |
@@ -2307,6 +2308,309 @@ Wait for the next teammate status, mailbox, or shared-task change after this cal
 Source: [`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
 
 All nine tools are scoped to implicit Team Leads and durable teammates. The shipped dsh-base bundle keeps the package disabled; the documented Agent Teams profile patch enables it while disabling the legacy continuable-child control names.
+
+<a id="deepseek-aidsh-coop"></a>
+
+## `@deepseek-ai/dsh-coop`
+
+### `coop_abort`
+
+Stop a plan you created (master only) in any non-terminal state; the assigned worker must acknowledge.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string",
+      "description": "Why the plan is being stopped."
+    }
+  },
+  "required": [
+    "planId"
+  ]
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_abort_ack`
+
+As the assigned worker, confirm you stopped an aborted-in-progress plan (aborting → aborted).
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "planId"
+  ]
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_execute_begin`
+
+Mark an approved plan as executing before you start the work (assigned worker only).
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "planId"
+  ]
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_execute_report`
+
+Report finished execution of an assigned plan (assigned worker only); wakes the master to verify.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string",
+      "description": "What was done and any notable outcomes."
+    }
+  },
+  "required": [
+    "planId",
+    "summary"
+  ]
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_list`
+
+List live coop sessions visible to this workspace (same directory plus any-scope), with their roles.
+
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_plan_create`
+
+Create a shared plan (master only). Writes the authoritative plan file plus its markdown document.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Short plan title."
+    },
+    "objective": {
+      "type": "string",
+      "description": "What the worker should achieve and how success is judged."
+    },
+    "reviewLevel": {
+      "type": "string",
+      "description": "Override the deployment default gating level.",
+      "enum": [
+        "strict",
+        "standard",
+        "lenient"
+      ]
+    }
+  },
+  "required": [
+    "title",
+    "objective"
+  ]
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_plan_notify`
+
+Notify the assigned worker that a plan awaits pre-review (master only). First notify binds the affine worker.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string",
+      "description": "Plan id from coop_plan_create."
+    },
+    "workerSessionId": {
+      "type": "string",
+      "description": "Bind this specific worker on first notify."
+    },
+    "reassign": {
+      "type": "boolean",
+      "description": "Pick a new worker (only after the old one went stale)."
+    },
+    "summary": {
+      "type": "string",
+      "description": "One-line instruction shown to the worker."
+    }
+  },
+  "required": [
+    "planId"
+  ]
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_pre_review`
+
+Worker gate on an assigned plan: pass moves it to ready_to_execute; request_changes returns it to the master.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "request_changes"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "One-line rationale recorded in the plan document."
+    }
+  },
+  "required": [
+    "planId",
+    "decision"
+  ]
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_register`
+
+Register THIS session with workspace-wide coop roles (master plans+verifies; worker pre-reviews+executes). Re-registering replaces your previous roles.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "roles": {
+      "type": "array",
+      "description": "Roles to hold after this call.",
+      "items": {
+        "type": "string",
+        "enum": [
+          "master",
+          "worker"
+        ]
+      }
+    },
+    "cwdScope": {
+      "type": "string",
+      "description": "\"cwd\" (default) restricts cooperation to this project directory; \"any\" makes you visible across directories.",
+      "enum": [
+        "cwd",
+        "any"
+      ]
+    },
+    "reviewLevel": {
+      "type": "string",
+      "description": "Pre-review strictness you apply as worker.",
+      "enum": [
+        "strict",
+        "standard",
+        "lenient"
+      ]
+    }
+  },
+  "required": [
+    "roles"
+  ]
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_status`
+
+Read one plan's current shared status and history, or every plan in this workspace when planId is omitted.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string",
+      "description": "Specific plan; omit to list all plans here."
+    }
+  }
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_verify`
+
+Verify a reported plan (creating master only): pass closes it; request_changes sends it back as needs_rework.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "request_changes"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "Acceptance rationale or rework demand."
+    }
+  },
+  "required": [
+    "planId",
+    "decision"
+  ]
+}
+```
+
+Source: [`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+Cross-session master/worker plan cooperation over a workspace-shared file store (.dsh/coop/). The session files are authoritative and per-session coop/* events are mirrors; notifications become inbox signal lines that drain into woken follow-up turns, so delivery works across dsh processes.
 
 <a id="deepseek-aidsh-tool-todo"></a>
 

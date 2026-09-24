@@ -63,6 +63,7 @@ import BrowserUseRegistry from '@deepseek-ai/dsh-browser-use'
 import * as StagehandBrowserTools from '@deepseek-ai/dsh-experimental-browser-use-stagehand-native'
 import type TeamService from '@deepseek-ai/dsh-experimental-agent-team'
 import * as ToolTeam from '@deepseek-ai/dsh-experimental-tool-agent-team'
+import CoopService from '@deepseek-ai/dsh-coop'
 import * as ToolTodo from '@deepseek-ai/dsh-tool-todo'
 import type PluginManager from '@deepseek-ai/dsh-plugin-manager'
 import * as PluginManagerTools from '@deepseek-ai/dsh-plugin-manager/tools'
@@ -617,6 +618,27 @@ const TOOL_PACKAGES: ToolPackage[] = [
     scope: ctx => catalogChildScopes.get(ctx) as Agent,
     note:
       'All nine tools are scoped to implicit Team Leads and durable teammates. The shipped dsh-base bundle keeps the package disabled; the documented Agent Teams profile patch enables it while disabling the legacy continuable-child control names.',
+  },
+  {
+    pkg: '@deepseek-ai/dsh-coop',
+    dir: 'coop',
+    source: 'packages/coop/coop/src/index.ts',
+    requires: ['ctx.tools', 'ctx.agents', 'a workspace cwd shared by every participating session'],
+    writes: [
+      'tool/call',
+      'tool/result',
+      'user/message via Agent.followup() for cross-session notifications',
+      'coop/registry',
+      'coop/plan-change',
+      'coop/review',
+      'coop/execution',
+    ],
+    async mount(ctx) {
+      await ctx.plugin(AgentRegistry)
+      await ctx.plugin(CoopService, {})
+    },
+    note:
+      'Cross-session master/worker plan cooperation over a workspace-shared file store (.dsh/coop/). The session files are authoritative and per-session coop/* events are mirrors; notifications become inbox signal lines that drain into woken follow-up turns, so delivery works across dsh processes.',
   },
   {
     pkg: '@deepseek-ai/dsh-tool-todo',

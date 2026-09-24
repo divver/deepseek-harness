@@ -45,6 +45,7 @@
 | `@deepseek-ai/dsh-tool-subagent-control` | `interrupt_agent`、`list_agents`、`send_message` | `ctx.tools`、`ctx.subagents`、`ctx.agents and ctx.sessionProjections (list_agents only)` | `tool/call`、`tool/result`、`child session events through ctx.subagents` | - | 这些是控制可继续后台 subagent 的全局命名工具：绑定提供方的 `tool-subagent` 实例注册不同的委派工具；本包注册一次 `send_message` 和 `interrupt_agent`，另由 `list_agents` 通过单独加载的 `/list-agents` 插件提供，其目录行使用 sessionProjections 和实时 Agent 注册表。 |
 | `@deepseek-ai/dsh-tool-jobs` | `job_kill`、`job_list`、`job_output` | `ctx.tools`、`ctx.jobs`、`ctx.systemPrompt` | `tool/call`、`tool/result`、`user/message via agent.inject() for background completion notices` | - | 与任务种类无关的后台任务控制器：后台 bash 命令、PTY 发送和 subagent 都通过相同的 3 个工具读取、列出和终止。加载该插件会挂接控制器，从而启用生产方的 `ctx.jobs.start()`。 |
 | `@deepseek-ai/dsh-experimental-tool-agent-team` | `interrupt_agent`、`list_agents`、`send_message`、`spawn_teammate`、`team_task_create`、`team_task_get`、`team_task_list`、`team_task_update`、`wait_agent` | `ctx.tools`、`ctx.systemPrompt`、`ctx.agentTeams`、`an exact live Team member Agent` | `tool/call`、`team/member`、`team/message/queued`、`team/message/delivered`、`team/task`、`tool/result` | - | 这 9 个工具限定于隐式 Team Lead 与持久 teammate 作用域。随产品发布的 dsh-base bundle 默认禁用该包；文档中的 Agent Teams profile patch 会启用它，并禁用旧 continuable child 的同名控制工具。 |
+| `@deepseek-ai/dsh-coop` | `coop_abort`、`coop_abort_ack`、`coop_execute_begin`、`coop_execute_report`、`coop_list`、`coop_plan_create`、`coop_plan_notify`、`coop_pre_review`、`coop_register`、`coop_status`、`coop_verify` | `ctx.tools`、`ctx.agents`、`a workspace cwd shared by every participating session` | `tool/call`、`tool/result`、`user/message via Agent.followup() for cross-session notifications`、`coop/registry`、`coop/plan-change`、`coop/review`、`coop/execution` | - | 基于 workspace 共享文件存储（.dsh/coop/）的跨 session Master/Worker 计划协作。共享文件是权威，各 session 的 coop/* 事件只是镜像；通知写入 inbox 信令行并被唤醒的 followup turn 消费，因此投递可跨 dsh 进程工作。 |
 | `@deepseek-ai/dsh-tool-todo` | `todo_write` | `ctx.tools`、`owning Agent session` | `tool/call`、`todo/write`、`tool/result` | - | todo_write 是会话所有的状态；UI 将最新的 todo/write 事件渲染为检查清单。`allowParallelInProgress` 是没有默认值的必填项，因此本目录明确选择 `true`，对应描述允许同时存在多个 `in_progress` 项。选择 `false` 的部署会获得同一工具，但描述会要求只能有 1 个活动任务。 |
 | `@deepseek-ai/dsh-tool-workflow` | `workflow` | `ctx.tools`、`ctx.workflowEngine`、`ctx.systemPrompt`、`a calling Agent (exec.agent parents the script children)` | `tool/call`、`tool/result` | - | - |
 | `@deepseek-ai/dsh-tool-workspace-dependencies` | `load_workspace_dependencies` | `ctx.tools` | `tool/call`, `tool/result` | - | - |
@@ -2313,6 +2314,310 @@ lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，�
 来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
 
 这 10 个工具限定于隐式 Team Lead 与持久 teammate 作用域。随产品发布的 dsh-base bundle 默认禁用该包；文档中的 Agent Teams profile patch 会启用它，并禁用旧 continuable child 的同名控制工具。
+
+
+<a id="deepseek-aidsh-coop"></a>
+
+## `@deepseek-ai/dsh-coop`
+
+### `coop_abort`
+
+停止一个由你创建的计划（仅限 master），任何非终态均可；被指派的 worker 必须确认。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string",
+      "description": "Why the plan is being stopped."
+    }
+  },
+  "required": [
+    "planId"
+  ]
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_abort_ack`
+
+作为被指派的 worker，确认你已停止处于 aborting 的计划（aborting → aborted）。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "planId"
+  ]
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_execute_begin`
+
+在开始工作前把已批准的计划标记为 executing（仅限被指派的 worker）。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "planId"
+  ]
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_execute_report`
+
+汇报被指派计划的执行完成（仅限被指派的 worker）；会唤醒 master 进行验证。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string",
+      "description": "What was done and any notable outcomes."
+    }
+  },
+  "required": [
+    "planId",
+    "summary"
+  ]
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_list`
+
+列出本 workspace 可见的活跃 coop session（同目录加 any 作用域）及其角色。
+
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_plan_create`
+
+创建共享计划（仅限 master）。写入权威的计划文件及其 markdown 文档。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Short plan title."
+    },
+    "objective": {
+      "type": "string",
+      "description": "What the worker should achieve and how success is judged."
+    },
+    "reviewLevel": {
+      "type": "string",
+      "description": "Override the deployment default gating level.",
+      "enum": [
+        "strict",
+        "standard",
+        "lenient"
+      ]
+    }
+  },
+  "required": [
+    "title",
+    "objective"
+  ]
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_plan_notify`
+
+通知被指派的 worker 有计划等待 pre-review（仅限 master）。首次 notify 绑定 affine worker。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string",
+      "description": "Plan id from coop_plan_create."
+    },
+    "workerSessionId": {
+      "type": "string",
+      "description": "Bind this specific worker on first notify."
+    },
+    "reassign": {
+      "type": "boolean",
+      "description": "Pick a new worker (only after the old one went stale)."
+    },
+    "summary": {
+      "type": "string",
+      "description": "One-line instruction shown to the worker."
+    }
+  },
+  "required": [
+    "planId"
+  ]
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_pre_review`
+
+worker 对被指派计划的关卡：pass 进入 ready_to_execute；request_changes 退回 master。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "request_changes"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "One-line rationale recorded in the plan document."
+    }
+  },
+  "required": [
+    "planId",
+    "decision"
+  ]
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_register`
+
+为本 session 注册 workspace 级 coop 角色（master 负责计划与验证；worker 负责 pre-review 与执行）。重复注册会替换之前的角色。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "roles": {
+      "type": "array",
+      "description": "Roles to hold after this call.",
+      "items": {
+        "type": "string",
+        "enum": [
+          "master",
+          "worker"
+        ]
+      }
+    },
+    "cwdScope": {
+      "type": "string",
+      "description": "\"cwd\" (default) restricts cooperation to this project directory; \"any\" makes you visible across directories.",
+      "enum": [
+        "cwd",
+        "any"
+      ]
+    },
+    "reviewLevel": {
+      "type": "string",
+      "description": "Pre-review strictness you apply as worker.",
+      "enum": [
+        "strict",
+        "standard",
+        "lenient"
+      ]
+    }
+  },
+  "required": [
+    "roles"
+  ]
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_status`
+
+读取某个计划当前的共享状态与历史；省略 planId 时列出本 workspace 的全部计划。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string",
+      "description": "Specific plan; omit to list all plans here."
+    }
+  }
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+### `coop_verify`
+
+验证已汇报的计划（仅限创建它的 master）：pass 关闭计划；request_changes 以 needs_rework 退回。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "planId": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "request_changes"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "Acceptance rationale or rework demand."
+    }
+  },
+  "required": [
+    "planId",
+    "decision"
+  ]
+}
+```
+
+来源：[`packages/coop/coop/src/index.ts`](../packages/coop/coop/src/index.ts)
+
+基于 workspace 共享文件存储（.dsh/coop/）的跨 session Master/Worker 计划协作。共享文件是权威，各 session 的 coop/* 事件只是镜像；通知写入 inbox 信令行并被唤醒的 followup turn 消费，因此投递可跨 dsh 进程工作。
 
 
 <a id="deepseek-aidsh-tool-todo"></a>

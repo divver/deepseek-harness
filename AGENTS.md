@@ -40,6 +40,7 @@ packages/    @deepseek-ai/dsh-<pkg> workspaces at packages/<group>/<pkg>/
   workflow/             workflow execution
   webhook/              webhook ingress
   todo/                 todo_write tool
+  coop/                 cross-session master/worker plan cooperation
   plan/                 logged planning
   goal/                 session goals
   schedule/             scheduled follow-ups

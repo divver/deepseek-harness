@@ -759,6 +759,102 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     ],
   },
   {
+    key: 'coop',
+    summary: 'Master/worker cooperation over a workspace-shared file store.',
+    description: 'Master/worker cooperation over a workspace-shared file store. The class is the plugin: the Loader instantiates it with Config, and the optional tool/command/policy children mount only when their seams are composed.',
+    methods: [
+      {
+        signature: 'async getRoles(agent: Agent): Promise<Role[]>',
+        description: 'Roles held by one agent, read from the shared registry (fail-loud when absent).',
+        parameters: [{ name: 'agent', description: 'querying live agent.' }],
+        returns: 'the roles held in the shared registry (empty when unregistered).',
+      },
+      {
+        signature: 'async setRoles( agent: Agent, ops: { add?: Role[]; remove?: Role[] } | { set: Role[] }, opts: { cwdScope?: \'cwd\' | \'any\'; reviewLevel?: ReviewLevel } = {}, ): Promise<Role[]>',
+        description: 'Register, update, or drop the calling agent\'s roles in the shared registry. Master registration runs its singleton check under the registry writer lock, so two processes cannot both become master.',
+        parameters: [{ name: 'agent', description: 'acting live agent.' }, { name: 'ops', description: 'additive/removal deltas or a full replacement set.' }, { name: 'opts', description: 'directory scope for newly declared visibility, and the worker gating level.' }],
+        returns: 'the resulting role set (empty means deregistered).',
+      },
+      {
+        signature: 'async listWorkspace(agent: Agent, opts: { all?: boolean } = {}): Promise<CoopRegistryEntry[]>',
+        description: 'Visible live registrations for one workspace (same cwd plus any-scope), or every entry in both tables with `all`.',
+        parameters: [{ name: 'agent', description: 'querying live agent anchoring the workspace.' }, { name: 'opts', description: '`all` bypasses the same-directory filter (the `--all` flag).' }],
+        returns: 'fresh entries, deduplicated across the local and global tables.',
+      },
+      {
+        signature: 'async createPlan(agent: Agent, req: { title: string; objective: string; reviewLevel?: ReviewLevel }): Promise<CoopPlanFile>',
+        description: 'Create a shared plan and its markdown document. Master-only.',
+        parameters: [{ name: 'agent', description: 'creating live agent (must hold the master role).' }, { name: 'req', description: 'title, objective, and optional review level override.' }],
+        returns: 'the committed draft plan.',
+      },
+      {
+        signature: 'async getPlan(agent: Agent, planId: string): Promise<CoopPlanFile>',
+        description: 'Load one plan with lazy watchdog transitions applied.',
+        parameters: [{ name: 'agent', description: 'reading live agent anchoring the workspace.' }, { name: 'planId', description: 'plan to load.' }],
+        returns: 'the plan with any due watchdog transition applied.',
+      },
+      {
+        signature: 'async listPlans(agent: Agent): Promise<CoopPlanFile[]>',
+        description: 'All plans in the agent\'s workspace, watchdog applied, newest history first.',
+        parameters: [{ name: 'agent', description: 'querying live agent.' }],
+        returns: 'plans ordered by most recent history entry.',
+      },
+      {
+        signature: 'async notifyPlan( agent: Agent, planId: string, opts: { workerSessionId?: string; reassign?: boolean; summary?: string } = {}, ): Promise<CoopPlanFile>',
+        description: 'Bind (or rebind) the affine worker and deliver the plan notification. Master-only, creator-only. A repeat notify while already `pending_pre_review` is a no-op that keeps the bound worker.',
+        parameters: [{ name: 'agent', description: 'notifying live agent.' }, { name: 'planId', description: 'plan to announce.' }, { name: 'opts', description: 'explicit worker, reassignment intent, and a short summary.' }],
+        returns: 'the committed plan with its affine worker bound.',
+      },
+      {
+        signature: 'async submitPreReview(agent: Agent, planId: string, decision: \'pass\' | \'request_changes\', summary?: string): Promise<CoopPlanFile>',
+        description: 'Worker pre-review gate.',
+        parameters: [{ name: 'agent', description: 'assigned worker live agent.' }, { name: 'planId', description: 'plan under review.' }, { name: 'decision', description: 'pass promotes to ready_to_execute; request_changes returns the plan.' }, { name: 'summary', description: 'one-line rationale recorded in the plan document.' }],
+        returns: 'the committed plan in ready_to_execute or needs_plan_revision.',
+      },
+      {
+        signature: 'async beginExecution(agent: Agent, planId: string): Promise<CoopPlanFile>',
+        description: 'Worker starts executing: ready_to_execute (or needs_rework retry) → executing.',
+        parameters: [{ name: 'agent', description: 'assigned worker live agent.' }, { name: 'planId', description: 'plan to begin.' }],
+        returns: 'the committed executing plan.',
+      },
+      {
+        signature: 'async touchExecution(agent: Agent, planId: string): Promise<void>',
+        description: 'Worker heartbeat while executing; feeds the executing watchdog.',
+        parameters: [{ name: 'agent', description: 'assigned worker live agent.' }, { name: 'planId', description: 'executing plan.' }],
+      },
+      {
+        signature: 'async reportExecution(agent: Agent, planId: string, summary: string): Promise<CoopPlanFile>',
+        description: 'Worker reports execution results: executing → pending_verify, then wakes the master.',
+        parameters: [{ name: 'agent', description: 'assigned worker live agent.' }, { name: 'planId', description: 'executed plan.' }, { name: 'summary', description: 'what was done, recorded in the plan document.' }],
+        returns: 'the committed pending_verify plan.',
+      },
+      {
+        signature: 'async verifyPlan(agent: Agent, planId: string, decision: \'pass\' | \'request_changes\', summary?: string): Promise<CoopPlanFile>',
+        description: 'Master verification: pass closes the plan (done → closed); request_changes returns it to the assigned worker as needs_rework.',
+        parameters: [{ name: 'agent', description: 'creating master live agent.' }, { name: 'planId', description: 'plan under verification.' }, { name: 'decision', description: 'pass or request_changes.' }, { name: 'summary', description: 'acceptance rationale or rework demand.' }],
+        returns: 'the committed plan (closed on pass, needs_rework otherwise).',
+      },
+      {
+        signature: 'async abortPlan(agent: Agent, planId: string, reason?: string): Promise<CoopPlanFile>',
+        description: 'Master abort: any non-terminal status moves to aborting and the assigned worker is told to stop. Repeat aborts while already aborting re-deliver.',
+        parameters: [{ name: 'agent', description: 'creating master live agent.' }, { name: 'planId', description: 'plan to stop.' }, { name: 'reason', description: 'human-readable stop rationale.' }],
+        returns: 'the committed aborting plan.',
+      },
+      {
+        signature: 'async abortAck(agent: Agent, planId: string): Promise<CoopPlanFile>',
+        description: 'Assigned worker acknowledges an abort: aborting → aborted.',
+        parameters: [{ name: 'agent', description: 'assigned worker live agent.' }, { name: 'planId', description: 'stopped plan.' }],
+        returns: 'the committed aborted plan.',
+      },
+      {
+        signature: 'async drainInbox(agent: Agent): Promise<number>',
+        description: 'Deliver every undelivered signal addressed to one agent and advance its watermark. Each delivered line becomes a woken follow-up turn.',
+        parameters: [{ name: 'agent', description: 'receiving live agent.' }],
+        returns: 'how many previously undelivered signals were delivered.',
+      },
+    ],
+  },
+  {
     key: 'credentials',
     summary: 'Abstract credential service over two key spaces that answer two questions.',
     description: 'Abstract credential service over two key spaces that answer two questions.\n\nA CredentialRef answers "what is behind this environment-variable name", layered over the process environment, the provider-managed store, and `.env` files. One seam-wide rule binds that half: an empty stored value is absent everywhere — `resolve` skips it, `describe` reports it unconfigured — so a blank never masquerades as a configured secret.\n\nA CredentialKey answers "what credential does this plugin hold for this id". Nothing can layer here — an authorization grant has no environment to be read from — so presence of the record is the whole fact, and modifyRecord is the only write path because a correct write depends on the current value (a token refresh is read-decide-replace under one lock).',
@@ -4678,6 +4774,26 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ContinuableSubagentDescriptorData extends SubagentDescriptorBase {\n    readonly mode: \'continuable\';\n    readonly label: string;\n    readonly agentProvider?: string;\n    readonly agentModel?: string;\n    readonly agentReasoningEffort?: ReasoningEffortId;\n    readonly persona?: string;\n    readonly toolFilter?: ToolRestriction;\n}',
   },
   {
+    name: 'CoopExecutionEventData',
+    declaration: 'export interface CoopExecutionEventData {\n    planId: string;\n    phase: \'begin\' | \'report\';\n    summary?: string;\n}',
+  },
+  {
+    name: 'CoopPlanFile',
+    declaration: 'export interface CoopPlanFile {\n    version: 1;\n    planId: PlanId;\n    docPath: string;\n    title: string;\n    objective: string;\n    status: PlanStatus;\n    createdBy: string;\n    assignedWorkerSessionId?: string;\n    cwd: string;\n    reviewLevel: ReviewLevel;\n    history: CoopPlanHistoryEntry[];\n    execution?: {\n        startedAt: number;\n        heartbeatAt: number;\n    };\n    lastReview?: CoopReviewEventData;\n    lastExecution?: CoopExecutionEventData;\n}',
+  },
+  {
+    name: 'CoopPlanHistoryEntry',
+    declaration: 'export interface CoopPlanHistoryEntry {\n    time: number;\n    sessionId: string;\n    op: string;\n    status: PlanStatus;\n    summary?: string;\n}',
+  },
+  {
+    name: 'CoopRegistryEntry',
+    declaration: 'export interface CoopRegistryEntry {\n    sessionId: string;\n    roles: Role[];\n    reviewLevel?: ReviewLevel;\n    updatedAt: number;\n    heartbeatAt: number;\n    cwd: string;\n    cwdScope: CwdScope;\n}',
+  },
+  {
+    name: 'CoopReviewEventData',
+    declaration: 'export interface CoopReviewEventData {\n    planId: string;\n    phase: \'pre_review\' | \'verify\' | \'abort_ack\';\n    decision: \'pass\' | \'request_changes\' | \'ack\';\n    summary?: string;\n}',
+  },
+  {
     name: 'CordisDynamicPackageId',
     declaration: 'export type CordisDynamicPackageId = Branded<\'CordisDynamicPackageId\'>;',
   },
@@ -4788,6 +4904,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'CredentialRef',
     declaration: 'export type CredentialRef = Branded<\'CredentialRef\'>;',
+  },
+  {
+    name: 'CwdScope',
+    declaration: 'export type CwdScope = \'cwd\' | \'any\';',
   },
   {
     name: 'DeepSeekLlmApiExtensionMap',
@@ -5634,6 +5754,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface PermissionCatalog {\n    options: PresetOption[];\n    defaultOptions: PresetOption[];\n    defaultPreset: string;\n}',
   },
   {
+    name: 'PlanId',
+    declaration: 'export type PlanId = Branded<\'CoopPlanId\'>;',
+  },
+  {
+    name: 'PlanStatus',
+    declaration: 'export type PlanStatus = \'draft\' | \'pending_pre_review\' | \'needs_plan_revision\' | \'ready_to_execute\' | \'executing\' | \'pending_verify\' | \'needs_rework\' | \'done\' | \'closed\' | \'aborting\' | \'aborted\';',
+  },
+  {
     name: 'PlatformSession',
     declaration: 'export interface PlatformSession {\n    readonly origin: string;\n    readonly token: string;\n    readonly embeddedPageDist?: string;\n    readonly requestHeaders?: Readonly<Record<string, string>>;\n}',
   },
@@ -5968,6 +6096,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'ResumeAgentOptions',
     declaration: 'export interface ResumeAgentOptions {\n    readonly resumeSessionId: SessionId;\n    readonly parentAgent?: Agent;\n    readonly agentOptions?: AgentOptions;\n    readonly signal?: AbortSignal;\n    readonly setup?: AgentSetup;\n}',
+  },
+  {
+    name: 'ReviewLevel',
+    declaration: 'export type ReviewLevel = \'strict\' | \'standard\' | \'lenient\';',
+  },
+  {
+    name: 'Role',
+    declaration: 'export type Role = \'master\' | \'worker\';',
   },
   {
     name: 'RpcId',
