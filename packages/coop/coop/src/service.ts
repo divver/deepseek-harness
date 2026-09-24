@@ -184,6 +184,9 @@ export class CoopService extends Service {
   constructor(ctx: Context, config: Config = {}) {
     super(ctx, 'coop')
     this.resolved = resolveCoopConfig(config)
+    ctx.inject(['shell'], (shellCtx) => {
+      this.shellSeam = (shellCtx as { shell?: unknown }).shell as typeof this.shellSeam
+    })
     ctx.inject(['systemPrompt'], (promptCtx) => {
       promptCtx.systemPrompt.section({
         name: COOP_POLICY_SECTION_NAME,
@@ -2210,14 +2213,7 @@ export class CoopService extends Service {
        * @returns exit code plus stdout/stderr text.
        */
   private async runGit(workdir: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
-    const shell = this.ctx.get('shell') as {
-      resolve: (request: Record<string, unknown>) => unknown
-      execute: (spec: unknown) => Promise<{ result: () => Promise<{
-        exitCode: number | null
-        stdout: { text: string }
-        stderr: { text: string }
-      }> }>
-    } | undefined
+    const shell = this.shellSeam ?? (this.ctx.get('shell') as typeof this.shellSeam)
     if (shell === undefined) {
       throw new CoopError('worktree operations require a mounted shell provider (ctx.shell)', 'COOP_CONFIG_UNSUPPORTED')
     }
@@ -2540,14 +2536,7 @@ export class CoopService extends Service {
        * @returns exit code plus trimmed stdout/stderr.
        */
   private async runHerdr(args: string[], opts: { quiet?: boolean } = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
-    const shell = this.ctx.get('shell') as {
-      resolve: (request: Record<string, unknown>) => unknown
-      execute: (spec: unknown) => Promise<{ result: () => Promise<{
-        exitCode: number | null
-        stdout: { text: string }
-        stderr: { text: string }
-      }> }>
-    } | undefined
+    const shell = this.shellSeam ?? (this.ctx.get('shell') as typeof this.shellSeam)
     if (shell === undefined) return { code: null, stdout: '', stderr: 'no shell provider mounted' }
     const binary = process.env.HERDR_BIN_PATH ?? 'herdr'
     const spec = shell.resolve({
@@ -2741,6 +2730,17 @@ export class CoopService extends Service {
     }
   }
 
+  /** Shell seam captured through injection — `ctx.get('shell')` may return a
+   * fiber wrapper whose method surface differs; the injected child's `shell`
+   * is the service instance the tests and production both expose. */
+  private shellSeam: {
+    resolve: (request: Record<string, unknown>) => unknown
+    execute: (spec: unknown) => Promise<{ result: () => Promise<{
+      exitCode: number | null
+      stdout: { text: string }
+      stderr: { text: string }
+    }> }>
+  } | undefined
 }
 /**
  * Whether the edge set contains a cycle; returns the cycle path for the
