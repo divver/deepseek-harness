@@ -894,13 +894,19 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the committed designing plan.',
       },
       {
-        signature: 'async activatePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>',
-        description: 'designing → active: recompute readiness from the DAG and schedule.',
-        parameters: [{ name: 'agent', description: 'activating live master.' }, { name: 'planId', description: 'plan to activate.' }],
-        returns: 'the committed active plan.',
+        signature: 'async submitReviewV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>',
+        description: 'Submit a designing plan to review (master only): designing → reviewing and every fresh bound reviewer is woken (§6.3).',
+        parameters: [{ name: 'agent', description: 'submitting live master.' }, { name: 'planId', description: 'plan to submit.' }],
+        returns: 'the committed reviewing plan.',
       },
       {
-        signature: 'async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: \'inline\' | \'subagent\'; skills?: string[]; worktreeId?: string }, ): Promise<CoopV2Task>',
+        signature: 'async reviewPlanV2( agent: Agent, planId: string, decision: \'pass\' | \'request_changes\', summary?: string, ): Promise<CoopV2PlanFile>',
+        description: 'Reviewer gate on a submitted plan (§6.3): pass → active (readiness recomputed, scheduler runs); request_changes → designing for the master to revise and resubmit. Gate: a reviewer bound to the owning master, or the master with `allowSelfReview` (§12.4).',
+        parameters: [{ name: 'agent', description: 'reviewing live reviewer (or self-reviewing master).' }, { name: 'planId', description: 'plan under review.' }, { name: 'decision', description: 'pass or request_changes.' }, { name: 'summary', description: 'one-line rationale.' }],
+        returns: 'the committed plan.',
+      },
+      {
+        signature: 'async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: \'inline\' | \'subagent\'; skills?: string[]; worktreeId?: string deadlines?: { softMs?: number; hardMs?: number } }, ): Promise<CoopV2Task>',
         description: 'Add one task to a non-terminal plan; `dependsOn` becomes DAG edges and a cycle is rejected under the plan lock. Schedules afterwards.',
         parameters: [{ name: 'agent', description: 'adding live master.' }, { name: 'planId', description: 'target plan.' }, { name: 'req', description: 'title, spec, dependencies, executor style, and skill demands.' }],
         returns: 'the committed task.',
@@ -979,6 +985,11 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         signature: 'async cleanWorktreeV2(agent: Agent, dir: string, opts: { force?: boolean } = {}): Promise<void>',
         description: 'Remove one worktree (`git worktree remove`) and mark its row `cleaned`.',
         parameters: [{ name: 'agent', description: 'cleaning live master.' }, { name: 'dir', description: 'worktree directory.' }, { name: 'opts', description: '`force` discards local modifications.' }],
+      },
+      {
+        signature: 'async touchExecutionV2(agent: Agent, planId: string, taskId: string): Promise<void>',
+        description: 'Assigned worker heartbeat while executing; feeds the executing watchdog (§5.2: silent `executingStaleMs` falls back to rework).',
+        parameters: [{ name: 'agent', description: 'executing live worker.' }, { name: 'planId', description: 'owning plan.' }, { name: 'taskId', description: 'target task.' }],
       },
     ],
   },
@@ -4939,7 +4950,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'CoopV2Task',
-    declaration: 'export interface CoopV2Task {\n    taskId: string;\n    title: string;\n    spec: string;\n    status: V2TaskStatus;\n    dependsOn: string[];\n    assignee?: string;\n    worktreeId?: string;\n    executor: \'inline\' | \'subagent\';\n    skills: string[];\n    attempts: number;\n    createdAt: number;\n    updatedAt: number;\n    verify?: {\n        decision: \'pass\' | \'request_changes\';\n        summary?: string;\n        by: string;\n        at: number;\n    };\n    report?: {\n        summary: string;\n        by: string;\n        at: number;\n    };\n}',
+    declaration: 'export interface CoopV2Task {\n    taskId: string;\n    title: string;\n    spec: string;\n    status: V2TaskStatus;\n    dependsOn: string[];\n    assignee?: string;\n    worktreeId?: string;\n    executor: \'inline\' | \'subagent\';\n    skills: string[];\n    attempts: number;\n    assignedAt?: number;\n    execution?: {\n        startedAt: number;\n        heartbeatAt: number;\n    };\n    deadlines?: {\n        softMs?: number;\n        hardMs?: number;\n    };\n    createdAt: number;\n    updatedAt: number;\n    verify?: {\n        decision: \'pass\' | \'request_changes\';\n        summary?: string;\n        by: string;\n        at: number;\n    };\n    report?: {\n        summary: string;\n        by: string;\n        at: number;\n    };\n}',
   },
   {
     name: 'CoopWtEntry',

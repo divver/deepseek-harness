@@ -261,12 +261,26 @@ async statusV2(agent: Agent): Promise<{ self: CoopV2RegistryEntry | undefined ma
 async createPlanV2(agent: Agent, req: { title: string; objective: string; repoRoot?: string }): Promise<CoopV2PlanFile>
 
 /**
-     * designing → active: recompute readiness from the DAG and schedule.
-     * @param agent - activating live master.
-     * @param planId - plan to activate.
-     * @returns the committed active plan.
+     * Submit a designing plan to review (master only): designing → reviewing
+     * and every fresh bound reviewer is woken (§6.3).
+     * @param agent - submitting live master.
+     * @param planId - plan to submit.
+     * @returns the committed reviewing plan.
      */
-async activatePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
+async submitReviewV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
+
+/**
+     * Reviewer gate on a submitted plan (§6.3): pass → active (readiness
+     * recomputed, scheduler runs); request_changes → designing for the master
+     * to revise and resubmit. Gate: a reviewer bound to the owning master, or
+     * the master with `allowSelfReview` (§12.4).
+     * @param agent - reviewing live reviewer (or self-reviewing master).
+     * @param planId - plan under review.
+     * @param decision - pass or request_changes.
+     * @param summary - one-line rationale.
+     * @returns the committed plan.
+     */
+async reviewPlanV2( agent: Agent, planId: string, decision: 'pass' | 'request_changes', summary?: string, ): Promise<CoopV2PlanFile>
 
 /**
      * Add one task to a non-terminal plan; `dependsOn` becomes DAG edges and a
@@ -276,7 +290,7 @@ async activatePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
      * @param req - title, spec, dependencies, executor style, and skill demands.
      * @returns the committed task.
      */
-async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[]; worktreeId?: string }, ): Promise<CoopV2Task>
+async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[]; worktreeId?: string deadlines?: { softMs?: number; hardMs?: number } }, ): Promise<CoopV2Task>
 
 /**
      * Update a task's brief while it is not in flight (executing/reporting/
@@ -408,6 +422,15 @@ async mergeWorktreeV2(agent: Agent, dir: string): Promise<CoopWtEntry>
      * @param opts - `force` discards local modifications.
      */
 async cleanWorktreeV2(agent: Agent, dir: string, opts: { force?: boolean } = {}): Promise<void>
+
+/**
+     * Assigned worker heartbeat while executing; feeds the executing
+     * watchdog (§5.2: silent `executingStaleMs` falls back to rework).
+     * @param agent - executing live worker.
+     * @param planId - owning plan.
+     * @param taskId - target task.
+     */
+async touchExecutionV2(agent: Agent, planId: string, taskId: string): Promise<void>
 ```
 
 Types: [Agent](core.md)

@@ -9,7 +9,8 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import CoopService from '../src/index.ts'
+import CoopService, { readV2PlanFile, v2PlanPath, v2Root, writeV2PlanFile } from '../src/index.ts'
+import type { CoopV2PlanFile } from '../src/index.ts'
 
 /**
  * v2 plan-DAG suite over a real agent spine: plan lifecycle, task add/link
@@ -59,6 +60,25 @@ async function harness(config: Partial<ConstructorParameters<typeof CoopService>
   }
 }
 
+/** Register the reviewer for the master (idempotent) and walk submit → pass. */
+async function activate(ctx: Context, master: Agent, reviewer: Agent, planId: string): Promise<void> {
+  const visible = await ctx.coop.listNodesV2(master)
+  if (!visible.some(entry => entry.sessionId === String(reviewer.session.id) && entry.roles.includes('reviewer'))) {
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
+  }
+  await ctx.coop.submitReviewV2(master, planId)
+  await ctx.coop.reviewPlanV2(reviewer, planId, 'pass')
+}
+
+/** Rewrite one plan file for tests that need to backdate watchdog anchors. */
+async function editPlanFile(cwd: string, masterId: string, planId: string, edit: (plan: CoopV2PlanFile) => CoopV2PlanFile): Promise<void> {
+  const path = v2PlanPath(v2Root(cwd, '.dsh/coop'), masterId, planId)
+  const plan = await readV2PlanFile(path)
+  if (plan === undefined) throw new Error(`plan ${planId} missing`)
+  await writeV2PlanFile(path, edit(plan))
+}
+
 /** The `[coop]`-sourced follow-up turns one agent received, as text. */
 function coopNotices(agent: Agent): string[] {
   return [...agent.session.snapshotEvents()]
@@ -83,11 +103,11 @@ describe('plan lifecycle', () => {
   })
 
   it('closes only when every task is done or cancelled', async () => {
-    const { ctx, master } = await harness()
+    const { ctx, master, reviewer } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
-    await ctx.coop.activatePlanV2(master, plan.planId)
+    await activate(ctx, master, reviewer, plan.planId)
     await expect(ctx.coop.closePlanV2(master, plan.planId)).rejects.toMatchObject({ code: 'COOP_INVALID_TRANSITION' })
     const board = await ctx.coop.boardV2(master, plan.planId)
     const t1 = board[0]?.tasks[0]
@@ -117,7 +137,7 @@ describe('dag', () => {
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 'first', spec: 'A' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 'second', spec: 'B', dependsOn: ['t1'] })
-    await ctx.coop.activatePlanV2(master, plan.planId)
+    await activate(ctx, master, reviewer, plan.planId)
     let board = await ctx.coop.boardV2(master, plan.planId)
     expect(board[0]?.tasks.find(task => task.taskId === 't1')?.status).toBe('assigned')
     expect(board[0]?.tasks.find(task => task.taskId === 't2')?.status).toBe('pending')
@@ -155,14 +175,14 @@ describe('dag', () => {
 
 describe('scheduler', () => {
   it('assigns ready tasks to idle bound workers and wakes them in-process', async () => {
-    const { ctx, master, worker } = await harness()
+    const { ctx, master, worker, reviewer } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
     const status = await ctx.coop.statusV2(master)
     const m = String(status.self?.masterId)
     await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't', spec: 'do' })
-    await ctx.coop.activatePlanV2(master, plan.planId)
+    await activate(ctx, master, reviewer, plan.planId)
     const board = await ctx.coop.boardV2(master, plan.planId)
     expect(board[0]?.tasks[0]?.status).toBe('assigned')
     expect(board[0]?.tasks[0]?.assignee).toBe('worker')
@@ -170,7 +190,7 @@ describe('scheduler', () => {
   })
 
   it('respects skill demands and maxParallelTasks', async () => {
-    const { ctx, master, worker, extra } = await harness({ maxParallelTasks: 1 })
+    const { ctx, master, worker, extra, reviewer } = await harness({ maxParallelTasks: 1 })
     await ctx.coop.registerV2(master, { roles: ['master'] })
     const m = String((await ctx.coop.statusV2(master)).self?.masterId)
     await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m, skills: ['rust'] })
@@ -178,7 +198,7 @@ describe('scheduler', () => {
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 'needs-rust', spec: 'A', skills: ['rust'] })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 'any', spec: 'B' })
-    await ctx.coop.activatePlanV2(master, plan.planId)
+    await activate(ctx, master, reviewer, plan.planId)
     const board = await ctx.coop.boardV2(master, plan.planId)
     expect(board[0]?.tasks.find(task => task.taskId === 't1')?.status).toBe('assigned')
     expect(board[0]?.tasks.find(task => task.taskId === 't1')?.assignee).toBe('worker')
@@ -193,7 +213,7 @@ describe('scheduler', () => {
     await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't', spec: 'do' })
-    await ctx.coop.activatePlanV2(master, plan.planId)
+    await activate(ctx, master, reviewer, plan.planId)
     await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
     await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'first try')
     const reworked = await ctx.coop.verifyTaskV2(reviewer, plan.planId, 't1', 'request_changes', 'tighter')
@@ -208,13 +228,13 @@ describe('scheduler', () => {
 
 describe('verification gate', () => {
   it('rejects the master by default and allows it with allowSelfReview', async () => {
-    const { ctx, master, worker } = await harness()
+    const { ctx, master, worker, reviewer } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
     const m = String((await ctx.coop.statusV2(master)).self?.masterId)
     await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't', spec: 'do' })
-    await ctx.coop.activatePlanV2(master, plan.planId)
+    await activate(ctx, master, reviewer, plan.planId)
     await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
     await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done')
     await expect(ctx.coop.verifyTaskV2(master, plan.planId, 't1', 'pass')).rejects.toMatchObject({ code: 'COOP_NOT_ASSIGNED_WORKER' })
@@ -225,7 +245,8 @@ describe('verification gate', () => {
     await ctx2.coop.registerV2(w2, { roles: ['worker'], masterId: m2id })
     const plan2 = await ctx2.coop.createPlanV2(m2, { title: 'P', objective: 'O' })
     await ctx2.coop.addTaskV2(m2, plan2.planId, { title: 't', spec: 'do' })
-    await ctx2.coop.activatePlanV2(m2, plan2.planId)
+    await ctx2.coop.submitReviewV2(m2, plan2.planId)
+    await ctx2.coop.reviewPlanV2(m2, plan2.planId, 'pass')
     await ctx2.coop.executeBeginV2(w2, plan2.planId, 't1')
     await ctx2.coop.executeReportV2(w2, plan2.planId, 't1', 'done')
     const verified = await ctx2.coop.verifyTaskV2(m2, plan2.planId, 't1', 'pass', 'self ok')
@@ -233,7 +254,7 @@ describe('verification gate', () => {
   })
 
   it('rejects a reviewer bound to another master', async () => {
-    const { ctx, master, second, worker, reviewer } = await harness()
+    const { ctx, cwd, master, second, worker, reviewer } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
     await ctx.coop.registerV2(second, { roles: ['master'] })
     const m = String((await ctx.coop.statusV2(master)).self?.masterId)
@@ -241,7 +262,8 @@ describe('verification gate', () => {
     await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: String((await ctx.coop.statusV2(second)).self?.masterId) })
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't', spec: 'do' })
-    await ctx.coop.activatePlanV2(master, plan.planId)
+    const ownReviewer = await ctx.agentLoop.create(SessionId('reviewer2'), { provider: 'mock', model: 'mock' }, { cwd })
+    await activate(ctx, master, ownReviewer, plan.planId)
     await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
     await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done')
     // Isolation by visibility: the cross-master reviewer cannot even resolve the plan.
@@ -249,13 +271,13 @@ describe('verification gate', () => {
   })
 
   it('abort cancels open tasks and signals in-flight assignees', async () => {
-    const { ctx, master, worker } = await harness()
+    const { ctx, master, worker, reviewer } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
     const m = String((await ctx.coop.statusV2(master)).self?.masterId)
     await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't', spec: 'do' })
-    await ctx.coop.activatePlanV2(master, plan.planId)
+    await activate(ctx, master, reviewer, plan.planId)
     await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
     const aborted = await ctx.coop.abortPlanV2(master, plan.planId)
     expect(aborted.status).toBe('aborted')
@@ -264,17 +286,126 @@ describe('verification gate', () => {
   })
 
   it('only the assignee may begin or report a task', async () => {
-    const { ctx, master, worker, extra } = await harness()
+    const { ctx, master, worker, extra, reviewer } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
     const m = String((await ctx.coop.statusV2(master)).self?.masterId)
     await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
     await ctx.coop.registerV2(extra, { roles: ['worker'], masterId: m })
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't', spec: 'do' })
-    await ctx.coop.activatePlanV2(master, plan.planId)
+    await activate(ctx, master, reviewer, plan.planId)
     const board = await ctx.coop.boardV2(master, plan.planId)
     const assignee = board[0]?.tasks[0]?.assignee
     const outsider = assignee === 'worker' ? extra : worker
     await expect(ctx.coop.executeBeginV2(outsider, plan.planId, 't1')).rejects.toMatchObject({ code: 'COOP_NOT_ASSIGNED_WORKER' })
+  })
+})
+
+describe('plan review gate', () => {
+  it('submit moves designing → reviewing and wakes bound reviewers', async () => {
+    const { ctx, master, worker, reviewer } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    const submitted = await ctx.coop.submitReviewV2(master, plan.planId)
+    expect(submitted.status).toBe('reviewing')
+    expect(coopNotices(reviewer).some(text => text.includes('plan ready for review'))).toBe(true)
+  })
+
+  it('request_changes returns the plan to designing; pass activates and schedules', async () => {
+    const { ctx, master, worker, reviewer } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do' })
+    await ctx.coop.submitReviewV2(master, plan.planId)
+    const returned = await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'request_changes', 'split t1')
+    expect(returned.status).toBe('designing')
+    expect(coopNotices(master).some(text => text.includes('plan review requested changes'))).toBe(true)
+    await ctx.coop.submitReviewV2(master, plan.planId)
+    const active = await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass')
+    expect(active.status).toBe('active')
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.status).toBe('assigned')
+  })
+
+  it('gates non-reviewers and honors allowSelfReview for plan review', async () => {
+    const { ctx, master } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.submitReviewV2(master, plan.planId)
+    await expect(ctx.coop.reviewPlanV2(master, plan.planId, 'pass')).rejects.toMatchObject({ code: 'COOP_NOT_ASSIGNED_WORKER' })
+
+    const { ctx: ctx2, master: m2 } = await harness({ allowSelfReview: true })
+    await ctx2.coop.registerV2(m2, { roles: ['master'] })
+    const plan2 = await ctx2.coop.createPlanV2(m2, { title: 'P', objective: 'O' })
+    await ctx2.coop.submitReviewV2(m2, plan2.planId)
+    const active = await ctx2.coop.reviewPlanV2(m2, plan2.planId, 'pass')
+    expect(active.status).toBe('active')
+  })
+})
+
+describe('watchdog and escalation', () => {
+  it('returns a silent executing task to rework and lets the worker re-begin', async () => {
+    const { ctx, cwd, master, worker, reviewer } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do' })
+    await activate(ctx, master, reviewer, plan.planId)
+    await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    await editPlanFile(cwd, m, plan.planId, current => ({
+      ...current,
+      tasks: current.tasks.map(task => task.taskId === 't1' && task.execution !== undefined
+        ? { ...task, execution: { ...task.execution, heartbeatAt: Date.now() - 601_000 } }
+        : task),
+    }))
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.status).toBe('rework')
+    const again = await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    expect(again.status).toBe('executing')
+  })
+
+  it('blocks a task past its hard deadline', async () => {
+    const { ctx, cwd, master, worker, reviewer } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do', deadlines: { hardMs: 60_000 } })
+    await activate(ctx, master, reviewer, plan.planId)
+    await editPlanFile(cwd, m, plan.planId, current => ({
+      ...current,
+      tasks: current.tasks.map(task => task.taskId === 't1' && task.assignedAt !== undefined
+        ? { ...task, assignedAt: Date.now() - 61_000 }
+        : task),
+    }))
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.status).toBe('blocked')
+  })
+
+  it('blocks on rework budget exhaustion and signals the master', async () => {
+    const { ctx, master, worker, reviewer } = await harness({ maxReworkAttempts: 1 })
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do' })
+    await activate(ctx, master, reviewer, plan.planId)
+    await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'first try')
+    const blocked = await ctx.coop.verifyTaskV2(reviewer, plan.planId, 't1', 'request_changes', 'tighter')
+    expect(blocked.status).toBe('blocked')
+    expect(blocked.attempts).toBe(1)
+    expect(coopNotices(master).some(text => text.includes('blocked — rework budget exhausted'))).toBe(true)
+    expect(coopNotices(worker).some(text => text.includes('rework budget exhausted'))).toBe(true)
   })
 })

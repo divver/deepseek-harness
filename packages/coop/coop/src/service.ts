@@ -90,6 +90,8 @@ export interface Config {
   maxParallelTasks?: number
   /** v2 whether the master may verify its own tasks when no reviewer is bound (§12.4; default off). */
   allowSelfReview?: boolean
+  /** v2 rework rounds before a task escalates to blocked (§5.2). */
+  maxReworkAttempts?: number
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -108,6 +110,7 @@ export const Config: z<Config> = z.object({
   maxReviewers: z.number(),
   maxParallelTasks: z.number(),
   allowSelfReview: z.boolean(),
+  maxReworkAttempts: z.number(),
   inboxPollMs: z.number(),
   mirrorEvents: z.boolean(),
 }) as unknown as z<Config>
@@ -1425,7 +1428,7 @@ export class CoopService extends Service {
       const path = store.v2PlanPath(root, masterId, planId)
       const taken = await store.mutateV2Plan(path, (current): { next?: CoopV2PlanFile; value: CoopV2Task[] } => {
         if (current === undefined || current.status !== 'active') return { value: [] }
-        let plan = recomputeReady(current, Date.now())
+        let plan = watchTasks(recomputeReady(current, Date.now()), Date.now(), this.resolved.executingStaleMs)
         const picked: CoopV2Task[] = []
         for (const task of plan.tasks) {
           if (task.status !== 'ready') continue
@@ -1449,6 +1452,7 @@ export class CoopService extends Service {
             status: 'assigned',
             assignee: match.sessionId,
             updatedAt: Date.now(),
+            ...(task.assignedAt === undefined ? { assignedAt: Date.now() } : {}),
             ...(worktreeId === undefined ? {} : { worktreeId }),
           }
           plan = {
@@ -1464,8 +1468,11 @@ export class CoopService extends Service {
         if (task.assignee === undefined) continue
         busy.add(task.assignee)
         assigned++
+        const workOrder = task.executor === 'subagent'
+          ? 'delegate the work to a subagent with the task spec as its objective, then coop_execute_report'
+          : 'do the work per the spec, then coop_execute_report'
         await this.deliverTask(root, masterId, task.assignee, planId, masterId, task,
-          `task assigned — call coop_execute_begin(planId="${planId}", taskId="${task.taskId}"), do the work per the spec${task.worktreeId === undefined ? '' : ` in worktree ${task.worktreeId}`}, then coop_execute_report`)
+          `task assigned — call coop_execute_begin(planId="${planId}", taskId="${task.taskId}"), ${workOrder}${task.worktreeId === undefined ? '' : ` in worktree ${task.worktreeId}`}`)
       }
     }
     return assigned
@@ -1550,28 +1557,104 @@ export class CoopService extends Service {
   }
 
   /**
-       * designing → active: recompute readiness from the DAG and schedule.
-       * @param agent - activating live master.
-       * @param planId - plan to activate.
-       * @returns the committed active plan.
+       * Submit a designing plan to review (master only): designing → reviewing
+       * and every fresh bound reviewer is woken (§6.3).
+       * @param agent - submitting live master.
+       * @param planId - plan to submit.
+       * @returns the committed reviewing plan.
        */
-  async activatePlanV2(agent: Agent, planId: string): Promise<CoopV2PlanFile> {
+  async submitReviewV2(agent: Agent, planId: string): Promise<CoopV2PlanFile> {
     const { masterId, root } = await this.requireV2Master(agent)
     const sessionId = String(agent.session.id)
     const now = Date.now()
+    const masterIdStr = String(masterId)
     const plan = await store.mutateV2Plan(
-      store.v2PlanPath(root, String(masterId), planId),
+      store.v2PlanPath(root, masterIdStr, planId),
       (current): { next?: CoopV2PlanFile; value: CoopV2PlanFile } => {
         if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
         if (current.status !== 'designing') {
           throw new CoopError(`plan "${planId}" is "${current.status}", expected designing`, 'COOP_INVALID_TRANSITION')
         }
-        const next = recomputeReady({ ...current, status: 'active' }, now)
-        return { next: { ...next, history: [...current.history, { time: now, sessionId, op: 'activate' }] }, value: next }
+        const next: CoopV2PlanFile = {
+          ...current,
+          status: 'reviewing',
+          history: [...current.history, { time: now, sessionId, op: 'submit_review' }],
+        }
+        return { next, value: next }
       })
-    await this.scheduleV2(root, String(masterId))
+    const reviewers = (await this.v2Tables(root)).filter(entry => entry.bindState === 'bound'
+          && String(entry.masterId) === masterIdStr
+          && entry.roles.includes('reviewer')
+          && this.isFreshV2(entry, Date.now()))
+    for (const reviewer of reviewers) {
+      await this.deliverPlan(root, sessionId, reviewer.sessionId, planId, masterIdStr, plan,
+        `plan ready for review — call coop_plan_review(planId="${planId}", decision) after judging the DAG against the objective`)
+    }
     return plan
   }
+
+  /**
+       * Reviewer gate on a submitted plan (§6.3): pass → active (readiness
+       * recomputed, scheduler runs); request_changes → designing for the master
+       * to revise and resubmit. Gate: a reviewer bound to the owning master, or
+       * the master with `allowSelfReview` (§12.4).
+       * @param agent - reviewing live reviewer (or self-reviewing master).
+       * @param planId - plan under review.
+       * @param decision - pass or request_changes.
+       * @param summary - one-line rationale.
+       * @returns the committed plan.
+       */
+  async reviewPlanV2(
+    agent: Agent,
+    planId: string,
+    decision: 'pass' | 'request_changes',
+    summary?: string,
+  ): Promise<CoopV2PlanFile> {
+    const sessionId = String(agent.session.id)
+    const root = await this.v2RootOf(agent)
+    const now = Date.now()
+    const own = (await this.v2Tables(root)).find(entry => entry.sessionId === sessionId)
+    if (own === undefined || !this.isFreshV2(own, now)) {
+      throw new CoopError('this session holds no live v2 coop role — register first', 'COOP_NODE_NOT_FOUND')
+    }
+    const masterId = own.masterId
+    if (masterId === undefined) {
+      throw new CoopError('this node is not bound to a master', 'COOP_NODE_NOT_FOUND')
+    }
+    const isReviewer = own.roles.includes('reviewer')
+    const isMaster = own.roles.includes('master')
+    if (!isReviewer && !(isMaster && this.resolved.allowSelfReview)) {
+      throw new CoopError('plan review requires a reviewer bound to this master (or allowSelfReview)', 'COOP_NOT_ASSIGNED_WORKER')
+    }
+    const masterIdStr = String(masterId)
+    const plan = await store.mutateV2Plan(
+      store.v2PlanPath(root, masterIdStr, planId),
+      (current): { next?: CoopV2PlanFile; value: CoopV2PlanFile } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        if (current.status !== 'reviewing') {
+          throw new CoopError(`plan "${planId}" is "${current.status}", expected reviewing`, 'COOP_INVALID_TRANSITION')
+        }
+        const at = Date.now()
+        const status = decision === 'pass' ? 'active' : 'designing'
+        const staged: CoopV2PlanFile = {
+          ...current,
+          status,
+          history: [...current.history, { time: at, sessionId, op: `plan_review ${decision}`, ...(summary === undefined ? {} : { summary }) }],
+        }
+        const next = decision === 'pass' ? recomputeReady(staged, at) : staged
+        return { next, value: next }
+      })
+    const masterEntry = (await this.v2Tables(root)).find(entry => entry.roles.includes('master') && String(entry.masterId) === masterIdStr)
+    if (masterEntry !== undefined) {
+      await this.deliverPlan(root, sessionId, masterEntry.sessionId, planId, masterIdStr, plan,
+        decision === 'pass'
+          ? 'plan review passed — plan is active; ready tasks are being scheduled'
+          : `plan review requested changes${summary === undefined ? '' : `: ${summary}`} — revise the DAG, then coop_plan_submit_review again`)
+    }
+    if (decision === 'pass') await this.scheduleV2(root, masterIdStr)
+    return plan
+  }
+
 
   /**
        * Add one task to a non-terminal plan; `dependsOn` becomes DAG edges and a
@@ -1584,7 +1667,15 @@ export class CoopService extends Service {
   async addTaskV2(
     agent: Agent,
     planId: string,
-    req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[]; worktreeId?: string },
+    req: {
+      title: string
+      spec: string
+      dependsOn?: string[]
+      executor?: 'inline' | 'subagent'
+      skills?: string[]
+      worktreeId?: string
+      deadlines?: { softMs?: number; hardMs?: number }
+    },
   ): Promise<CoopV2Task> {
     const { masterId, root } = await this.requireV2Master(agent)
     const sessionId = String(agent.session.id)
@@ -1617,6 +1708,7 @@ export class CoopService extends Service {
           executor: req.executor ?? 'inline',
           skills: req.skills ?? [],
           ...(req.worktreeId === undefined ? {} : { worktreeId: req.worktreeId }),
+          ...(req.deadlines === undefined ? {} : { deadlines: req.deadlines }),
           attempts: 0,
           createdAt: now,
           updatedAt: now,
@@ -1788,7 +1880,7 @@ export class CoopService extends Service {
             if (planId !== undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
             return { value: undefined }
           }
-          const next = recomputeReady(current, Date.now())
+          const next = watchTasks(recomputeReady(current, Date.now()), Date.now(), this.resolved.executingStaleMs)
           return next === current ? { value: current } : { next, value: next }
         })
       if (plan !== undefined) plans.push(plan)
@@ -1820,7 +1912,12 @@ export class CoopService extends Service {
           throw new CoopError(`task "${taskId}" is "${task.status}", expected assigned/rework`, 'COOP_INVALID_TRANSITION')
         }
         const now = Date.now()
-        const next: CoopV2Task = { ...task, status: 'executing', updatedAt: now }
+        const next: CoopV2Task = {
+          ...task,
+          status: 'executing',
+          updatedAt: now,
+          execution: { startedAt: now, heartbeatAt: now },
+        }
         const planNext: CoopV2PlanFile = {
           ...current,
           tasks: current.tasks.map(candidate => candidate.taskId === taskId ? next : candidate),
@@ -1931,11 +2028,13 @@ export class CoopService extends Service {
           throw new CoopError(`task "${taskId}" is "${task.status}", expected verifying`, 'COOP_INVALID_TRANSITION')
         }
         const at = Date.now()
+        const attempts = task.attempts + 1
+        const escalated = decision !== 'pass' && attempts >= this.resolved.maxReworkAttempts
         const next: CoopV2Task = {
           ...task,
-          status: decision === 'pass' ? 'done' : 'rework',
+          status: decision === 'pass' ? 'done' : (escalated ? 'blocked' : 'rework'),
           updatedAt: at,
-          ...(decision === 'pass' ? {} : { attempts: task.attempts + 1 }),
+          ...(decision === 'pass' ? {} : { attempts }),
           verify: { decision, ...(summary === undefined ? {} : { summary }), by: sessionId, at },
         }
         const staged: CoopV2PlanFile = {
@@ -1948,8 +2047,17 @@ export class CoopService extends Service {
     if (verified.assignee !== undefined) {
       const text = decision === 'pass'
         ? 'verify passed — task done; you are free for the next assignment'
-        : `rework requested${summary === undefined ? '' : `: ${summary}`} — call coop_execute_begin again, address the feedback, then coop_execute_report`
+        : verified.status === 'blocked'
+          ? `rework budget exhausted (attempts ${String(verified.attempts)}) — task blocked; stop working on it, your master decides`
+          : `rework requested${summary === undefined ? '' : `: ${summary}`} — call coop_execute_begin again, address the feedback, then coop_execute_report`
       await this.deliverTask(root, sessionId, verified.assignee, planId, masterId, verified, text)
+    }
+    if (verified.status === 'blocked') {
+      const masterEntry = (await this.v2Tables(root)).find(entry => entry.roles.includes('master') && String(entry.masterId) === masterId)
+      if (masterEntry !== undefined) {
+        await this.deliverTask(root, sessionId, masterEntry.sessionId, planId, masterId, verified,
+          `task ${verified.taskId} blocked — rework budget exhausted; cancel, revise, or re-scope it`)
+      }
     }
     if (decision === 'pass') await this.scheduleV2(root, masterId)
     return verified
@@ -2223,6 +2331,66 @@ export class CoopService extends Service {
     return merged
   }
 
+  /**
+       * Assigned worker heartbeat while executing; feeds the executing
+       * watchdog (§5.2: silent `executingStaleMs` falls back to rework).
+       * @param agent - executing live worker.
+       * @param planId - owning plan.
+       * @param taskId - target task.
+       */
+  async touchExecutionV2(agent: Agent, planId: string, taskId: string): Promise<void> {
+    const sessionId = String(agent.session.id)
+    const { plan, root } = await this.planForNode(agent, planId)
+    await store.mutateV2Plan(
+      store.v2PlanPath(root, String(plan.masterId), planId),
+      (current): { next?: CoopV2PlanFile; value: undefined } => {
+        if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+        const task = current.tasks.find(candidate => candidate.taskId === taskId)
+        if (task === undefined) throw new CoopError(`task "${taskId}" not found in plan "${planId}"`, 'COOP_TASK_NOT_FOUND')
+        if (task.assignee !== sessionId) {
+          throw new CoopError(`task "${taskId}" is assigned to "${task.assignee ?? 'nobody'}"`, 'COOP_NOT_ASSIGNED_WORKER')
+        }
+        if (task.status !== 'executing' || task.execution === undefined) {
+          throw new CoopError(`task "${taskId}" is "${task.status}", expected executing`, 'COOP_INVALID_TRANSITION')
+        }
+        const next: CoopV2Task = { ...task, execution: { ...task.execution, heartbeatAt: Date.now() } }
+        return {
+          next: { ...current, tasks: current.tasks.map(candidate => candidate.taskId === taskId ? next : candidate) },
+          value: undefined,
+        }
+      })
+  }
+
+  /**
+       * Append one plan-level signal and drain the target when it is live in-process.
+       * @param root - absolute v2 root.
+       * @param fromId - acting node id.
+       * @param targetId - receiving session id.
+       * @param planId - owning plan id.
+       * @param masterId - owning master id (for the doc path).
+       * @param text - one-line notice text.
+       */
+  private async deliverPlan(
+    root: string,
+    fromId: string,
+    targetId: string,
+    planId: string,
+    masterId: string,
+    plan: CoopV2PlanFile,
+    text: string,
+  ): Promise<void> {
+    await store.appendSignal(store.inboxPath(root, targetId), {
+      time: Date.now(),
+      from: fromId,
+      planId,
+      kind: 'task',
+      summary: `${plan.title} — ${text}`,
+      docPath: store.v2DocPath(root, masterId, planId),
+    })
+    const target = this.ctx.agents.get(SessionId(targetId))
+    if (target !== undefined) await this.drainAgentInbox(target, root)
+  }
+
 }
 /**
  * Whether the edge set contains a cycle; returns the cycle path for the
@@ -2304,4 +2472,31 @@ function recomputeReady(plan: CoopV2PlanFile, now: number): CoopV2PlanFile {
 /** Quote one argv element for the shell-string seam; plain tokens stay bare. */
 function shellQuote(part: string): string {
   return /^[\w.\/@:%+=^,-]+$/u.test(part) ? part : `'${part.replaceAll("'", '\'\\\'\'')}'`
+}
+/**
+ * Apply lazy watchdog transitions to a plan's tasks (§5.2): an `executing`
+ * task whose heartbeat went silent falls back to `rework` (the same worker
+ * may re-begin); a non-terminal task past its hard deadline (measured from
+ * first assignment) escalates to `blocked` for the master to decide.
+ * Returns the same reference when nothing applies.
+ * @param plan - plan whose tasks need watching.
+ * @param now - epoch ms.
+ * @param executingStaleMs - silent-heartbeat window.
+ * @returns the plan with watched tasks settled.
+ */
+function watchTasks(plan: CoopV2PlanFile, now: number, executingStaleMs: number): CoopV2PlanFile {
+  const tasks = plan.tasks.map((task) => {
+    if (task.status === 'executing' && task.execution !== undefined && now - task.execution.heartbeatAt > executingStaleMs) {
+      const { execution: _dropped, ...rest } = task
+      return { ...rest, status: 'rework' as const, updatedAt: now }
+    }
+    const hardMs = task.deadlines?.hardMs
+    if (hardMs !== undefined && task.assignedAt !== undefined
+      && task.status !== 'done' && task.status !== 'cancelled' && task.status !== 'blocked'
+      && now - task.assignedAt > hardMs) {
+      return { ...task, status: 'blocked' as const, updatedAt: now }
+    }
+    return task
+  })
+  return { ...plan, tasks }
 }

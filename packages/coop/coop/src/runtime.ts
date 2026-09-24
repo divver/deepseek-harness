@@ -32,6 +32,8 @@ export interface ResolvedCoopConfig {
   maxParallelTasks: number
   /** v2 whether the master may verify its own tasks when no reviewer is bound (§12.4; default off). */
   allowSelfReview: boolean
+  /** v2 rework rounds before a task escalates to blocked (§5.2). */
+  maxReworkAttempts: number
 }
 
 /**
@@ -57,6 +59,7 @@ export function resolveCoopConfig(config: {
   maxReviewers?: number
   maxParallelTasks?: number
   allowSelfReview?: boolean
+  maxReworkAttempts?: number
 }): ResolvedCoopConfig {
   const positive = (value: number | undefined, name: string): number | undefined => {
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
@@ -84,6 +87,7 @@ export function resolveCoopConfig(config: {
     maxReviewers: positive(config.maxReviewers, 'maxReviewers') ?? 2,
     maxParallelTasks: positive(config.maxParallelTasks, 'maxParallelTasks') ?? 3,
     allowSelfReview: config.allowSelfReview ?? false,
+    maxReworkAttempts: positive(config.maxReworkAttempts, 'maxReworkAttempts') ?? 3,
   }
 }
 

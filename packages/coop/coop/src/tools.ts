@@ -596,8 +596,8 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
   }))
 
   ctx.tools.register(defineTool({
-    name: 'coop_plan_activate',
-    description: 'Activate a designing plan (master only): readiness is computed from the DAG and ready tasks are scheduled.',
+    name: 'coop_plan_submit_review',
+    description: 'Submit a designing plan to review (master only): the plan moves to reviewing and every bound reviewer of your master is woken to judge the DAG against the objective.',
     parameters: {
       planId: { type: 'string', required: true, description: 'Plan id from coop_plan_create.' },
     },
@@ -612,8 +612,62 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
     async execute(args, exec) {
       const agent = needAgent(exec)
       try {
-        const plan = await service.activatePlanV2(agent, args.planId)
+        const plan = await service.submitReviewV2(agent, args.planId)
         return { planId: plan.planId, status: plan.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_plan_review',
+    description: 'Review a submitted plan (reviewer bound to the plan\'s master; the master itself only with allowSelfReview). pass → active (ready tasks schedule); request_changes → back to designing for the master.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Plan under review.' },
+      decision: { type: 'string', required: true, enum: ['pass', 'request_changes'], description: 'Review verdict.' },
+      summary: { type: 'string', description: 'One-line rationale.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { planId: { type: 'string', required: true }, status: { type: 'string', required: true } },
+      },
+      render: (_args, value) => textOut(`plan ${value.planId} → ${value.status}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const plan = await service.reviewPlanV2(agent, args.planId, args.decision,
+          args.summary === undefined ? undefined : args.summary)
+        return { planId: plan.planId, status: plan.status }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_execute_touch',
+    description: 'Assigned worker heartbeat while executing; a silent heartbeat past the stale window returns the task to rework, so touch periodically during long work.',
+    parameters: {
+      planId: { type: 'string', required: true, description: 'Owning plan id.' },
+      taskId: { type: 'string', required: true, description: 'Target task id.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { touched: { type: 'boolean', required: true } },
+      },
+      render: (_args, value) => textOut(value.touched ? 'execution heartbeat recorded' : 'not touched'),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        await service.touchExecutionV2(agent, args.planId, args.taskId)
+        return { touched: true }
       } catch (error) {
         throw new Error(failMessage(error))
       }
@@ -628,8 +682,10 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       title: { type: 'string', required: true, description: 'Short task title.' },
       spec: { type: 'string', required: true, description: 'Full task brief handed to the assigned worker.' },
       dependsOn: { type: 'array', description: 'Upstream task ids that must be done first.', items: { type: 'string' } },
-      executor: { type: 'string', enum: ['inline', 'subagent'], description: 'Executor style; subagent arrives with P3.' },
+      executor: { type: 'string', enum: ['inline', 'subagent'], description: 'Executor style; subagent delegates the task spec to a spawned sub-agent.' },
       skills: { type: 'array', description: 'Skills an assigned worker must cover.', items: { type: 'string' } },
+      softDeadlineMs: { type: 'integer', description: 'Informational soft deadline in ms from first assignment.' },
+      hardDeadlineMs: { type: 'integer', description: 'Hard deadline in ms from first assignment; past due the task blocks.' },
     },
     output: {
       schema: {
@@ -648,6 +704,14 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
           ...(args.dependsOn === undefined ? {} : { dependsOn: args.dependsOn }),
           ...(args.executor === undefined ? {} : { executor: args.executor }),
           ...(args.skills === undefined ? {} : { skills: args.skills }),
+          ...(args.softDeadlineMs === undefined && args.hardDeadlineMs === undefined
+            ? {}
+            : {
+              deadlines: {
+                ...(args.softDeadlineMs === undefined ? {} : { softMs: args.softDeadlineMs }),
+                ...(args.hardDeadlineMs === undefined ? {} : { hardMs: args.hardDeadlineMs }),
+              },
+            }),
         })
         return { taskId: task.taskId, status: task.status }
       } catch (error) {

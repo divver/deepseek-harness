@@ -263,6 +263,12 @@ export interface CoopV2Task {
   skills: string[]
   /** Rework round count; verify request_changes increments. */
   attempts: number
+  /** Epoch ms of the first scheduler assignment; anchors the hard deadline. */
+  assignedAt?: number
+  /** Present while `executing`; `heartbeatAt` feeds the executing watchdog. */
+  execution?: { startedAt: number; heartbeatAt: number }
+  /** Deadline hints from assignment; `hardMs` past due blocks the task. */
+  deadlines?: { softMs?: number; hardMs?: number }
   createdAt: number
   updatedAt: number
   /** Latest verify conclusion, once one exists. */
