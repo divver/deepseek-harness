@@ -334,3 +334,16 @@ export interface CoopWtRegistryFile {
   version: 1
   entries: CoopWtEntry[]
 }
+/** One appended memory record of a master's durable summary trail. */
+export interface CoopMemoryEntry {
+  /** Epoch ms. */
+  time: number
+  /** What the record summarizes. */
+  kind: 'task' | 'plan'
+  /** `planId` for plans, `<taskId>@<planId>` for tasks. */
+  ref: string
+  title: string
+  summary: string
+  /** Carry-over conclusions (verify rationale, rework lessons). */
+  lessons?: string[]
+}

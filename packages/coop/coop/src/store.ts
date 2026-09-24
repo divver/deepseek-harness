@@ -11,7 +11,7 @@
 import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { writeFileAtomic, withFileLock } from '@deepseek-ai/dsh-atomic-write'
-import type { CoopInboxEntry, CoopPlanFile, CoopRegistryEntry, CoopRegistryFile, CoopV2MasterProfile, CoopV2PlanFile, CoopV2RegistryFile, CoopWtRegistryFile, CoopWorkspaceFile } from './types.ts'
+import type { CoopInboxEntry, CoopMemoryEntry, CoopPlanFile, CoopRegistryEntry, CoopRegistryFile, CoopV2MasterProfile, CoopV2PlanFile, CoopV2RegistryFile, CoopWtRegistryFile, CoopWorkspaceFile } from './types.ts'
 
 /** Whether one caught read failure is the plain absence of the file. */
 function isMissing(error: unknown): boolean {
@@ -668,6 +668,72 @@ export async function readWtRegistry(path: string): Promise<CoopWtRegistryFile |
 export async function writeWtRegistry(path: string, file: CoopWtRegistryFile): Promise<void> {
   await writeFileAtomic(path, `${JSON.stringify(file, null, 2)}\n`, { mode: FILE_MODE, dirMode: DIR_MODE })
 }
+
+// ---- v2 namespace: master memory trail ----
+
+/**
+ * The per-master memory trail path.
+ * @param root - absolute v2 root.
+ * @param masterId - owning master id.
+ * @returns the memory jsonl path.
+ */
+export function memoryPath(root: string, masterId: string): string {
+  return join(root, 'masters', masterId, 'memory.jsonl')
+}
+
+/**
+ * The per-master human-readable memory projection path.
+ * @param root - absolute v2 root.
+ * @param masterId - owning master id.
+ * @returns the memory markdown path.
+ */
+export function memoryDocPath(root: string, masterId: string): string {
+  return join(root, 'masters', masterId, 'memory.md')
+}
+
+/** Parse one memory jsonl body; blank trailing lines are ignored. */
+function parseMemory(raw: string): CoopMemoryEntry[] {
+  return raw.split('\n').flatMap(line => line.trim().length === 0 ? [] : [JSON.parse(line) as CoopMemoryEntry])
+}
+
+/**
+ * Read every memory record of one master.
+ * @param path - memory jsonl path.
+ * @returns the entries in file order (oldest first).
+ */
+export async function readMemory(path: string): Promise<CoopMemoryEntry[]> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
+    if (isMissing(error)) return []
+    throw error
+  }
+  return parseMemory(raw)
+}
+
+/**
+ * Append one memory record under the trail's writer lock, then compact to the
+ * retention budget by dropping the oldest records.
+ * @param path - memory jsonl path.
+ * @param entry - the record to append.
+ * @param retain - maximum record count kept.
+ */
+export async function appendMemory(path: string, entry: CoopMemoryEntry, retain: number): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: DIR_MODE })
+  await withFileLock(path, async () => {
+    let lines: CoopMemoryEntry[] = []
+    try {
+      lines = parseMemory(await readFile(path, 'utf8'))
+    } catch (error) {
+      if (!isMissing(error)) throw error
+    }
+    lines.push(entry)
+    if (lines.length > retain) lines = lines.slice(lines.length - retain)
+    await writeFileAtomic(path, lines.map(line => JSON.stringify(line)).join('\n') + '\n', { mode: FILE_MODE })
+  })
+}
+
 
 /**
  * Run one locked read-check-write cycle over the worktree occupancy table.

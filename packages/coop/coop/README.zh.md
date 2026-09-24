@@ -47,6 +47,8 @@ executing heartbeat timeout → needs_rework (worker may re-begin)
 | `maxReviewers` | `2` | v2 单 master 的 reviewer 容量上限（bind 与注册时校验） |
 | `maxParallelTasks` | `3` | v2 单 master 跨 plan 同时 assigned+executing 的任务上限 |
 | `maxReworkAttempts` | `3` | v2 返工轮数耗尽后任务升级为 blocked |
+| `memoryInjectTopK` | `8` | v2 注入 coop:memory 提示段的最新记忆条数（§12.3 时间倒序 top-K） |
+| `memoryRetainEntries` | `256` | v2 单 master 记忆保留预算；追加时丢弃最旧记录 |
 | `allowSelfReview` | `false` | v2 无 reviewer 时允许 master 自验自己的任务（§12.4） |
 
 ## v2 模式（已交付 P0）
@@ -59,7 +61,8 @@ executing heartbeat timeout → needs_rework (worker may re-begin)
 - **命令** —— `/coop master|worker|reviewer [--master <id>] [--model <route>] [--any-cwd]`、`/coop list [--unbound]`、`/coop bind|release <sessionId>`、`/coop status`、`/coop off`、`/coop workspace init [path]`。
 - **工具** —— `coop_register`、`coop_list`、`coop_bind`、`coop_release`、`coop_status`；v2 模式下不注册 v1 的十一个工具。
 - **Worktree（P2）** —— `coop_worktree_create` 把 plan 的 `repoRoot` 通过 shell seam（git 一律走 `ctx.shell`，禁止裸 `child_process`）分支到 `<workspace>/wt/<masterId>/<seq>-<slug>`；目录名在全局 `wt-registry.json` 锁内占位，master 之间绝不撞车。调度器给被分派任务分配空闲 worktree（独占），并在唤醒信令里指名。`coop_worktree_merge` 用 `git merge --no-ff` 合回（base 移动或冲突 → `COOP_WORKTREE_MERGE_CONFLICT` fail-loud，绝不自动解冲突，§6.4）；`coop_plan_close` 先自动合并全部活跃 worktree；`coop_worktree_clean` 移除（`force` 丢弃改动）。
-- **Reviewer 门控与升级（P3）** —— 激活现在经由评审：`coop_plan_submit_review`（designing → reviewing，唤醒被绑 reviewer）与 `coop_plan_review`（pass → active 并调度；request_changes → 回到 designing；与任务验证同构的 reviewer/allowSelfReview 门）。任务携带执行心跳（`coop_execute_touch`），静默超过 `executingStaleMs` 回落 rework；`hardDeadlineMs` 自首次分派计时，到期任务 blocked；`maxReworkAttempts` 耗尽的 `request_changes` 判定同样 blocked，并同时通知 worker 与 master。subagent 执行型任务会在分派信令中指示 worker 把任务 spec 委托给 sub-agent。memory 随 P4 交付。
+- **Reviewer 门控与升级（P3）** —— 激活现在经由评审：`coop_plan_submit_review`（designing → reviewing，唤醒被绑 reviewer）与 `coop_plan_review`（pass → active 并调度；request_changes → 回到 designing；与任务验证同构的 reviewer/allowSelfReview 门）。任务携带执行心跳（`coop_execute_touch`），静默超过 `executingStaleMs` 回落 rework；`hardDeadlineMs` 自首次分派计时，到期任务 blocked；`maxReworkAttempts` 耗尽的 `request_changes` 判定同样 blocked，并同时通知 worker 与 master。subagent 执行型任务会在分派信令中指示 worker 把任务 spec 委托给 sub-agent。
+- **Summarizer → memory（P4）** —— 每个通过验证的 task 与关闭的 plan 都会被确定性汇总进 master 的记忆轨 `v2/masters/<masterId>/memory.jsonl`（report 文本 + verify 结论作为 lessons），并镜像人读的 `memory.md`；追加按 `memoryRetainEntries` 压缩。`coop:memory` 提示段为该 master 的每个成员注入最新 `memoryInjectTopK` 条（仅时间倒序，§12.3）；针对性回忆用 `coop_memory_search`（关键词，按 master 隔离）。可选的 summarizer-model LLM 通道已延后 —— 确定性汇总对 report/verify 文本保持无损。
 - **Plan 即 task DAG（P1）** —— `coop_plan_create`（绑定单一 `repoRoot`，§12.1）→ `coop_task_add`/`coop_task_link`/`coop_task_cancel`（plan 锁内环检测）→ `coop_plan_activate`。就绪度由 DAG 推导；调度器把 ready 任务分派给空闲的被绑定 worker（skill 需求 ⊆ 声明技能，`maxParallelTasks`），并用 `task assigned` 信令唤醒。worker 执行 `coop_execute_begin` → `coop_execute_report`；被绑定的 reviewer 用 `coop_task_verify` 验收（`pass` → done 且下游转 ready；`request_changes` → 同一 worker 返工）。`coop_board` 是看板投影；`coop_plan_close` 要求全部任务 done/cancelled；`coop_plan_abort` 取消开放任务并通知执行中的 assignee。Worktree、plan 评审门控、subagent 执行器与 memory 随 P2–P4 交付。
 
 ## 人类命令

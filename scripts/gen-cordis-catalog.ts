@@ -825,6 +825,7 @@ export const TYPE_LINK_EXEMPTIONS: Readonly<Record<string, string>> = {
   CoopV2PlanFile: 'v2 plan DAG storage shape is owned by packages/coop/coop/src/types.ts',
   CoopV2Task: 'v2 plan task node shape is owned by packages/coop/coop/src/types.ts',
   CoopWtEntry: 'v2 worktree occupancy row shape is owned by packages/coop/coop/src/types.ts',
+  CoopMemoryEntry: 'v2 memory trail record shape is owned by packages/coop/coop/src/types.ts',
   CwdScope: 'directory-scope enum is owned by packages/coop/coop/src/types.ts',
   ReviewLevel: 'coop gating enum is owned by packages/coop/coop/src/types.ts',
   V2Role: 'coop v2 role enum is owned by packages/coop/coop/src/types.ts',

@@ -1092,4 +1092,35 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       }
     },
   }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_memory_search',
+    description: 'Keyword-search your master\'s memory trail (task/plan summaries and lessons); newest matches first. The coop:memory prompt section already carries the newest records — use this for targeted recall when starting a new plan or task (§12.3).',
+    parameters: {
+      query: { type: 'string', required: true, description: 'Case-insensitive substring matched against title, summary, and lessons.' },
+      limit: { type: 'integer', description: 'Maximum matches (default 10).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          count: { type: 'integer', required: true },
+          detail: { type: 'array', required: true, items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => textOut(value.count === 0 ? 'No matching memory.' : `${value.count} memory record(s):\n${value.detail.join('\n')}`),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      const entries = await service.searchMemoryV2(agent, {
+        query: args.query,
+        ...(args.limit === undefined ? {} : { limit: args.limit }),
+      })
+      return {
+        count: entries.length,
+        detail: entries.map(entry => `[${entry.kind}] ${entry.ref} ${entry.title} — ${entry.summary}${(entry.lessons ?? []).length === 0 ? '' : ` (lessons: ${(entry.lessons ?? []).join('; ')})`}`),
+      }
+    },
+  }))
 }

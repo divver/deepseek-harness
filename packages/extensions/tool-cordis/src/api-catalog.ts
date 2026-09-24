@@ -906,7 +906,7 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the committed plan.',
       },
       {
-        signature: 'async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: \'inline\' | \'subagent\'; skills?: string[]; worktreeId?: string deadlines?: { softMs?: number; hardMs?: number } }, ): Promise<CoopV2Task>',
+        signature: 'async addTaskV2( agent: Agent, planId: string, req: { title: string spec: string dependsOn?: string[] executor?: \'inline\' | \'subagent\' skills?: string[] worktreeId?: string deadlines?: { softMs?: number; hardMs?: number } }, ): Promise<CoopV2Task>',
         description: 'Add one task to a non-terminal plan; `dependsOn` becomes DAG edges and a cycle is rejected under the plan lock. Schedules afterwards.',
         parameters: [{ name: 'agent', description: 'adding live master.' }, { name: 'planId', description: 'target plan.' }, { name: 'req', description: 'title, spec, dependencies, executor style, and skill demands.' }],
         returns: 'the committed task.',
@@ -990,6 +990,18 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         signature: 'async touchExecutionV2(agent: Agent, planId: string, taskId: string): Promise<void>',
         description: 'Assigned worker heartbeat while executing; feeds the executing watchdog (§5.2: silent `executingStaleMs` falls back to rework).',
         parameters: [{ name: 'agent', description: 'executing live worker.' }, { name: 'planId', description: 'owning plan.' }, { name: 'taskId', description: 'target task.' }],
+      },
+      {
+        signature: 'async memoryLinesV2(agent: Agent): Promise<string[]>',
+        description: 'The newest memory lines of the calling node\'s master (§12.3: recency top-K, no relevance algorithm; targeted recall is coop_memory_search).',
+        parameters: [{ name: 'agent', description: 'querying live node.' }],
+        returns: 'the newest injected lines, newest first.',
+      },
+      {
+        signature: 'async searchMemoryV2(agent: Agent, req: { query: string; limit?: number }): Promise<CoopMemoryEntry[]>',
+        description: 'Keyword search over the calling node\'s master memory (isolation: other masters\' trails are invisible).',
+        parameters: [{ name: 'agent', description: 'querying live node.' }, { name: 'req', description: 'query text and optional limit.' }],
+        returns: 'matching entries, newest first.',
       },
     ],
   },
@@ -4919,6 +4931,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'CoopExecutionEventData',
     declaration: 'export interface CoopExecutionEventData {\n    planId: string;\n    phase: \'begin\' | \'report\';\n    summary?: string;\n}',
+  },
+  {
+    name: 'CoopMemoryEntry',
+    declaration: 'export interface CoopMemoryEntry {\n    time: number;\n    kind: \'task\' | \'plan\';\n    ref: string;\n    title: string;\n    summary: string;\n    lessons?: string[];\n}',
   },
   {
     name: 'CoopPlanFile',

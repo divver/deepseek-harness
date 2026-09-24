@@ -21,6 +21,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import type {
   CoopInboxEntry,
+  CoopMemoryEntry,
   CoopPlanFile,
   CoopRegistryEntry,
   CoopV2PlanFile,
@@ -92,6 +93,10 @@ export interface Config {
   allowSelfReview?: boolean
   /** v2 rework rounds before a task escalates to blocked (§5.2). */
   maxReworkAttempts?: number
+  /** v2 memory records injected into the coop:memory prompt section (§12.3). */
+  memoryInjectTopK?: number
+  /** v2 memory trail retention budget per master; appends drop the oldest beyond it. */
+  memoryRetainEntries?: number
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -111,6 +116,8 @@ export const Config: z<Config> = z.object({
   maxParallelTasks: z.number(),
   allowSelfReview: z.boolean(),
   maxReworkAttempts: z.number(),
+  memoryInjectTopK: z.number(),
+  memoryRetainEntries: z.number(),
   inboxPollMs: z.number(),
   mirrorEvents: z.boolean(),
 }) as unknown as z<Config>
@@ -174,6 +181,18 @@ export class CoopService extends Service {
         order: COOP_POLICY_ORDER,
         text: this.resolved.mode === 'v2' ? COOP_V2_POLICY_TEXT : COOP_POLICY_TEXT,
       })
+      if (this.resolved.mode === 'v2') {
+        promptCtx.systemPrompt.section({
+          name: 'coop:memory',
+          order: 41,
+          text: '{{coopMemory}}',
+        })
+        promptCtx.systemPrompt.variable('coopMemory', (context) => {
+          if (context.agent === undefined) return undefined
+          const block = this.memoryCache.get(String(context.agent.session.id))
+          return block === undefined || block.length === 0 ? undefined : block
+        })
+      }
     })
     ctx.inject(['tools'], (toolCtx) => {
       if (this.resolved.mode === 'v2') registerCoopV2Tools(toolCtx, this)
@@ -945,6 +964,9 @@ export class CoopService extends Service {
     return this.resolved.mode
   }
 
+  /** Per-session coop:memory prompt blocks; refreshed on ticks, writes, and drains. */
+  private readonly memoryCache = new Map<string, string>()
+
   /**
        * The v2 coop root for one agent: nearest explicit workspace anchor above
        * the session cwd, else the cwd itself (single-project fallback).
@@ -998,8 +1020,12 @@ export class CoopService extends Service {
        * @param agent - owning live agent.
        */
   private async touchActive(agent: Agent): Promise<void> {
-    if (this.resolved.mode === 'v2') await this.touchOwnEntryV2(agent)
-    else await this.touchOwnEntry(agent)
+    if (this.resolved.mode === 'v2') {
+      await this.touchOwnEntryV2(agent)
+      await this.refreshMemoryCache(agent)
+    } else {
+      await this.touchOwnEntry(agent)
+    }
   }
 
   /**
@@ -2059,7 +2085,17 @@ export class CoopService extends Service {
           `task ${verified.taskId} blocked — rework budget exhausted; cancel, revise, or re-scope it`)
       }
     }
-    if (decision === 'pass') await this.scheduleV2(root, masterId)
+    if (decision === 'pass') {
+      await this.recordMemory(root, masterId, {
+        time: Date.now(),
+        kind: 'task',
+        ref: `${verified.taskId}@${planId}`,
+        title: verified.title,
+        summary: verified.report?.summary ?? 'completed',
+        ...(verified.verify?.summary === undefined ? {} : { lessons: [verified.verify.summary] }),
+      })
+      await this.scheduleV2(root, masterId)
+    }
     return verified
   }
 
@@ -2096,6 +2132,13 @@ export class CoopService extends Service {
         const next: CoopV2PlanFile = { ...current, status: 'closed', history: [...current.history, { time: now, sessionId, op: 'close' }] }
         return { next, value: next }
       })
+    await this.recordMemory(root, String(masterId), {
+      time: Date.now(),
+      kind: 'plan',
+      ref: planId,
+      title: closed.title,
+      summary: `${closed.tasks.filter(task => task.status === 'done').length} done, ${closed.tasks.filter(task => task.status === 'cancelled').length} cancelled — ${closed.objective}`,
+    })
     await store.appendDocSection(store.v2DocPath(root, String(masterId), planId), `- ${new Date().toISOString()} closed by ${sessionId}\n`)
     return closed
   }
@@ -2389,6 +2432,79 @@ export class CoopService extends Service {
     })
     const target = this.ctx.agents.get(SessionId(targetId))
     if (target !== undefined) await this.drainAgentInbox(target, root)
+  }
+
+  /**
+       * Deterministically summarize one finished task or closed plan into the
+       * master's memory trail (P4; the optional summarizer-model pass is deferred —
+       * the composition stays lossless over report/verify text). Appends the jsonl
+       * record, mirrors a markdown section, compacts to the retention budget, and
+       * refreshes the prompt cache for live in-process members.
+       * @param root - absolute v2 root.
+       * @param masterId - owning master id.
+       * @param entry - the record to append.
+       */
+  private async recordMemory(root: string, masterId: string, entry: CoopMemoryEntry): Promise<void> {
+    await store.appendMemory(store.memoryPath(root, masterId), entry, this.resolved.memoryRetainEntries)
+    await store.appendDocSection(store.memoryDocPath(root, masterId), [
+      `- ${new Date(entry.time).toISOString()} [${entry.kind}] ${entry.ref} ${entry.title}: ${entry.summary}`,
+      '',
+    ].join('\n'))
+    for (const member of this.ctx.agents.list()) {
+      await this.refreshMemoryCache(member)
+    }
+  }
+
+  /**
+       * The newest memory lines of the calling node's master (§12.3: recency
+       * top-K, no relevance algorithm; targeted recall is coop_memory_search).
+       * @param agent - querying live node.
+       * @returns the newest injected lines, newest first.
+       */
+  async memoryLinesV2(agent: Agent): Promise<string[]> {
+    const root = await this.v2RootOf(agent)
+    const own = (await this.v2Tables(root)).find(entry => entry.sessionId === String(agent.session.id))
+    const masterId = own?.masterId
+    if (own === undefined || masterId === undefined) return []
+    const entries = await store.readMemory(store.memoryPath(root, String(masterId)))
+    return entries.slice(-this.resolved.memoryInjectTopK).reverse()
+      .map(entry => `[${entry.kind}] ${entry.ref} ${entry.title} — ${entry.summary}`)
+  }
+
+  /**
+       * Keyword search over the calling node's master memory (isolation: other
+       * masters' trails are invisible).
+       * @param agent - querying live node.
+       * @param req - query text and optional limit.
+       * @returns matching entries, newest first.
+       */
+  async searchMemoryV2(agent: Agent, req: { query: string; limit?: number }): Promise<CoopMemoryEntry[]> {
+    const root = await this.v2RootOf(agent)
+    const own = (await this.v2Tables(root)).find(entry => entry.sessionId === String(agent.session.id))
+    const masterId = own?.masterId
+    if (own === undefined || masterId === undefined) {
+      throw new CoopError('this session holds no live v2 coop role — register first', 'COOP_NODE_NOT_FOUND')
+    }
+    const needle = req.query.toLowerCase()
+    const limit = req.limit ?? 10
+    const entries = (await store.readMemory(store.memoryPath(root, String(masterId)))).reverse()
+    return entries.filter(entry => entry.title.toLowerCase().includes(needle)
+          || entry.summary.toLowerCase().includes(needle)
+          || (entry.lessons ?? []).some(lesson => lesson.toLowerCase().includes(needle))).slice(0, limit)
+  }
+
+  /**
+       * Rebuild one agent's coop:memory prompt block from its master's trail.
+       * @param agent - live member whose cache to refresh.
+       */
+  private async refreshMemoryCache(agent: Agent): Promise<void> {
+    const sessionId = String(agent.session.id)
+    try {
+      const lines = await this.memoryLinesV2(agent)
+      this.memoryCache.set(sessionId, lines.length === 0 ? '' : ['## Coop memory (most recent first)', ...lines].join('\n'))
+    } catch {
+      this.memoryCache.delete(sessionId)
+    }
   }
 
 }

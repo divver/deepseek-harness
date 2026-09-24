@@ -290,7 +290,7 @@ async reviewPlanV2( agent: Agent, planId: string, decision: 'pass' | 'request_ch
      * @param req - title, spec, dependencies, executor style, and skill demands.
      * @returns the committed task.
      */
-async addTaskV2( agent: Agent, planId: string, req: { title: string; spec: string; dependsOn?: string[]; executor?: 'inline' | 'subagent'; skills?: string[]; worktreeId?: string deadlines?: { softMs?: number; hardMs?: number } }, ): Promise<CoopV2Task>
+async addTaskV2( agent: Agent, planId: string, req: { title: string spec: string dependsOn?: string[] executor?: 'inline' | 'subagent' skills?: string[] worktreeId?: string deadlines?: { softMs?: number; hardMs?: number } }, ): Promise<CoopV2Task>
 
 /**
      * Update a task's brief while it is not in flight (executing/reporting/
@@ -431,6 +431,23 @@ async cleanWorktreeV2(agent: Agent, dir: string, opts: { force?: boolean } = {})
      * @param taskId - target task.
      */
 async touchExecutionV2(agent: Agent, planId: string, taskId: string): Promise<void>
+
+/**
+     * The newest memory lines of the calling node's master (§12.3: recency
+     * top-K, no relevance algorithm; targeted recall is coop_memory_search).
+     * @param agent - querying live node.
+     * @returns the newest injected lines, newest first.
+     */
+async memoryLinesV2(agent: Agent): Promise<string[]>
+
+/**
+     * Keyword search over the calling node's master memory (isolation: other
+     * masters' trails are invisible).
+     * @param agent - querying live node.
+     * @param req - query text and optional limit.
+     * @returns matching entries, newest first.
+     */
+async searchMemoryV2(agent: Agent, req: { query: string; limit?: number }): Promise<CoopMemoryEntry[]>
 ```
 
 Types: [Agent](core.zh.md)

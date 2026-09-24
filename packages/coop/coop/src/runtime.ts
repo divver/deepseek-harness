@@ -34,6 +34,10 @@ export interface ResolvedCoopConfig {
   allowSelfReview: boolean
   /** v2 rework rounds before a task escalates to blocked (§5.2). */
   maxReworkAttempts: number
+  /** v2 memory records injected into the coop:memory prompt section (§12.3 recency top-K). */
+  memoryInjectTopK: number
+  /** v2 memory trail retention budget per master; appends drop the oldest beyond it. */
+  memoryRetainEntries: number
 }
 
 /**
@@ -60,6 +64,8 @@ export function resolveCoopConfig(config: {
   maxParallelTasks?: number
   allowSelfReview?: boolean
   maxReworkAttempts?: number
+  memoryInjectTopK?: number
+  memoryRetainEntries?: number
 }): ResolvedCoopConfig {
   const positive = (value: number | undefined, name: string): number | undefined => {
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
@@ -88,6 +94,8 @@ export function resolveCoopConfig(config: {
     maxParallelTasks: positive(config.maxParallelTasks, 'maxParallelTasks') ?? 3,
     allowSelfReview: config.allowSelfReview ?? false,
     maxReworkAttempts: positive(config.maxReworkAttempts, 'maxReworkAttempts') ?? 3,
+    memoryInjectTopK: positive(config.memoryInjectTopK, 'memoryInjectTopK') ?? 8,
+    memoryRetainEntries: positive(config.memoryRetainEntries, 'memoryRetainEntries') ?? 256,
   }
 }
 
