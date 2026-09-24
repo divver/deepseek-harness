@@ -1,0 +1,15 @@
+id = "coop.board"
+name = "Coop Board"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Read-only coop v2 kanban board over a dsh coop workspace"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[panes]]
+id = "board"
+title = "Coop board"
+placement = "overlay"
+command = ["target/release/coop-board"]
