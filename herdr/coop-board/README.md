@@ -12,14 +12,44 @@ herdr plugin link .
 herdr plugin pane open --plugin coop.board --entrypoint board
 ```
 
-Bind a key (for example prefix+b) in the herdr config:
+## Shortcuts
+
+### Opening the board (herdr layer)
+
+| Method | Notes |
+|---|---|
+| `prefix+m` | shortcut (config below): press `ctrl+b`, release, then `m` |
+| `herdr plugin action invoke coop.board.open` | CLI plugin action |
+| `herdr plugin pane open --plugin coop.board --entrypoint board` | native command |
+
+Shortcuts must live in herdr's **user config** `~/.config/herdr/config.toml` (`[[keys.command]]` declared in a plugin manifest does NOT register in current herdr):
 
 ```toml
 [[keys.command]]
-key = "prefix+b"
-type = "plugin_action"
-command = "coop.board.board"
+key = "prefix+m"
+type = "pane"
+command = "/abs/path/to/herdr/coop-board/target/release/coop-board"
+description = "open the coop board"
 ```
+
+Notes:
+
+- `type = "pane"` opens a temporary zoomed pane running the board; `q` closes it. The pane inherits the focused pane's cwd, so the board follows the workspace you pressed the key in.
+- Pick a key the default keymap does not use; taken prefix keys are `? b c e g h j k l minus n o p q r s tab v w x z` plus `shift+d/g/n/p/r/t/tab/w/x` and `1..9` (verify with `herdr --default-config`; `prefix+?` lists the live bindings).
+- Run `herdr server reload-config` after editing to apply immediately.
+
+### Inside the board
+
+| Key | Action |
+|---|---|
+| `q` / `Esc` | quit the board |
+| `Tab` / `l` | next master (v2 only) |
+| `BackTab` / `h` | previous master (v2 only) |
+| `j` / `↓` · `k` / `↑` | select plan in the sidebar (crosses master boundaries) |
+| `g` / `G` | first / last plan row |
+| `a` | toggle the kanban between the selected plan and every plan of the master merged |
+| `d` | toggle the right panel between the status kanban and the topological DAG view (v2 only; projects the selected plan) |
+| `v` | toggle v1/v2 layout (when both exist) |
 
 ## Workspace discovery and the empty board
 
@@ -31,20 +61,7 @@ To point the board at real data:
 2. Register at least one master there (`/coop master`); plans and tasks then render as they exist in `.dsh/coop/v2/`. A v1-only root needs no anchor — the board detects `.dsh/coop/registry.json` directly.
 3. Alternatively run the binary directly with an explicit workspace root — `target/release/coop-board /path/to/workspace` skips discovery entirely.
 
-Planned: the manifest pane command should take the workspace from the herdr plugin context (`HERDR_PLUGIN_CONTEXT_JSON`, the focused workspace cwd) or a `COOP_WORKSPACE` environment variable, so the board follows the herdr workspace instead of the plugin root.
-
-## Keys
-
-| Key | Action |
-|---|---|
-| `q` / `Esc` | quit |
-| `Tab` / `l` | next master (v2 only) |
-| `BackTab` / `h` | previous master (v2 only) |
-| `j` / `↓` · `k` / `↑` | select plan in the sidebar (crosses master boundaries) |
-| `g` / `G` | first / last plan row |
-| `a` | toggle the kanban between the selected plan and every plan of the master merged |
-| `d` | toggle the right panel between the status kanban and the topological DAG view (v2 only; projects the selected plan) |
-| `v` | toggle v1/v2 layout (when both exist) |
+The board resolves the workspace to project in this priority order (as of 0.2.2): the `COOP_WORKSPACE` environment variable > the herdr plugin context (`HERDR_PLUGIN_CONTEXT_JSON`'s `focused_pane_cwd`, then `workspace_cwd`) > discovery from the process cwd up to the nearest coop layout markers. Plugin panes always run with the plugin directory as their cwd, so opening from herdr takes the second path — the board follows the directory of the pane you opened it from; an explicit root (`target/release/coop-board /path/to/workspace`) still overrides everything.
 
 ## Dashboard layers (v2)
 

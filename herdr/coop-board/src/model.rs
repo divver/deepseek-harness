@@ -607,6 +607,26 @@ pub fn markers_of(root: &Path) -> (bool, bool) {
     layout_markers(root)
 }
 
+/// Extract the workspace a herdr plugin invocation points at. The context
+/// JSON is FLAT (verified against herdr 0.9.x): `focused_pane_cwd` names the
+/// pane the command ran from, `workspace_cwd` the workspace's own root; both
+/// are absolute paths or absent. Tolerant by design: any missing or
+/// differently-shaped field simply yields `None` and the caller falls back to
+/// cwd discovery.
+/// @param json - raw `HERDR_PLUGIN_CONTEXT_JSON` value (may be empty).
+/// @returns the root the board should project, if the context names one.
+pub fn context_workspace(json: &str) -> Option<PathBuf> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    ["focused_pane_cwd", "workspace_cwd"]
+        .iter()
+        .find_map(|key| {
+            value.get(*key).and_then(|v| v.as_str()).and_then(|s| {
+                let p = PathBuf::from(s);
+                p.is_absolute().then_some(p)
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +688,26 @@ mod tests {
         let waves = vec![vec![&settled_a], vec![&settled_b]];
         assert_eq!(current_wave(&waves), 2);
         assert_eq!(current_wave(&[]), 0);
+    }
+
+    #[test]
+    fn context_workspace_extraction() {
+        let live = r#"{"workspace_id":"w1","workspace_label":"xlshcn","workspace_cwd":"/Users/a/harness","tab_id":"w1:t7","focused_pane_id":"w1:p4","focused_pane_cwd":"/Users/a/xlshcn","invocation_source":"api"}"#;
+        assert_eq!(
+            context_workspace(live),
+            Some(PathBuf::from("/Users/a/xlshcn")),
+            "the focused pane wins over the workspace root"
+        );
+        let workspace_only = r#"{"workspace_cwd":"/Users/a/harness"}"#;
+        assert_eq!(
+            context_workspace(workspace_only),
+            Some(PathBuf::from("/Users/a/harness"))
+        );
+        assert_eq!(context_workspace(r#"{"tab_id":"w1:t7"}"#), None);
+        assert_eq!(context_workspace("not json"), None);
+        assert_eq!(context_workspace(""), None);
+        let relative = r#"{"focused_pane_cwd":"proj"}"#;
+        assert_eq!(context_workspace(relative), None, "only absolute roots count");
     }
 
     #[test]

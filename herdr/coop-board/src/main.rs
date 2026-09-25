@@ -45,15 +45,33 @@ fn run<B: ratatui::backend::Backend>(app: &mut App, terminal: &mut Terminal<B>) 
 }
 
 fn main() -> io::Result<()> {
-    let start = env::current_dir()?;
     let explicit = env::args().nth(1);
-    let (workspace, has_v1, mut has_v2) = match explicit {
-        Some(path) => {
-            let root = PathBuf::from(path);
-            let (v1, v2) = model::markers_of(&root);
+    let start = match explicit {
+        Some(path) => PathBuf::from(path),
+        // Plugin panes run with the plugin directory as cwd; the workspace the
+        // user is looking at comes from the herdr plugin context (or an
+        // explicit COOP_WORKSPACE override), then normal discovery walks up
+        // from there to the nearest coop layout markers.
+        None => env::var("COOP_WORKSPACE")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var("HERDR_PLUGIN_CONTEXT_JSON")
+                    .ok()
+                    .and_then(|json| model::context_workspace(&json))
+            })
+            .or_else(|| env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    let (workspace, has_v1, mut has_v2) = {
+        let root = start;
+        let (v1, v2) = model::markers_of(&root);
+        if v1 || v2 {
             (root, v1, v2)
+        } else {
+            model::discover(root)
         }
-        None => model::discover(start),
     };
     if !has_v1 && !has_v2 {
         has_v2 = true;

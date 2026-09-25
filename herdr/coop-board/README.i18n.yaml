@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write herdr/coop-board/README.md
-README.md: 5d16186ff7a6692f613e936c3e2d75f8351d86cc
-README.zh.md: 45229cecf054e3325e437549c484a0f9f2139eae
+README.md: e20281194ad5ae14075200ceeebda9e39fee3206
+README.zh.md: 77a8fadedb0e98992321718863e1c948d9fd74f6

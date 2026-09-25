@@ -1,6 +1,6 @@
 id = "coop.board"
 name = "Coop Board"
-version = "0.2.1"
+version = "0.2.3"
 min_herdr_version = "0.7.0"
 description = "Read-only layered coop dashboard over a dsh coop workspace"
 platforms = ["linux", "macos"]
@@ -13,3 +13,9 @@ id = "board"
 title = "Coop board"
 placement = "overlay"
 command = ["target/release/coop-board"]
+
+[[actions]]
+id = "open"
+title = "Open the coop board"
+contexts = ["workspace"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "coop.board", "--entrypoint", "board"]

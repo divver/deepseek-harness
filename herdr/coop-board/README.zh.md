@@ -12,14 +12,44 @@ herdr plugin link .
 herdr plugin pane open --plugin coop.board --entrypoint board
 ```
 
-在 herdr 配置里绑定按键（例如 prefix+b）：
+## 快捷键
+
+### 打开看板（herdr 层）
+
+| 方式 | 说明 |
+|---|---|
+| `prefix+m` | 快捷键（见下方配置方法）：按 `ctrl+b` 松开再按 `m` |
+| `herdr plugin action invoke coop.board.open` | CLI 触发插件 action |
+| `herdr plugin pane open --plugin coop.board --entrypoint board` | 原生命令 |
+
+快捷键必须写在 herdr **用户配置** `~/.config/herdr/config.toml`（插件清单里声明 `[[keys.command]]` 在当前 herdr 不会注册进键位表）：
 
 ```toml
 [[keys.command]]
-key = "prefix+b"
-type = "plugin_action"
-command = "coop.board.board"
+key = "prefix+m"
+type = "pane"
+command = "/abs/path/to/herdr/coop-board/target/release/coop-board"
+description = "open the coop board"
 ```
+
+要点：
+
+- `type = "pane"` 开临时 zoomed 窗格运行看板，`q` 退出即关；窗格继承聚焦窗格的 cwd，看板自动跟随你按键时所在的 workspace。
+- 选键时避开默认键表已占用的 prefix 键：`? b c e g h j k l minus n o p q r s tab v w x z` 及 `shift+d/g/n/p/r/t/tab/w/x`、`1..9`（可用 `herdr --default-config` 核对；`prefix+?` 查看当前生效键位）。
+- 改完执行 `herdr server reload-config` 立即生效。
+
+### 看板内按键
+
+| 键 | 动作 |
+|---|---|
+| `q` / `Esc` | 退出看板 |
+| `Tab` / `l` | 下一个 master（仅 v2） |
+| `BackTab` / `h` | 上一个 master（仅 v2） |
+| `j` / `↓` · `k` / `↑` | 在侧栏选择 plan（跨 master 边界移动） |
+| `g` / `G` | 第一个 / 最后一个 plan 行 |
+| `a` | 看板在「选中 plan」与「该 master 全部 plan 合并」之间切换 |
+| `d` | 右侧面板在状态看板与拓扑 DAG 视图之间切换（仅 v2，投影选中 plan） |
+| `v` | 切换 v1/v2 布局（两者共存时） |
 
 ## Workspace 发现与空看板
 
@@ -31,20 +61,7 @@ Herdr 以插件根目录为工作目录运行插件窗格命令，向上寻找�
 2. 在那里注册至少一个 master（`/coop master`）；plan 与 task 随 `.dsh/coop/v2/` 中的实际状态渲染。纯 v1 根不需要锚点 —— 看板直接探测 `.dsh/coop/registry.json`。
 3. 或者直接带显式 workspace 根运行二进制 —— `target/release/coop-board /path/to/workspace` 完全跳过发现。
 
-计划中：清单窗格命令应从 herdr 插件上下文（`HERDR_PLUGIN_CONTEXT_JSON`，聚焦 workspace 的 cwd）或 `COOP_WORKSPACE` 环境变量取 workspace，让看板跟随 herdr workspace 而不是插件根。
-
-## 按键
-
-| 键 | 动作 |
-|---|---|
-| `q` / `Esc` | 退出 |
-| `Tab` / `l` | 下一个 master（仅 v2） |
-| `BackTab` / `h` | 上一个 master（仅 v2） |
-| `j` / `↓` · `k` / `↑` | 在侧栏选择 plan（跨 master 边界移动） |
-| `g` / `G` | 第一个 / 最后一个 plan 行 |
-| `a` | 看板在「选中 plan」与「该 master 全部 plan 合并」之间切换 |
-| `d` | 右侧面板在状态看板与拓扑 DAG 视图之间切换（仅 v2，投影选中 plan） |
-| `v` | 切换 v1/v2 布局（两者共存时） |
+看板按以下优先级解析要投影的 workspace（0.2.2 起）：`COOP_WORKSPACE` 环境变量 > herdr 插件上下文（`HERDR_PLUGIN_CONTEXT_JSON` 的 `focused_pane_cwd`，其次 `workspace_cwd`）> 从进程 cwd 向上发现最近的 coop 布局标记。插件窗格的进程 cwd 固定在插件根目录，所以从 herdr 打开时走的是第二条路径 —— 看板跟随你打开时所在窗格的目录；也可显式传根路径 `target/release/coop-board /path/to/workspace`。
 
 ## 仪表盘分层（v2）
 
