@@ -122,7 +122,7 @@ async function runRole(
   }
   return USAGE
 }
-const V2_USAGE = 'usage: /coop master [--any-cwd] · worker|reviewer [--master <masterId>] [--model <route>] [--skills a,b] [--any-cwd] · off · list [--unbound] · status · bind <sessionId> · release <sessionId> · board [planId] · plan close|abort <planId> · workspace init [path]'
+const V2_USAGE = 'usage: /coop master [--any-cwd] · worker|reviewer [--master <masterId>] [--model <route>] [--skills a,b] [--any-cwd] · off · list [--unbound] · status · bind <sessionId> · release <sessionId> · spawn worker|reviewer [--model <route>] [--workdir <dir> | --worktree <dir|branch>] · board [planId] · plan close|abort <planId> · workspace init [path]'
 /** Dispatch the v2 `/coop` grammar for one live agent. */
 async function runV2(
   service: CoopService,
@@ -202,12 +202,19 @@ async function runV2(
   if (head === 'spawn' && (sub === 'worker' || sub === 'reviewer')) {
     const model = parsed.flags.get('model')
     const workdir = parsed.flags.get('workdir')
+    const worktree = parsed.flags.get('worktree')
     const outcome = await service.createNodeV2(agent, {
       role: sub,
       ...(typeof model === 'string' ? { model } : {}),
       ...(typeof workdir === 'string' ? { workdir } : {}),
+      ...(typeof worktree === 'string' ? { worktree } : {}),
     })
-    if (outcome.spawned === 'herdr') return `Node spawned in herdr pane ${outcome.paneId} — registration line sent.`
+    if (outcome.spawned === 'herdr') {
+      const entry = outcome.entry
+      return entry === undefined
+        ? `Node spawned in herdr pane ${outcome.paneId} — registration line sent.`
+        : `Node spawned in herdr pane ${outcome.paneId} — ${entry.roles.join('+')} ${entry.sessionId} [${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}].`
+    }
     return `Node spawned headless: ${outcome.entry?.sessionId ?? '?'} (${outcome.entry?.bindState ?? '?'}).`
   }
   if (head === 'workspace' && sub === 'init') {

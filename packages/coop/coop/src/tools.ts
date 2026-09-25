@@ -1126,11 +1126,12 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
 
   ctx.tools.register(defineTool({
     name: 'coop_worker_create',
-    description: 'Auto-create one bound worker/reviewer node (master only). With herdr reachable from a herdr-hosted master, the node lands in a freshly split pane running spawnCommand and receives its /coop registration line; otherwise it is an in-process headless session (§8.2).',
+    description: 'Auto-create one bound worker/reviewer node (master only). With herdr reachable from a herdr-hosted master, the node lands in a freshly split pane running spawnCommand at the target directory (worktree > workdir > workspace root) and is confirmed registered-and-bound by watching the registry; otherwise it is an in-process headless session (§8.2).',
     parameters: {
       role: { type: 'string', required: true, enum: ['worker', 'reviewer'], description: 'Node role to create.' },
       model: { type: 'string', description: 'Model route recorded on the node (headless sessions also launch with it).' },
-      workdir: { type: 'string', description: 'Working directory for the spawned session (defaults to the workspace root).' },
+      workdir: { type: 'string', description: 'Working directory for the spawned session (defaults to the workspace root; the herdr pane starts there).' },
+      worktree: { type: 'string', description: 'Coop worktree to place the node in, by directory or branch name; the pane/session starts inside the worktree (registration still resolves the workspace anchor).' },
     },
     output: {
       schema: {
@@ -1152,6 +1153,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
           role: args.role,
           ...(args.model === undefined ? {} : { model: args.model }),
           ...(args.workdir === undefined ? {} : { workdir: args.workdir }),
+          ...(args.worktree === undefined ? {} : { worktree: args.worktree }),
         })
         return {
           spawned: outcome.spawned,

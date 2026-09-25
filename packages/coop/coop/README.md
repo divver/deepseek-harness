@@ -53,6 +53,9 @@ All fields optional; enum and positivity rules fail loud at load.
 | `spawnCommand` | `dsh --cwd {cwd}` | v2 command template run in a spawned herdr pane; `{cwd}` is replaced |
 | `spawnReadyRegex` | _(empty)_ | v3 regex the spawned pane must match before its registration line is sent |
 | `allowSelfReview` | `false` | v2 let the master verify its own tasks when no reviewer is bound (§12.4) |
+| `roleLlm` | _(empty)_ | v2 per-role LLM routes `{ master\|worker\|reviewer: { provider, model, reasoningEffort? } }`; every request of a session registered under that role is rewritten onto the route (provider+model pair, adapter-interpreted effort) |
+| `spawnRegisterTimeoutMs` | `30000` | v2 window waiting for a spawned pane's registration to land in the registry; the registration line is re-sent roughly every 4 s meanwhile, and a timeout fails loud with the manual line quoted |
+| `spawnLayout` | `columns` | v2 arrangement of auto-spawned panes: `columns` — master in one column, workers stacked in a column, reviewers stacked in a column right of the workers; `right` — legacy behavior, every pane split right of the master |
 
 ## v2 mode (P0 shipped)
 
@@ -66,8 +69,51 @@ Set `mode: "v2"` to switch to the multi-master node registry ([spec](../../../.a
 - **Plans are task DAGs (P1)** — `coop_plan_create` (bound to one `repoRoot`, §12.1) → `coop_task_add`/`coop_task_link`/`coop_task_cancel` (cycle-checked under the plan lock) → review-gated activation (P3). Readiness derives from the DAG; the scheduler assigns ready tasks to idle bound workers (skill demands ⊆ declared skills, `maxParallelTasks`) and wakes them with `task assigned` signals. Workers run `coop_execute_begin` → `coop_execute_report`; a bound reviewer verifies with `coop_task_verify` (`pass` → done and downstream goes ready; `request_changes` → rework for the same worker). `coop_board` is the kanban projection; `coop_plan_close` requires every task done/cancelled; `coop_plan_abort` cancels open tasks and signals in-flight assignees.
 - **Worktrees (P2)** — `coop_worktree_create` branches a plan's `repoRoot` into `<workspace>/wt/<masterId>/<seq>-<slug>` through the mounted shell seam (git runs via `ctx.shell`, never raw `child_process`); the directory name is claimed under the global `wt-registry.json` lock, so masters never collide. The scheduler hands each assigned task a free worktree (exclusive) and names it in the wake-up signal. `coop_worktree_merge` merges back with `git merge --no-ff` (a moved base or a conflict aborts fail-loud as `COOP_WORKTREE_MERGE_CONFLICT` — no auto-resolution, §6.4); `coop_plan_close` auto-merges every still-active worktree first; `coop_worktree_clean` removes one (`force` discards modifications). Plan-review gating, subagent executors, and memory arrive with P3–P4.
 - **Reviewer gates and escalation (P3)** — activation now runs through review: `coop_plan_submit_review` (designing → reviewing, bound reviewers woken) and `coop_plan_review` (pass → active with scheduling; request_changes → designing; same reviewer/allowSelfReview gate as task verify). Tasks carry an executing heartbeat (`coop_execute_touch`) whose silence past `executingStaleMs` returns the task to rework, and a `hardDeadlineMs` measured from first assignment whose expiry blocks the task; `maxReworkAttempts` exhausted `request_changes` verdicts also block, signalling both the worker and the master. Subagent-executor tasks tell the assigned worker to delegate the task spec to a spawned sub-agent.
-- **Herdr TUI integration (P5a)** — `coop_worker_create` (and `/coop spawn worker|reviewer`) auto-creates nodes: with herdr reachable and the master inside a herdr pane, the node lands in a freshly split pane running `spawnCommand`, then receives its `/coop <role> --master <id>` line (pane id self-reports via `HERDR_PANE_ID` at registration); otherwise an in-process headless session is created pre-bound. Every poll tick mirrors node states into herdr (`pane report-agent`/`report-metadata`, only on change), so herdr's sidebar becomes the node card row. The kanban board is the separate `coop-board` Ratatui plugin ([herdr/coop-board](../../../herdr/coop-board/README.md)): `herdr plugin link <repo>/herdr/coop-board` then `herdr plugin pane open --plugin coop.board --entrypoint board` opens the overlay (q/Esc closes); the pane command runs from the plugin root, so point it at a workspace with a `/coop workspace init` anchor or pass an explicit root — see the plugin README's discovery section.
+- **Herdr TUI integration (P5a)** — `coop_worker_create` (and `/coop spawn worker|reviewer [--model <route>] [--workdir <dir> | --worktree <dir|branch>]`) auto-creates nodes: with herdr reachable and the master inside a herdr pane, the freshly split pane follows the default column layout (`spawnLayout: columns`: same-role panes stack onto the bottom of their column, and a role's first pane inserts a fresh full-height column beside the master — column order follows spawn order; derived from live geometry plus each node's self-reported pane id, no stored state) and is anchored with `--cwd` at the node's living directory (worktree > workdir > workspace root) and runs `spawnCommand`, then receives its `/coop <role> --master <id>` line; coop polls the registry until the node actually lands (re-sending the line roughly every 4 s inside the `spawnRegisterTimeoutMs` window; a timeout fails loud quoting the manual line). The line carries the master id, so the node pre-binds — no follow-up `coop_bind` from the master. Otherwise an in-process headless session is created pre-bound. Every poll tick mirrors node states into herdr (`pane report-agent`/`report-metadata`, only on change), so herdr's sidebar becomes the node card row. The kanban board is the separate `coop-board` Ratatui plugin ([herdr/coop-board](../../../herdr/coop-board/README.md)): `herdr plugin link <repo>/herdr/coop-board` then `herdr plugin pane open --plugin coop.board --entrypoint board` opens the overlay (q/Esc closes, `d` toggles the DAG view); the pane command runs from the plugin root, so point it at a workspace with a `/coop workspace init` anchor or pass an explicit root — see the plugin README's discovery section.
+- **Per-role LLM routes (roleLlm)** — with `roleLlm: { master|worker|reviewer: { provider, model, reasoningEffort? } }` configured, every LLM request of a session registered under that role is rewritten onto the route by a local `agent/request` listener (provider/model/effort). `/coop master` and `/coop worker|reviewer` apply it at registration; herdr panes from `/coop spawn` apply the same deployment config when their registration line lands, and headless nodes also launch with the route's provider/model. The effective route is recorded in registry `meta.model`; `/coop off` lifts the pin.
 - **Summarizer → memory (P4)** — every verified task and closed plan is deterministically summarized into the master's memory trail `v2/masters/<masterId>/memory.jsonl` (report text + verify rationale as lessons) with a human-readable `memory.md` mirror; appends compact to `memoryRetainEntries`. The `coop:memory` prompt section injects the newest `memoryInjectTopK` records (recency only, §12.3) for every member of the master; targeted recall is `coop_memory_search` (keyword, per-master isolation). The optional summarizer-model LLM pass is deferred — the deterministic composition stays lossless over report/verify text. `coop_board` is the kanban projection; `coop_plan_close` requires every task done/cancelled; `coop_plan_abort` cancels open tasks and signals in-flight assignees. Worktrees, plan-review gating, subagent executors, and memory arrive with P2–P4.
+
+## Per-role model pinning (roleLlm) — the full recipe
+
+`roleLlm` pins provider + model + reasoningEffort per role (master / worker / reviewer). It takes effect in two layers, and both belong in the deployment:
+
+**Layer 1: coop's `roleLlm` (request-level pin; applies in every deployment)**
+
+Every LLM request of a session registered under that role is rewritten onto the route by a local `agent/request` listener; headless nodes launch with the route's provider/model; the effective route is recorded in registry `meta.model` (visible on the board and in `/coop list`); `/coop off` lifts the pin. Validation fails loud: provider+model must be a non-empty pair, role keys are exactly master|worker|reviewer, and the effort is a non-empty string interpreted by the target provider's adapter (an unlisted level falls back to the adapter default).
+
+**Layer 2: the host TUI's startup route pair (so dsh-tui panes display AND use the role model from boot)**
+
+dsh-tui resolves a new session's startup route as: a complete provider+model pair in the `dsh-tui` entry config > `~/.dsh-tui/model.json` (the `/model` picker's global persisted choice) > built-in defaults. With `roleLlm` alone, a fresh pane's statusline keeps showing the picker's model until the first request travels the pinned route. To boot panes correctly, pin an **env-driven complete pair** on the `dsh-tui` entry: `/coop spawn` automatically injects `DSH_COOP_PROVIDER` / `DSH_COOP_MODEL` / `DSH_COOP_EFFORT` (via `herdr pane split --env`) from the role's route when one is configured; panes without the env (master / plain panes) fall back to the pinned defaults.
+
+Complete `~/.dsh/profiles/<name>/cordis.patch.yml` example:
+
+```yaml
+- id: dsh-tui
+  config:
+    # A complete pair wins over the /model picker; panes without coop env
+    # boot on the fallback (the master's default route).
+    provider: !!js process.env.DSH_COOP_PROVIDER ?? 'zai-coding-cn'
+    model: !!js process.env.DSH_COOP_MODEL ?? 'glm-5.3'
+    effort: !!js process.env.DSH_COOP_EFFORT ?? 'max'
+- insert:
+  - id: coop
+    name: '@deepseek-ai/dsh-coop'
+    config:
+      mode: v2
+      spawn: auto
+      spawnCommand: dsh --profile <name>
+      roleLlm:
+        master:   { provider: zai-coding-cn, model: glm-5.3, reasoningEffort: max }
+        worker:   { provider: zai-coding-cn, model: glm-5.3-flash, reasoningEffort: high }
+        reviewer: { provider: zai-coding-cn, model: glm-5.3, reasoningEffort: max }
+```
+
+Behavior notes:
+
+- The provider route must already exist (e.g. an `llm-pi-ai.providers.<id>` settings entry or a composed adapter), and the model id must be one the provider actually serves.
+- Once a complete pair is pinned, NEW sessions no longer boot on the `/model` picker (an in-session `/model` switch still works); `roleLlm` remains the authoritative request-level override.
+- An explicit `--model <route>` (spawn/register argument) only records registry meta and seeds the headless launch; it does not change the roleLlm pin.
+- Non-TUI deployments (web/headless) need only layer 1; when the host composes the session-controller service, registration also commits a visible model selection and appends a durable `model/selection` event.
 
 ## Human commands
 

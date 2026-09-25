@@ -45,9 +45,8 @@ import {
   mintMasterId,
   normalizeCwd,
   resolveCoopConfig,
-  v2Root,
-} from './runtime.ts'
-import type { ResolvedCoopConfig } from './runtime.ts'
+  v2Root, applyRoleLlmRoute, planColumnSplit, PaneBox } from './runtime.ts'
+import type { ResolvedCoopConfig, RoleLlmRoute, RoleLlmSettings } from './runtime.ts'
 import * as store from './store.ts'
 import { COOP_POLICY_ORDER, COOP_POLICY_SECTION_NAME, COOP_POLICY_TEXT, COOP_V2_POLICY_TEXT } from './policy.ts'
 import { registerCoopCommands } from './commands.ts'
@@ -56,6 +55,13 @@ import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'coop': { kind: 'coop' } & ContextFormed
+  }
+}
+
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionEventMap {
+    /** Identical to the session-controller declaration so the interfaces merge when both are composed. */
+    'model/selection': { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }
   }
 }
 
@@ -103,6 +109,12 @@ export interface Config {
   spawnCommand?: string
   /** v2 regex herdr pane output must match before the registration line is sent (empty = send immediately). */
   spawnReadyRegex?: string
+  /** v2 per-role LLM routes (`master`/`worker`/`reviewer` → provider/model/reasoningEffort) applied to registered sessions' requests. */
+  roleLlm?: RoleLlmSettings
+  /** v2 window waiting for a spawned pane's registration to land in the registry (default 30,000). */
+  spawnRegisterTimeoutMs?: number
+  /** v2 pane arrangement for auto-spawned nodes: role `columns` or legacy `right`. */
+  spawnLayout?: 'columns' | 'right'
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -127,6 +139,9 @@ export const Config: z<Config> = z.object({
   spawn: z.string(),
   spawnCommand: z.string(),
   spawnReadyRegex: z.string(),
+  spawnRegisterTimeoutMs: z.number(),
+  spawnLayout: z.string(),
+  roleLlm: z.any(),
   inboxPollMs: z.number(),
   mirrorEvents: z.boolean(),
 }) as unknown as z<Config>
@@ -181,9 +196,28 @@ export class CoopService extends Service {
 
   private readonly resolved: ResolvedCoopConfig
 
+  /** Role-pinned LLM routes for sessions registered in THIS process; cross-process nodes apply their own deployment config. */
+  private readonly roleLlmBySession = new Map<string, RoleLlmRoute>()
+
+  /** Optional session-controller seam that makes a role pin visible in the owning session's model selection. */
+  private sessionController: SessionControllerSeam | undefined
+
   constructor(ctx: Context, config: Config = {}) {
     super(ctx, 'coop')
     this.resolved = resolveCoopConfig(config)
+    ctx.inject(['sessionController'], (controllerCtx) => {
+      this.sessionController = (controllerCtx as { sessionController?: SessionControllerSeam }).sessionController
+    })
+    // Deployment-pinned role routes rewrite every request of a locally
+    // registered session; registration in any process applies the same
+    // deployment config there, so herdr panes and headless spawns converge.
+    if (this.resolved.mode === 'v2' && Object.keys(this.resolved.roleLlm).length > 0) {
+      ctx.on('agent/request', async ({ agent }, next) => {
+        const resolved = await next()
+        const route = this.roleLlmBySession.get(String(agent.session.id))
+        return route === undefined ? resolved : applyRoleLlmRoute(resolved, route)
+      })
+    }
     ctx.inject(['shell'], (shellCtx) => {
       this.shellSeam = (shellCtx as { shell?: unknown }).shell as typeof this.shellSeam
     })
@@ -1120,12 +1154,15 @@ export class CoopService extends Service {
     const now = Date.now()
     const root = await this.v2RootOf(agent)
     const localPath = store.v2RegistryPath(root)
+    const roleRoute = this.roleLlmForRoles(req.roles)
     const paneEnv = process.env.HERDR_PANE_ID
     const meta = req.model === undefined && paneEnv === undefined
       ? {}
       : {
         meta: {
-          ...(req.model === undefined ? {} : { model: req.model }),
+          ...(req.model === undefined && roleRoute === undefined
+            ? {}
+            : { model: req.model ?? `${String(roleRoute?.provider)}/${String(roleRoute?.model)}` }),
           ...(paneEnv === undefined ? {} : { paneId: paneEnv, spawn: 'herdr' as const }),
         },
       }
@@ -1159,6 +1196,7 @@ export class CoopService extends Service {
         createdAt: now,
         status: 'active',
       })
+      if (roleRoute !== undefined) this.applyRoleRoute(agent, roleRoute)
       this.appendMirror(agent.session, 'coop/registry-v2', { op: 'register', roles: ['master'], masterId: String(masterId), bindState: 'bound', updatedAt: now })
       return entry
     }
@@ -1198,6 +1236,7 @@ export class CoopService extends Service {
         return { next: { version: 2, entries: [...others, result.entry] }, value: undefined }
       })
     }
+    if (roleRoute !== undefined) this.applyRoleRoute(agent, roleRoute)
     this.appendMirror(agent.session, 'coop/registry-v2', {
       op: 'register',
       roles: req.roles,
@@ -1233,6 +1272,7 @@ export class CoopService extends Service {
       const profile = await store.readMasterProfile(profilePath)
       if (profile !== undefined) await store.writeMasterProfile(profilePath, { ...profile, status: 'retired' })
     }
+    this.roleLlmBySession.delete(sessionId)
     this.appendMirror(agent.session, 'coop/registry-v2', { op: 'off', roles: [], updatedAt: now })
     return removed ?? { sessionId, roles: [], bindState: 'unbound', cwd, cwdScope: 'cwd', updatedAt: now, heartbeatAt: now }
   }
@@ -2573,10 +2613,25 @@ export class CoopService extends Service {
        */
   async createNodeV2(
     agent: Agent,
-    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string },
+    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string; worktree?: string },
   ): Promise<{ spawned: 'herdr' | 'headless'; paneId?: string; entry?: CoopV2RegistryEntry }> {
     const { masterId, root } = await this.requireV2Master(agent)
-    void root
+    // Where the node LIVES: an assigned worktree wins, then an explicit
+    // workdir, then the workspace root. Registration scope is unaffected —
+    // worktrees sit under `<workspace>/wt/`, so anchor discovery still finds
+    // the same registry the master id lives in.
+    let cwd: string
+    if (req.worktree !== undefined) {
+      const entry = (await store.readWtRegistry(store.wtRegistryPath(root)))?.entries
+        .find(candidate => candidate.masterId === String(masterId)
+          && (candidate.dir === req.worktree || candidate.branch === req.worktree))
+      if (entry === undefined) {
+        throw new CoopError(`no worktree "${req.worktree}" under ${String(masterId)} — create one with coop_worktree_create first`, 'COOP_NODE_NOT_FOUND')
+      }
+      cwd = normalizeCwd(entry.dir)
+    } else {
+      cwd = req.workdir === undefined ? this.workspaceOf(agent) : normalizeCwd(req.workdir)
+    }
     const masterPane = process.env.HERDR_PANE_ID
     const inHerdr = masterPane !== undefined
     const available = inHerdr ? await this.herdrAvailable() : false
@@ -2589,10 +2644,27 @@ export class CoopService extends Service {
             : 'herdr spawn requires the master to run inside a herdr pane (HERDR_PANE_ID absent)',
           'COOP_SPAWN_FAILED')
       }
-      return this.createNodeHeadless(agent, req, masterId)
+      return this.createNodeHeadless(agent, req, masterId, cwd)
     }
-    const cwd = req.workdir === undefined ? this.workspaceOf(agent) : normalizeCwd(req.workdir)
-    const split = await this.runHerdr(['pane', 'split', masterPane ?? '', '--direction', 'right', '--no-focus'])
+    // --cwd anchors the new pane at the node's living directory; worktrees
+    // sit under the workspace, so anchor discovery still finds the registry.
+    // The split target arranges role columns (master | workers | reviewers).
+    const plan = await this.planPaneSplit(String(masterId), masterPane ?? '', req.role, root)
+    // Role-route env boot: the TUI resolves a complete provider+model pair
+    // from its entry config over the persisted /model pick, so seeding
+    // DSH_COOP_* here makes the pane boot (display AND first request) on the
+    // role's route instead of the workspace's last picker choice.
+    const roleRoute = this.roleLlmForRoles([req.role])
+    const env: string[] = roleRoute === undefined
+      ? []
+      : [
+        '--env', `DSH_COOP_PROVIDER=${roleRoute.provider}`,
+        '--env', `DSH_COOP_MODEL=${roleRoute.model}`,
+        ...(roleRoute.reasoningEffort === undefined
+          ? []
+          : ['--env', `DSH_COOP_EFFORT=${String(roleRoute.reasoningEffort)}`]),
+      ]
+    const split = await this.runHerdr(['pane', 'split', plan.targetPane, '--direction', plan.direction, '--no-focus', '--cwd', cwd, ...env])
     if (split.code !== 0) {
       throw new CoopError(`herdr pane split failed: ${split.stderr || split.stdout}`, 'COOP_SPAWN_FAILED')
     }
@@ -2625,7 +2697,11 @@ export class CoopService extends Service {
     if (enter.code !== 0) {
       throw new CoopError(`herdr pane send-keys failed: ${enter.stderr || enter.stdout}`, 'COOP_SPAWN_FAILED')
     }
-    return { spawned: 'herdr', paneId }
+    // Delivery through a still-booting TUI is best-effort; the registry is
+    // the truth. Poll for the entry, re-sending the line until it lands —
+    // then report the committed bind state instead of hoping it arrived.
+    const entry = await this.awaitPaneRegistration(root, paneId, req.role, line)
+    return { spawned: 'herdr', paneId, entry }
   }
 
   /**
@@ -2640,6 +2716,7 @@ export class CoopService extends Service {
     agent: Agent,
     req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string },
     masterId: MasterId,
+    cwd: string,
   ): Promise<{ spawned: 'headless'; entry: CoopV2RegistryEntry }> {
     const loop = this.ctx.get('agentLoop') as {
       create: (id: SessionId, options: { provider?: string; model?: string }, meta: { cwd: string }) => Promise<Agent>
@@ -2648,14 +2725,16 @@ export class CoopService extends Service {
       throw new CoopError('headless spawn requires the agent-loop service', 'COOP_SPAWN_FAILED')
     }
     const route = agent.options as { provider?: string; model?: string }
-    const model = req.model ?? route.model
+    const roleRoute = this.roleLlmForRoles([req.role])
+    const model = req.model ?? roleRoute?.model ?? route.model
+    const provider = roleRoute?.provider ?? route.provider
     const spawned = await loop.create(
       SessionId(`coop-${req.role}-${randomUUID().slice(0, 8)}`),
       {
-        ...(route.provider === undefined ? {} : { provider: route.provider }),
+        ...(provider === undefined ? {} : { provider }),
         ...(model === undefined ? {} : { model }),
       },
-      { cwd: req.workdir === undefined ? this.workspaceOf(agent) : normalizeCwd(req.workdir) },
+      { cwd },
     )
     const entry = await this.registerV2(spawned, {
       roles: [req.role],
@@ -2741,6 +2820,145 @@ export class CoopService extends Service {
       stderr: { text: string }
     }> }>
   } | undefined
+
+  /**
+         * The role-pinned LLM route currently applied to one registered session.
+         * @param sessionId - session to look up.
+         * @returns the route, or undefined when the session has none in this process.
+         */
+  roleLlmFor(sessionId: string): RoleLlmRoute | undefined {
+    return this.roleLlmBySession.get(sessionId)
+  }
+
+  /** First configured role route matching any of the entry's roles. */
+  private roleLlmForRoles(roles: readonly V2Role[]): RoleLlmRoute | undefined {
+    for (const role of roles) {
+      const route = this.resolved.roleLlm[role]
+      if (route !== undefined) return route
+    }
+    return undefined
+  }
+
+  /**
+         * Wait for a spawned pane's registration line to land as a registry entry
+         * (matched by the pane id the session self-reports), re-sending the line
+         * while the pane is still booting. The first wait is longer to cover TUI
+         * startup; afterwards the line repeats roughly every four seconds.
+         * @param root - the master's v2 root (the registry the pane writes to).
+         * @param paneId - herdr pane the node was spawned into.
+         * @param role - role the registration line carries.
+         * @param line - the registration line, resent on retry and quoted on timeout.
+         * @returns the committed registry entry.
+         * @throws CoopError `COOP_SPAWN_FAILED` when the window elapses with no entry.
+         */
+  private async awaitPaneRegistration(root: string, paneId: string, role: 'worker' | 'reviewer', line: string): Promise<CoopV2RegistryEntry> {
+    const deadline = Date.now() + this.resolved.spawnRegisterTimeoutMs
+    const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+    for (let attempt = 1; ; attempt++) {
+      await sleep(attempt === 1 ? 1_500 : 1_000)
+      const entry = (await store.readV2Registry(store.v2RegistryPath(root)))?.entries
+        .find(candidate => candidate.meta?.paneId === paneId && candidate.roles.includes(role))
+      if (entry !== undefined) return entry
+      if (Date.now() >= deadline) {
+        throw new CoopError(`spawned pane ${paneId} never registered as ${role} within ${String(this.resolved.spawnRegisterTimeoutMs)}ms — send the line manually: ${line}`, 'COOP_SPAWN_FAILED')
+      }
+      if (attempt % 4 === 0) {
+        const send = await this.runHerdr(['pane', 'send-text', paneId, line])
+        if (send.code === 0) await this.runHerdr(['pane', 'send-keys', paneId, 'Enter'])
+      }
+    }
+  }
+
+  /**
+     * Pick the pane to split for the next auto-spawned node. Under the
+     * default `columns` layout the live herdr geometry plus each node's
+     * self-reported pane id derive the role columns with no stored state:
+     * same-role panes extend the bottom of their column, and a role's first
+     * pane splits the master right, inserting a fresh full-height column.
+         * Unreadable layouts degrade to the legacy master-right split.
+         * @param masterId - owning master id.
+         * @param masterPane - the master's herdr pane id.
+         * @param role - role being spawned.
+         * @param root - the master's v2 root (registry source for live pane ids).
+         * @returns the pane to split and the direction.
+         */
+  private async planPaneSplit(masterId: string, masterPane: string, role: 'worker' | 'reviewer', root: string): Promise<{ targetPane: string; direction: 'right' | 'down' }> {
+    if (this.resolved.spawnLayout === 'right' || masterPane.length === 0) {
+      return { targetPane: masterPane, direction: 'right' }
+    }
+    const layoutOut = await this.runHerdr(['pane', 'layout', '--pane', masterPane], { quiet: true })
+    if (layoutOut.code !== 0) {
+      return { targetPane: masterPane, direction: 'right' }
+    }
+    let panes: { pane_id?: string; rect?: { x?: number; y?: number; width?: number; height?: number } }[]
+    try {
+      const parsed = JSON.parse(layoutOut.stdout) as { result?: { layout?: { panes?: typeof panes } } }
+      panes = parsed.result?.layout?.panes ?? []
+    } catch {
+      return { targetPane: masterPane, direction: 'right' }
+    }
+    const boxes = new Map<string, PaneBox>()
+    for (const pane of panes) {
+      const rect = pane.rect
+      if (pane.pane_id === undefined || rect === undefined) continue
+      boxes.set(pane.pane_id, {
+        paneId: pane.pane_id,
+        x: rect.x ?? 0,
+        y: rect.y ?? 0,
+        width: rect.width ?? 0,
+        height: rect.height ?? 0,
+      })
+    }
+    const now = Date.now()
+    const entries = (await store.readV2Registry(store.v2RegistryPath(root)))?.entries ?? []
+    const rolePanes = (wanted: 'worker' | 'reviewer'): PaneBox[] =>
+      entries
+        .filter(entry => entry.bindState === 'bound'
+                && String(entry.masterId ?? '') === masterId
+                && this.isFreshV2(entry, now)
+                && entry.roles.includes(wanted)
+                && entry.meta?.paneId !== undefined
+                && boxes.has(entry.meta.paneId))
+        .map(entry => boxes.get(String(entry.meta?.paneId)))
+        .filter((box): box is PaneBox => box !== undefined)
+    return planColumnSplit(masterPane, rolePanes(role))
+  }
+
+  /**
+         * Pin one registered session onto its role route on BOTH surfaces: the
+         * request waterfall (every later request rewrites onto the route) and the
+         * session's own model selection, so the TUI statusline, the model-switch
+         * notice, and the wire all agree instead of the UI still showing the
+         * session default while requests silently travel the role route.
+         * @param agent - freshly registered live agent.
+         * @param route - validated role route to pin.
+         */
+  private applyRoleRoute(agent: Agent, route: RoleLlmRoute): void {
+    this.roleLlmBySession.set(String(agent.session.id), route)
+    const selection = {
+      provider: route.provider,
+      model: route.model,
+      ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+    }
+    const controller = this.sessionController
+    if (controller !== undefined) {
+      try {
+        controller.selectForNextRequest(agent, selection)
+        return
+      } catch {
+        // Fall through to the durable event below.
+      }
+    }
+    try {
+      // Without the session-controller service (e.g. the TUI profile), the
+      // durable `model/selection` event still records the pin in the
+      // transcript, and the first request's header carries the route.
+      agent.session.append('model/selection', selection)
+    } catch {
+      // The event seam is optional; the request-waterfall pin alone carries
+      // the route.
+    }
+  }
 }
 /**
  * Whether the edge set contains a cycle; returns the cycle path for the
@@ -2849,4 +3067,8 @@ function watchTasks(plan: CoopV2PlanFile, now: number, executingStaleMs: number)
     return task
   })
   return { ...plan, tasks }
+}
+/** The one session-controller operation coop consumes: commit a model selection the owning session's UI and routing both see. */
+interface SessionControllerSeam {
+  selectForNextRequest: (agent: Agent, selection: { provider: string; model: string; reasoningEffort?: unknown }) => void
 }
