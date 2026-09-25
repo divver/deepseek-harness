@@ -1,9 +1,9 @@
 [package]
 name = "coop-board"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
-description = "Read-only coop v2 kanban board (Ratatui) for the herdr coop plugin"
+description = "Read-only layered coop dashboard (Ratatui) for the herdr coop plugin"
 
 [[bin]]
 name = "coop-board"

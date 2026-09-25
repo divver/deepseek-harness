@@ -1,8 +1,8 @@
 id = "coop.board"
 name = "Coop Board"
-version = "0.1.0"
+version = "0.2.1"
 min_herdr_version = "0.7.0"
-description = "Read-only coop v2 kanban board over a dsh coop workspace"
+description = "Read-only layered coop dashboard over a dsh coop workspace"
 platforms = ["linux", "macos"]
 
 [[build]]

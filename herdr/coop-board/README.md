@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-Read-only Ratatui kanban board over a dsh coop workspace — the `board` pane of the herdr coop plugin (spec §8.4). It supports both registry layouts: v2 (`.dsh/coop/v2/`, task DAG per master, cards are tasks) and v1 (`.dsh/coop/`, linear 11-state plans, cards are plans). Discovery walks up for either layout marker (v2 preferred, `v` toggles when both exist), else falls back to the cwd. The board never writes: operations stay in dsh tools and commands. Verified against herdr 0.9.1.
+Read-only layered Ratatui dashboard over a dsh coop workspace — the `board` pane of the herdr coop plugin (spec §8.4). Workspace → masters → nodes → plans → task kanban. It supports both registry layouts: v2 (`.dsh/coop/v2/`, task DAG per master, cards are tasks) and v1 (`.dsh/coop/`, linear 11-state plans, cards are plans). Discovery walks up for either layout marker (v2 preferred, `v` toggles when both exist), else falls back to the cwd. The board never writes: operations stay in dsh tools and commands. Verified against herdr 0.9.1.
 
 ## Install and open
 
@@ -40,6 +40,24 @@ Planned: the manifest pane command should take the workspace from the herdr plug
 | `q` / `Esc` | quit |
 | `Tab` / `l` | next master (v2 only) |
 | `BackTab` / `h` | previous master (v2 only) |
+| `j` / `↓` · `k` / `↑` | select plan in the sidebar (crosses master boundaries) |
+| `g` / `G` | first / last plan row |
+| `a` | toggle the kanban between the selected plan and every plan of the master merged |
+| `d` | toggle the right panel between the status kanban and the topological DAG view (v2 only; projects the selected plan) |
 | `v` | toggle v1/v2 layout (when both exist) |
 
-The board refreshes from the shared files roughly every 300 ms. In v2 mode the columns are task statuses (ready/assigned/executing/reporting/verifying/rework/blocked/done/pending) and each card shows the task id, title, assignee, and rework count. In v1 mode the columns are the eleven plan states (draft/pending_pre_review/needs_plan_revision/ready_to_execute/executing/pending_verify/needs_rework/done/closed/aborting/aborted) and each card is a plan with its assigned worker; the master switcher is hidden because v1 has one master per directory. The local registry is read only — v1's global any-scope table under `~/.dsh` is not consulted.
+## Dashboard layers (v2)
+
+The board is a layered dashboard over the workspace, refreshed from the shared files roughly every 300 ms:
+
+- **Workspace header** — root path, anchor status, and workspace totals: masters, bound nodes, unbound pool size, plans (active), tasks (done), active worktrees.
+- **Sidebar** — the master/plan tree. Each master row shows liveness (`●` age, green→yellow→gray as the 5-minute heartbeat window drains), fleet sizes, and plan count; each plan row shows a status-colored progress bar (`[▓▓▓░░░] done/total`) and its active-worktree count. Plans sort running-first (active → reviewing → designing → terminal). The unbound pool block lists adoptable nodes below the tree.
+- **Fleet strip** — the selected master's own row plus every bound worker/reviewer: role tag, short session id, model route, herdr pane, declared skills, and heartbeat liveness.
+- **Kanban** — task cards of the selected plan (or every plan of the master merged with `a`), grouped into seven workflow columns (ready / assigned / exec+reporting / verify / rework+blocked / pending / done+cancelled). Cards carry plan-prefixed id, title, assignee, rework count, worktree, and age; secondary statuses get a `[tag]` inside their column.
+- **DAG view (`d`)** — the selected plan's tasks layered topologically (Kahn) over `dependsOn`, one column per wave; a left→right read is a valid execution order. The header shows `wave k/n` and done counts; the wave holding live work is highlighted yellow, fully settled waves green. Cards use motion glyphs (▶ executing / ◌ ready / ⊟ blocked / ✓ done / ⊘ cancelled) with a `← deps`, assignee, rework, and age tail. Dangling deps are ignored, a cycle's remainder lands in a final column, and beyond 8 columns trailing waves merge into one overflow column. Row semantics follow OmO's herdr-dag panel.
+
+In v1 mode the sidebar lists plans, the fleet strip shows the local registry, and the columns are the eleven plan states with a plan per card; the master switcher is hidden because v1 has one master per directory. The local registry is read only — v1's global any-scope table under `~/.dsh` is not consulted.
+
+## Development
+
+`cargo test` runs the model/app/view suites: status bucketing, progress and age formatting, liveness windows, plan ordering, fixture-driven loading of both layouts, selection semantics (cross-master moves, reload survival, aggregate mode), and full-frame renders via ratatui's `TestBackend`.
