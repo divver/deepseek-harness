@@ -71,7 +71,7 @@ Herdr 以插件根目录为工作目录运行插件窗格命令，向上寻找�
 - **侧栏** —— master/plan 树。master 行显示存活状态（`●` 心跳年龄，随 5 分钟存活窗口由绿→黄→灰）、机队规模与 plan 数；plan 行显示按状态着色的进度条（`[▓▓▓░░░] done/total`）与活跃 worktree 数。plan 排序运行优先（active → reviewing → designing → 终态）。unbound 池块列在树下，展示可收编节点。
 - **机队条** —— 选中 master 自身与每个被绑定 worker/reviewer：角色标记、短 session id、模型路由、herdr 窗格、声明技能与心跳存活。
 - **看板** —— 选中 plan 的 task 卡片（`a` 切换为该 master 全部 plan 合并），归入七个工作流列（ready / assigned / exec+reporting / verify / rework+blocked / pending / done+cancelled）。卡片带 plan 前缀 id、标题、assignee、返工次数、worktree 与年龄；列内次要状态加 `[tag]` 标注。
-- **DAG 视图（`d`）** —— 选中 plan 的 task 依 `dependsOn` 做 Kahn 拓扑分层，每个 wave 一列，从左到右即合法执行顺序。头部显示 `wave k/n` 与 done 计数；含活跃任务的 wave 标黄、全部终态的 wave 标绿。卡片用运动图标（▶ 执行中 / ◌ ready / ⊟ blocked / ✓ done / ⊘ cancelled），尾部列出 `← 依赖`、assignee、返工次数与年龄；悬空依赖忽略，环的剩余节点落入最后一列，超过 8 列时尾部 wave 合并为溢出列。参考 OmO herdr-dag 面板的行式布局语义。
+- **DAG 视图（`d`）** —— 选中 plan 的 task 画成节点图（OmO task-graph 线框）：Kahn 拓扑 wave 从左到右，头部为 `Task Graph:` 标题加 `wave k/n · d/t done · r running · w waiting · m models` 状态行；每列 `Wave k` 标题配 `(done/total …)` 副标题（全部终态 ✓ 绿，活跃 wave 黄）；task 画成方框卡片（名称、`status · age`、`→ assignee · model` 从绑定 fleet 解析、稀疏脚行），依赖边为穿过列间空档的正交连线（`──>` 带拐角）—— 卡片按其依赖所在行自动排序让扇出更紧凑，连线取依赖状态色、从卡片背后穿过，只有悬空依赖留在脚行。底部 `live (n)` 走马灯钉住执行中的 task。环的剩余节点落入最后一列；超过 8 列时尾部 wave 合并为溢出列。
 
 v1 模式下侧栏列出 plan、机队条显示本地注册表、列为十一个 plan 状态且每卡是一个 plan；master 切换隐藏，因为 v1 每目录单 master。只读本地注册表 —— v1 的全局 any-scope 表（`~/.dsh`）不读取。
 

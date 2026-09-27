@@ -707,7 +707,11 @@ mod tests {
         assert_eq!(context_workspace("not json"), None);
         assert_eq!(context_workspace(""), None);
         let relative = r#"{"focused_pane_cwd":"proj"}"#;
-        assert_eq!(context_workspace(relative), None, "only absolute roots count");
+        assert_eq!(
+            context_workspace(relative),
+            None,
+            "only absolute roots count"
+        );
     }
 
     #[test]

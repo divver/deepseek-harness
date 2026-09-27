@@ -1,6 +1,6 @@
 id = "coop.board"
 name = "Coop Board"
-version = "0.2.3"
+version = "0.2.5"
 min_herdr_version = "0.7.0"
 description = "Read-only layered coop dashboard over a dsh coop workspace"
 platforms = ["linux", "macos"]

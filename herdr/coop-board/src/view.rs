@@ -1,6 +1,9 @@
 //! Rendering layer: the layered dashboard chrome (workspace header totals,
 //! master/plan sidebar, fleet strip, kanban columns) over the model snapshot.
 
+use std::collections::HashMap;
+
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -42,6 +45,10 @@ const SIDEBAR_WIDTH: u16 = 36;
 const BAR_WIDTH: usize = 6;
 /// Hard ceiling on DAG wave columns before they merge into a trailing bucket.
 const DAG_MAX_COLUMNS: usize = 8;
+/// Minimum gutter cells between DAG columns, reserved for dependency edges.
+const DAG_MIN_GUTTER: u16 = 4;
+/// One DAG card box: 2 border rows + 4 text rows, uniform so edge anchors line up.
+const DAG_CARD_H: u16 = 6;
 
 /// Motion glyph for one task status (OmO dag-widget convention: the
 /// pre-running states stay visually distinct so a booting graph never reads
@@ -485,49 +492,152 @@ fn draw_sidebar_v2(app: &mut App, frame: &mut Frame, area: Rect, now: u64) {
     );
 }
 
-/// DAG card: motion-glyph head plus a deps/assignee/attempts/age tail.
-fn dag_card(task: &Task, plan: &PlanView, show_plan: bool) -> ListItem<'static> {
-    let mut tail = String::new();
-    if !task.depends_on.is_empty() {
-        let deps: Vec<String> = task.depends_on.iter().map(|dep| task_short(dep)).collect();
-        tail.push_str(&format!("← {} ", deps.join(",")));
-    }
-    if let Some(assignee) = &task.assignee {
-        tail.push_str(&format!("· → {} ", model::short_id(assignee)));
-    }
-    if task.attempts > 0 {
-        tail.push_str(&format!("· rw{} ", task.attempts));
-    }
-    tail.push_str(&format!(
-        "· {}",
-        model::age_string(model::now_ms().saturating_sub(task.updated_at))
-    ));
-    let head = format!(
-        "{}{}{}",
-        if show_plan {
-            format!("{}·", model::plan_short(&plan.plan_id))
-        } else {
-            String::new()
-        },
-        task_short(&task.task_id),
-        if task.title.is_empty() { String::new() } else { format!(" {}", task.title) }
-    );
-    ListItem::new(vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{} ", task_icon(&task.status)),
-                Style::default().fg(task_color(&task.status)),
-            ),
-            Span::styled(head, Style::default().add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(Span::styled(format!("  {tail}"), Style::default().fg(Color::Gray))),
-    ])
+/// Take at most `max` chars of `s` (chars, not bytes: safe on wide glyphs).
+fn trunc(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }
 
-/// v2 DAG projection: topological waves as left→right columns. A left→right
-/// read is a valid execution order; the wave holding live work leads the
-/// header (`wave k/n`), and beyond `DAG_MAX_COLUMNS` the trailing waves merge
-/// into one overflow column so narrow terminals never collapse to nothing.
+/// DAG card content (OmO task-graph wireframe): name, `status · age`,
+/// `→ assignee · model`, and a sparse footline (dangling deps, rework,
+/// worktree). Padded to four rows so every box anchors edges uniformly;
+/// `placed` carries the ids whose cards are on screen, so resolved deps rely
+/// on drawn edges and only dangling ones stay on the footline.
+fn dag_card_lines(
+    task: &Task,
+    models: &HashMap<String, String>,
+    inner: usize,
+    placed: &HashMap<&str, (u16, u16)>,
+) -> Vec<Line<'static>> {
+    let color = task_color(&task.status);
+    let age = model::age_string(model::now_ms().saturating_sub(task.updated_at));
+    let model_line = match &task.assignee {
+        Some(assignee) => {
+            let model = models
+                .get(assignee)
+                .map(|m| format!(" · {m}"))
+                .unwrap_or_default();
+            format!("→ {}{model}", model::short_id(assignee))
+        }
+        None => String::new(),
+    };
+    let mut foot: Vec<String> = Vec::new();
+    let dangling: Vec<String> = task
+        .depends_on
+        .iter()
+        .filter(|dep| !placed.contains_key(dep.as_str()))
+        .map(|dep| task_short(dep))
+        .collect();
+    if !dangling.is_empty() {
+        foot.push(format!("← {}", dangling.join(",")));
+    }
+    if task.attempts > 0 {
+        foot.push(format!("rw{}", task.attempts));
+    }
+    if let Some(worktree) = &task.worktree_id {
+        foot.push(format!("wt {worktree}"));
+    }
+    let name = if task.title.is_empty() {
+        task_short(&task.task_id)
+    } else {
+        task.title.clone()
+    };
+    vec![
+        Line::from(Span::styled(
+            trunc(&name, inner),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            trunc(&format!("{} · {}", task.status, age), inner),
+            Style::default().fg(color),
+        )),
+        Line::from(Span::styled(
+            trunc(&model_line, inner),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            trunc(&foot.join(" · "), inner),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
+
+/// Paint a connector cell only where the canvas is still blank, so edges
+/// pass behind cards instead of corrupting them.
+fn paint(buf: &mut Buffer, clip: Rect, x: u16, y: u16, symbol: &str, style: Style) {
+    if x < clip.x || y < clip.y || x >= clip.right() || y >= clip.bottom() {
+        return;
+    }
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        if cell.symbol() == " " {
+            cell.set_symbol(symbol);
+            cell.set_style(style);
+        }
+    }
+}
+
+/// Orthogonal dependency edge (OmO task-graph wireframe): exit the source
+/// card's right border, jog vertically inside the gutter lane, run flat into
+/// the target row, and enter with a `>` head.
+fn draw_edge(
+    buf: &mut Buffer,
+    clip: Rect,
+    source_right: u16,
+    source_y: u16,
+    lane_x: u16,
+    target_x: u16,
+    target_y: u16,
+    style: Style,
+) {
+    if source_y == target_y {
+        for x in source_right..target_x {
+            paint(
+                buf,
+                clip,
+                x,
+                source_y,
+                if x + 1 == target_x { ">" } else { "─" },
+                style,
+            );
+        }
+        return;
+    }
+    let (corner_a, corner_b) = if target_y > source_y {
+        ("┌", "┘")
+    } else {
+        ("┐", "└")
+    };
+    for x in source_right..lane_x {
+        paint(buf, clip, x, source_y, "─", style);
+    }
+    paint(buf, clip, lane_x, source_y, corner_a, style);
+    let (top, bottom) = if target_y > source_y {
+        (source_y + 1, target_y)
+    } else {
+        (target_y + 1, source_y)
+    };
+    for y in top..bottom {
+        paint(buf, clip, lane_x, y, "│", style);
+    }
+    paint(buf, clip, lane_x, target_y, corner_b, style);
+    for x in (lane_x + 1)..target_x {
+        paint(
+            buf,
+            clip,
+            x,
+            target_y,
+            if x + 1 == target_x { ">" } else { "─" },
+            style,
+        );
+    }
+}
+
+/// v2 DAG projection in the OmO task-graph style: topological waves as
+/// left→right columns (a left→right read is a valid execution order), a
+/// two-line header leading with the live wave, per-wave `done/total` titles,
+/// rich cards (status · age, assignee · model, deps tail), and a `live`
+/// ticker of in-flight tasks pinned to the bottom. Beyond `DAG_MAX_COLUMNS`
+/// the trailing waves merge into one overflow column so narrow terminals
+/// never collapse to nothing.
 fn draw_dag_v2(app: &App, frame: &mut Frame, area: Rect) {
     let plan = match app.dag_plan() {
         Some(plan) => plan,
@@ -542,32 +652,92 @@ fn draw_dag_v2(app: &App, frame: &mut Frame, area: Rect) {
     };
     let waves = model::dag_waves(&plan.tasks);
     let current = model::current_wave(&waves);
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    let models: HashMap<String, String> = app
+        .selected_master()
+        .map(|master| {
+            master
+                .nodes
+                .iter()
+                .filter_map(|node| node.model.clone().map(|m| (node.session_id.clone(), m)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let distinct_models = models
+        .values()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let running = plan
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.status.as_str(), "executing" | "reporting"))
+        .count();
+    let live: Vec<&Task> = plan
+        .tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status.as_str(),
+                "executing" | "reporting" | "verifying" | "rework"
+            )
+        })
+        .collect();
+    let ticker_height = if live.is_empty() {
+        0
+    } else {
+        (live.len().min(3) + 2) as u16
+    };
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(ticker_height),
+    ])
+    .split(area);
+    let settled_header = current > waves.len();
+    let mut status_line = format!(
+        "wave {}/{} · {}/{} done · {running} running · {} waiting",
+        current,
+        waves.len(),
+        plan.totals.resolved(),
+        plan.totals.total,
+        plan.totals.waiting
+    );
+    if distinct_models > 0 {
+        status_line.push_str(&format!(
+            " · {distinct_models} model{}",
+            if distinct_models > 1 { "s" } else { "" }
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" dag · {} ", model::plan_short(&plan.plan_id)),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{} [{}] ", plan.title, plan.status),
-                Style::default().fg(Color::Gray),
-            ),
-            Span::styled(
-                format!(
-                    "wave {}/{} · {}/{} done",
-                    current,
-                    waves.len(),
-                    plan.totals.resolved(),
-                    plan.totals.total
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    " Task Graph: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Style::default().fg(if current > waves.len() {
+                Span::styled(
+                    format!("{} [{}] ", plan.title, plan.status),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled(
+                    format!("· {}", model::plan_short(&plan.plan_id)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(Span::styled(
+                status_line,
+                Style::default().fg(if settled_header {
                     Color::Green
                 } else {
                     Color::Yellow
                 }),
-            ),
-        ])),
+            )),
+            Line::from(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]),
         rows[0],
     );
     if plan.tasks.is_empty() {
@@ -592,16 +762,55 @@ fn draw_dag_v2(app: &App, frame: &mut Frame, area: Rect) {
             last.1.extend(merged);
         }
     }
-    let constraints = shown
-        .iter()
-        .map(|_| Constraint::Percentage((100 / shown.len().max(1)) as u16))
-        .collect::<Vec<_>>();
-    let columns = Layout::horizontal(constraints).split(rows[1]);
-    for (column, (wave_no, wave)) in columns.iter().zip(shown.iter()) {
-        let is_current = *wave_no == current && current <= waves.len();
-        let settled = wave
+    let overflow = waves.len() > DAG_MAX_COLUMNS;
+
+    // Node-graph layout (OmO task-graph wireframe): one column per wave with
+    // `Wave k` + `(done/total …)` headers, boxed cards stacked underneath,
+    // and orthogonal dependency edges routed through the gutters. Cards are
+    // ordered by the mean row of their placed dependencies so fan-outs stay
+    // tight; edges only paint blank cells and pass behind cards.
+    let graph = rows[1];
+    let column_w = graph.width / shown.len().max(1) as u16;
+    let card_w = column_w.saturating_sub(DAG_MIN_GUTTER).clamp(12, 24);
+    let inner_w = card_w.saturating_sub(2) as usize;
+    let pitch = DAG_CARD_H + 1;
+    let mut card_at: HashMap<&str, (u16, u16)> = HashMap::new();
+    let mut center_y: HashMap<&str, u16> = HashMap::new();
+    let mut color_of: HashMap<&str, Color> = HashMap::new();
+    for wave in shown.iter_mut().skip(1) {
+        let mut keyed: Vec<(u64, usize, &Task)> = wave
+            .1
             .iter()
-            .all(|task| matches!(task.status.as_str(), "done" | "cancelled"));
+            .enumerate()
+            .map(|(slot, task)| {
+                let anchors: Vec<u64> = task
+                    .depends_on
+                    .iter()
+                    .filter_map(|dep| center_y.get(dep.as_str()).copied().map(u64::from))
+                    .collect();
+                let key = if anchors.is_empty() {
+                    u64::MAX
+                } else {
+                    anchors.iter().sum::<u64>() / anchors.len() as u64
+                };
+                (key, slot, *task)
+            })
+            .collect();
+        keyed.sort_by_key(|(key, slot, _)| (*key, *slot));
+        wave.1 = keyed.into_iter().map(|(_, _, task)| task).collect();
+    }
+    for (index, (wave_no, wave)) in shown.iter().enumerate() {
+        let x = graph.x + index as u16 * column_w;
+        let is_current = *wave_no == current && current <= waves.len();
+        let resolved = wave
+            .iter()
+            .filter(|task| matches!(task.status.as_str(), "done" | "cancelled"))
+            .count();
+        let settled = resolved == wave.len();
+        let wave_running = wave
+            .iter()
+            .filter(|task| matches!(task.status.as_str(), "executing" | "reporting"))
+            .count();
         let title_color = if is_current {
             Color::Yellow
         } else if settled {
@@ -609,18 +818,126 @@ fn draw_dag_v2(app: &App, frame: &mut Frame, area: Rect) {
         } else {
             Color::DarkGray
         };
-        let title = if shown.len() == DAG_MAX_COLUMNS && waves.len() > DAG_MAX_COLUMNS && *wave_no == DAG_MAX_COLUMNS {
-            format!(" w{}+ · {} ", wave_no, wave.len())
+        let name = if overflow && *wave_no == DAG_MAX_COLUMNS {
+            format!("Wave {wave_no}+")
         } else {
-            format!(" w{} · {} ", wave_no, wave.len())
+            format!("Wave {wave_no}")
         };
-        let items: Vec<ListItem> = wave.iter().map(|task| dag_card(task, plan, false)).collect();
-        let mut list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(Span::styled(title, Style::default().fg(title_color))));
-        if is_current {
-            list = list.highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        let subtitle = if overflow && *wave_no == DAG_MAX_COLUMNS {
+            format!("({})", wave.len())
+        } else if settled {
+            format!("({resolved}/{} done ✓)", wave.len())
+        } else if wave_running > 0 {
+            format!("({resolved}/{} done · {wave_running} running)", wave.len())
+        } else {
+            format!("({resolved}/{} done)", wave.len())
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    name,
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(subtitle, Style::default().fg(title_color))),
+            ]),
+            Rect {
+                x,
+                y: graph.y,
+                width: column_w,
+                height: 2,
+            },
+        );
+        for (slot, task) in wave.iter().enumerate() {
+            let y = graph.y + 3 + slot as u16 * pitch;
+            if y + DAG_CARD_H > graph.bottom() {
+                break;
+            }
+            card_at.insert(task.task_id.as_str(), (x, y));
+            center_y.insert(task.task_id.as_str(), y + DAG_CARD_H / 2);
+            color_of.insert(task.task_id.as_str(), task_color(&task.status));
+            let lines = dag_card_lines(task, &models, inner_w, &card_at);
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::bordered().border_style(Style::default().fg(task_color(&task.status))),
+                ),
+                Rect {
+                    x,
+                    y,
+                    width: card_w,
+                    height: DAG_CARD_H,
+                },
+            );
         }
-        frame.render_widget(list, *column);
+    }
+
+    // Dependency edges: one wire per (dep → task) pair whose cards both fit
+    // on screen; a source with several targets fans into successive gutter
+    // lanes, and each wire takes the dep's status color.
+    let lane_span = column_w.saturating_sub(card_w).saturating_sub(2).max(1);
+    let mut lane_use: HashMap<&str, u16> = HashMap::new();
+    for wave in &shown {
+        for task in &wave.1 {
+            for dep in &task.depends_on {
+                let (Some(&(sx, sy)), Some(&(tx, ty))) = (
+                    card_at.get(dep.as_str()),
+                    card_at.get(task.task_id.as_str()),
+                ) else {
+                    continue;
+                };
+                if sx >= tx {
+                    continue;
+                }
+                let used = lane_use.entry(dep.as_str()).or_insert(0);
+                let lane = sx + card_w + 1 + (*used % lane_span);
+                *used += 1;
+                draw_edge(
+                    frame.buffer_mut(),
+                    graph,
+                    sx + card_w,
+                    sy + DAG_CARD_H / 2,
+                    lane,
+                    tx,
+                    ty + DAG_CARD_H / 2,
+                    Style::default().fg(color_of[dep.as_str()]),
+                );
+            }
+        }
+    }
+
+    if !live.is_empty() {
+        let items: Vec<ListItem> = live
+            .iter()
+            .take(3)
+            .map(|task| {
+                let model = task
+                    .assignee
+                    .as_ref()
+                    .and_then(|assignee| models.get(assignee))
+                    .map(|m| format!(" · {m}"))
+                    .unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", task_icon(&task.status)),
+                        Style::default().fg(task_color(&task.status)),
+                    ),
+                    Span::styled(
+                        format!("{} · {}", task_short(&task.task_id), task.status),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(model, Style::default().fg(Color::Gray)),
+                ]))
+            })
+            .collect();
+        frame.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" live ({}) ", live.len())),
+            ),
+            rows[2],
+        );
     }
 }
 
@@ -854,7 +1171,7 @@ mod tests {
                 .join("b1.json"),
             r#"{"version":2,"planId":"b1","title":"dag plan","status":"active","createdAt":1,"tasks":[
                 {"taskId":"task-a","title":"root","status":"done","updatedAt":10,"dependsOn":[]},
-                {"taskId":"task-b","title":"fan left","status":"executing","updatedAt":20,"dependsOn":["task-a"]},
+                {"taskId":"task-b","title":"fan left","status":"executing","updatedAt":20,"assignee":"w1","dependsOn":["task-a"]},
                 {"taskId":"task-c","title":"fan right","status":"ready","updatedAt":30,"dependsOn":["task-a"]},
                 {"taskId":"task-d","title":"sink","status":"pending","updatedAt":40,"dependsOn":["task-b","task-c"]}
             ]}"#,
@@ -868,12 +1185,32 @@ mod tests {
         );
         app.handle_key(ratatui::crossterm::event::KeyCode::Char('d'));
         let frame = render(&mut app, 160, 40);
-        assert!(frame.contains("wave 2/3"), "header shows the live wave");
-        assert!(frame.contains("← a ·"), "fan tail lists its dep then the age tail");
-        assert!(frame.contains("← b,c"), "sink tail lists both deps");
-        assert!(frame.contains("▶"), "executing motion glyph");
-        assert!(frame.contains("w1 · 1"), "first wave column title");
+        if let Ok(path) = std::env::var("COOP_BOARD_DUMP") {
+            fs::write(path, &frame).expect("dump");
+        }
+        assert!(frame.contains("Task Graph:"), "wireframe title bar");
+        assert!(
+            frame.contains("wave 2/3 · 1/4 done · 1 running"),
+            "status line leads with the live wave"
+        );
+        assert!(frame.contains("Wave 1"), "wave column header");
+        assert!(frame.contains("(1/1 done ✓)"), "settled wave subtitle");
+        assert!(
+            frame.contains("(0/2 done · 1 running)"),
+            "live wave subtitle"
+        );
+        assert!(frame.contains("──>"), "flat dependency edge into a card");
+        assert!(frame.contains("└"), "elbow edge turning up into a card");
+        assert!(
+            frame.contains("→ w1 · glm-5.3"),
+            "card resolves the assignee's model from the fleet"
+        );
+        assert!(
+            frame.contains("live (1)"),
+            "bottom ticker of in-flight tasks"
+        );
         assert!(frame.contains("dag plan"), "plan title in the header");
+        assert!(frame.contains("▶"), "executing motion glyph in the ticker");
         let _ = fs::remove_dir_all(&dir);
     }
 }
