@@ -471,7 +471,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       const entries = await service.listNodesV2(agent, { ...(args.unbound === true ? { unboundOnly: true } : {}) })
       return {
         count: entries.length,
-        detail: entries.map(entry => `${entry.sessionId}: ${entry.roles.join('+')} [${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}]`),
+        detail: entries.map(entry => `${entry.sessionId}: ${entry.roles.join('+')} [${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}]${entry.meta?.contextPct === undefined ? '' : ` · ctx ${Math.round(entry.meta.contextPct * 100)}%`}`),
       }
     },
   }))
@@ -545,9 +545,10 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
           masters: { type: 'integer', required: true },
           ownNodes: { type: 'integer', required: true },
           unbound: { type: 'integer', required: true },
+          detail: { type: 'array', items: { type: 'string' }, description: 'Per-node line: sessionId, roles, bind state, context occupancy.' },
         },
       },
-      render: (_args, value) => textOut(`${value.self ?? 'unregistered'} · masters: ${String(value.masters)} · your nodes: ${String(value.ownNodes)} · unbound: ${String(value.unbound)}`),
+      render: (_args, value) => textOut(`${value.self ?? 'unregistered'} · masters: ${String(value.masters)} · your nodes: ${String(value.ownNodes)} · unbound: ${String(value.unbound)}${(value.detail ?? []).length === 0 ? '' : `\n${(value.detail ?? []).join('\n')}`}`),
     },
     async execute(_args, exec) {
       const agent = needAgent(exec)
@@ -559,6 +560,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
         masters: status.masters.length,
         ownNodes: status.own.length,
         unbound: status.unbound,
+        detail: status.own.map(entry => `${entry.sessionId}: ${entry.roles.join('+')}${entry.meta?.contextPct === undefined ? '' : ` · ctx ${Math.round(entry.meta.contextPct * 100)}%`}`),
       }
     },
   }))
@@ -684,6 +686,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       dependsOn: { type: 'array', description: 'Upstream task ids that must be done first.', items: { type: 'string' } },
       executor: { type: 'string', enum: ['inline', 'subagent'], description: 'Executor style; subagent delegates the task spec to a spawned sub-agent.' },
       skills: { type: 'array', description: 'Skills an assigned worker must cover.', items: { type: 'string' } },
+      assigneeSessionId: { type: 'string', description: 'Pin this task to one bound worker session id (master-designated assignment; the scheduler still waits for that worker to be idle).' },
       softDeadlineMs: { type: 'integer', description: 'Informational soft deadline in ms from first assignment.' },
       hardDeadlineMs: { type: 'integer', description: 'Hard deadline in ms from first assignment; past due the task blocks.' },
     },
@@ -704,6 +707,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
           ...(args.dependsOn === undefined ? {} : { dependsOn: args.dependsOn }),
           ...(args.executor === undefined ? {} : { executor: args.executor }),
           ...(args.skills === undefined ? {} : { skills: args.skills }),
+          ...(args.assigneeSessionId === undefined ? {} : { pinnedAssignee: args.assigneeSessionId }),
           ...(args.softDeadlineMs === undefined && args.hardDeadlineMs === undefined
             ? {}
             : {
@@ -731,6 +735,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       spec: { type: 'string', description: 'New task brief.' },
       executor: { type: 'string', enum: ['inline', 'subagent'], description: 'New executor style.' },
       skills: { type: 'array', description: 'New skill demands.', items: { type: 'string' } },
+      assigneeSessionId: { type: 'string', description: 'Pin to a bound worker session id, or pass an empty string to clear the pin (steers the next scheduler assignment).' },
     },
     output: {
       schema: {
@@ -748,6 +753,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
           ...(args.spec === undefined ? {} : { spec: args.spec }),
           ...(args.executor === undefined ? {} : { executor: args.executor }),
           ...(args.skills === undefined ? {} : { skills: args.skills }),
+          ...(args.assigneeSessionId === undefined ? {} : { pinnedAssignee: args.assigneeSessionId }),
         })
         return { taskId: task.taskId, status: task.status }
       } catch (error) {

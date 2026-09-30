@@ -194,8 +194,18 @@ export interface CoopV2RegistryEntry {
   heartbeatAt: number
   /** Skills this node declares; the scheduler matches task skill demands against them. */
   skills?: string[]
-  /** Optional registration metadata; `model` is the LlmAdapter route string, `paneId` self-reports a herdr pane. */
-  meta?: { model?: string; provider?: string; pid?: number; host?: string; paneId?: string; spawn?: string }
+  /** Optional registration metadata; `context*` fields carry last-reported context occupancy (token-meter). */
+  meta?: {
+    model?: string
+    provider?: string
+    pid?: number
+    host?: string
+    paneId?: string
+    spawn?: string
+    contextPct?: number
+    contextTokens?: number
+    contextWindow?: number
+  }
 }
 
 /** On-disk shape of `.dsh/coop/v2/registry.json` and the global any-scope v2 table. */
@@ -256,6 +266,8 @@ export interface CoopV2Task {
   dependsOn: string[]
   /** Bound worker session currently owning the task. */
   assignee?: string
+  /** Master-designated worker session id; when set, the scheduler only assigns this task to that worker. */
+  pinnedAssignee?: string
   /** Worktree directory the task runs in, once one is allocated. */
   worktreeId?: string
   /** Executor style the task declares; subagent arrives with P3. */

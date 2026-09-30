@@ -41,6 +41,7 @@ import {
   CoopError,
   PlanId as brandPlanId,
   canCommunicate,
+  contextPctOf,
   coopRoot,
   mintMasterId,
   normalizeCwd,
@@ -95,6 +96,8 @@ export interface Config {
   maxReviewers?: number
   /** v2 per-master limit on concurrently assigned+executing tasks across plans. */
   maxParallelTasks?: number
+  /** v2 context-occupancy ceiling (0..1): workers at/above it schedule last and, at `maxWorkers`, get recycled (default 0.65). */
+  workerContextCeilingPct?: number
   /** v2 whether the master may verify its own tasks when no reviewer is bound (§12.4; default off). */
   allowSelfReview?: boolean
   /** v2 rework rounds before a task escalates to blocked (§5.2). */
@@ -132,6 +135,7 @@ export const Config: z<Config> = z.object({
   maxWorkers: z.number(),
   maxReviewers: z.number(),
   maxParallelTasks: z.number(),
+  workerContextCeilingPct: z.number(),
   allowSelfReview: z.boolean(),
   maxReworkAttempts: z.number(),
   memoryInjectTopK: z.number(),
@@ -154,6 +158,9 @@ declare module '@deepseek-ai/cordis' {
 
 /** Terminal statuses accepting no further transitions except idempotent re-abort. */
 const TERMINAL_STATUSES: ReadonlySet<PlanStatus> = new Set(['done', 'closed', 'aborted'])
+
+/** Minimum dwell between context-ceiling worker recycles for one master. */
+const WORKER_RECYCLE_COOLDOWN_MS = 60_000
 
 /**
  * Apply lazy watchdog transitions to one loaded plan. Executing plans whose
@@ -1007,6 +1014,9 @@ export class CoopService extends Service {
   /** Per-session throttle behind v2 heartbeats; mirrors the v1 map's cadence. */
   private readonly lastTouchV2 = new Map<string, number>()
 
+  /** Per-master throttle behind context-ceiling worker recycling. */
+  private readonly lastRecycleV2 = new Map<string, number>()
+
   /** Registry model in force for this deployment. */
   get mode(): 'v1' | 'v2' {
     return this.resolved.mode
@@ -1089,9 +1099,41 @@ export class CoopService extends Service {
     if (now - last < Math.min(this.resolved.staleMs / 4, 30_000)) return
     this.lastTouchV2.set(sessionId, now)
     try {
-      await store.touchHeartbeatV2(store.v2RegistryPath(await this.v2RootOf(agent)), sessionId, now)
+      await store.touchHeartbeatV2(store.v2RegistryPath(await this.v2RootOf(agent)), sessionId, now, this.contextMetaOf(agent))
     } catch {
       // A missing/corrupt registry surfaces on the next real operation.
+    }
+  }
+
+  /**
+   * Context-occupancy meta for this node's registry entry, read from the
+   * optional token-meter `contextPressure` session projection (same-process
+   * fold over this session's log). An absent seam or unknown numbers yield
+   * an empty patch — the registry never records a guess.
+   * @param agent - heartbeating live agent.
+   * @returns the meta patch to merge, possibly empty.
+   */
+  private contextMetaOf(agent: Agent): { contextPct?: number; contextTokens?: number; contextWindow?: number } {
+    // Read through an opaque record: the session-projection service may or
+    // may not be mounted in this process, and its Context augmentation
+    // declares the member non-optional even when it is absent at runtime.
+    const seam = (this.ctx as unknown as Record<string, unknown>)['sessionProjections'] as
+      | { snapshot(session: object, keys?: readonly string[]): { values: Record<string, unknown> } }
+      | undefined
+    if (seam === undefined) return {}
+    try {
+      const view = seam.snapshot(agent.session, ['contextPressure']).values['contextPressure']
+      const pct = contextPctOf(view)
+      if (pct === undefined) return {}
+      const pressure = view as { projectedTokens?: number; pressureTokens?: number; contextWindow?: number }
+      const used = pressure.projectedTokens ?? pressure.pressureTokens
+      return {
+        contextPct: Math.round(pct * 1000) / 1000,
+        ...(used === undefined ? {} : { contextTokens: used }),
+        ...(pressure.contextWindow === undefined ? {} : { contextWindow: pressure.contextWindow }),
+      }
+    } catch {
+      return {}
     }
   }
 
@@ -1471,18 +1513,23 @@ export class CoopService extends Service {
        * Single-writer per master (the acting process); each assignment commits
        * under its plan's writer lock and the busy set is rebuilt from a fresh scan
        * of every active plan, so `maxParallelTasks` holds across plans. A worker
-       * without declared skills only receives tasks with no skill demand.
-       * @param root - absolute v2 root.
-       * @param masterId - owning master id.
-       * @returns how many tasks were assigned.
-       */
+       * without declared skills only receives tasks with no skill demand. A
+       * master-pinned task (`pinnedAssignee`) only ever goes to its designated
+       * worker; otherwise the lowest-context free worker wins, and when every
+       * bound worker sits at/above `workerContextCeilingPct` while the master
+       * already holds `maxWorkers`, the hottest idle one is recycled for a
+         * fresh replacement (§4.4 spawn transport).
+         * @param root - absolute v2 root.
+         * @param masterId - owning master id.
+         * @returns how many tasks were assigned.
+         */
   private async scheduleV2(root: string, masterId: string): Promise<number> {
     const now = Date.now()
-    const entries = await this.v2Tables(root)
-    const workers = entries.filter(entry => entry.bindState === 'bound'
+    const boundWorkersOf = (): Promise<CoopV2RegistryEntry[]> => this.v2Tables(root).then(entries => entries.filter(entry => entry.bindState === 'bound'
           && String(entry.masterId) === masterId
           && entry.roles.includes('worker')
-          && this.isFreshV2(entry, now))
+          && this.isFreshV2(entry, Date.now())))
+    let workers = await boundWorkersOf()
     if (workers.length === 0) return 0
     const dir = store.v2PlansDir(root, masterId)
     let names: string[]
@@ -1497,6 +1544,7 @@ export class CoopService extends Service {
     const usedWorktrees = new Set<string>()
     const wtEntries = (await store.readWtRegistry(store.wtRegistryPath(root)))?.entries ?? []
     let inflight = 0
+    let ready = 0
     for (const planId of planIds) {
       const plan = await store.readV2PlanFile(store.v2PlanPath(root, masterId, planId))
       if (plan?.status !== 'active') continue
@@ -1505,9 +1553,25 @@ export class CoopService extends Service {
           busy.add(task.assignee)
           inflight++
         }
+        if (task.status === 'ready') ready++
         if (task.worktreeId !== undefined && task.status !== 'done' && task.status !== 'cancelled') {
           usedWorktrees.add(task.worktreeId)
         }
+      }
+    }
+    // Context-ceiling recycling: when every bound fresh worker reports at
+    // or above the ceiling, the master already holds `maxWorkers` of them,
+    // and ready work is still waiting, the hottest idle worker is released
+    // and a fresh replacement spawned — a saturated context never strands a
+    // ready task while capacity could be rotated instead.
+    if (ready > 0
+        && workers.length >= this.resolved.maxWorkers
+        && workers.length > 0
+        && workers.every(worker => (worker.meta?.contextPct ?? 0) >= this.resolved.workerContextCeilingPct)
+        && now - (this.lastRecycleV2.get(masterId) ?? 0) >= WORKER_RECYCLE_COOLDOWN_MS) {
+      this.lastRecycleV2.set(masterId, now)
+      if (await this.recycleSaturatedWorkerV2(root, masterId, workers, busy)) {
+        workers = await boundWorkersOf()
       }
     }
     let assigned = 0
@@ -1523,8 +1587,17 @@ export class CoopService extends Service {
           if (inflight + picked.length >= this.resolved.maxParallelTasks) break
           const free = workers.filter(worker => !busy.has(worker.sessionId)
                 && task.skills.every(skill => (worker.skills ?? []).includes(skill)))
-          const match = free[0]
+          // A master-pinned task only ever goes to its designated worker;
+          // otherwise the lowest-context free worker wins, so saturated
+          // contexts sink in scheduling priority.
+          const pool = task.pinnedAssignee === undefined
+            ? [...free].sort((left, right) => (left.meta?.contextPct ?? 0) - (right.meta?.contextPct ?? 0))
+            : free.filter(worker => worker.sessionId === task.pinnedAssignee)
+          const match = pool[0]
           if (match === undefined) continue
+          // Claim inside the plan pass too, so a second ready task of the
+          // same plan never lands on the worker this pass just filled.
+          busy.add(match.sessionId)
           let worktreeId = task.worktreeId
           if (worktreeId === undefined) {
             const freeWorktree = wtEntries.find(candidate => candidate.planId === planId
@@ -1564,6 +1637,79 @@ export class CoopService extends Service {
       }
     }
     return assigned
+  }
+
+  /**
+       * Validate that one session id is a live bound worker of this master,
+       * usable as a task's `pinnedAssignee`.
+       * @param root - absolute v2 root.
+       * @param masterId - owning master id.
+       * @param sessionId - candidate worker session id.
+       */
+  private async assertPinnedWorkerV2(root: string, masterId: string, sessionId: string): Promise<void> {
+    const now = Date.now()
+    const entry = (await this.v2Tables(root)).find(candidate => candidate.sessionId === sessionId)
+    if (entry === undefined
+        || !entry.roles.includes('worker')
+        || entry.bindState !== 'bound'
+        || String(entry.masterId) !== masterId
+        || !this.isFreshV2(entry, now)) {
+      throw new CoopError(`pinned worker "${sessionId}" is not a live bound worker of this master`, 'COOP_NO_WORKER')
+    }
+  }
+
+  /**
+       * Release the highest-context idle worker and spawn a fresh replacement
+       * (context-ceiling recycling). The release always precedes the spawn so
+       * the master's worker capacity is never exceeded; when the master's own
+       * agent is not live in this process or the spawn fails, the master gets
+       * a node signal instead and recycling retries after the cooldown.
+       * @param root - absolute v2 root.
+       * @param masterId - owning master id.
+       * @param workers - the master's fresh bound workers (all at/above the ceiling).
+       * @param busy - session ids currently holding a task.
+       * @returns whether a replacement worker was spawned and bound.
+       */
+  private async recycleSaturatedWorkerV2(
+    root: string,
+    masterId: string,
+    workers: CoopV2RegistryEntry[],
+    busy: Set<string>,
+  ): Promise<boolean> {
+    const idle = workers.filter(worker => !busy.has(worker.sessionId))
+    const victim = [...idle].sort((left, right) => (right.meta?.contextPct ?? 0) - (left.meta?.contextPct ?? 0))[0]
+    const masterEntry = (await this.v2Tables(root))
+      .find(entry => entry.roles.includes('master') && String(entry.masterId) === masterId)
+    if (victim === undefined || masterEntry === undefined) return false
+    const now = Date.now()
+    await store.mutateV2Registry(store.v2RegistryPath(root), (current) => {
+      const entries = current?.entries ?? []
+      const target = entries.find(candidate => candidate.sessionId === victim.sessionId)
+      if (target === undefined || target.bindState !== 'bound' || String(target.masterId) !== masterId) {
+        return { value: undefined }
+      }
+      const { masterId: _dropped, ...rest } = target
+      return {
+        next: { version: 2, entries: entries.map(candidate => candidate.sessionId === victim.sessionId ? { ...rest, bindState: 'unbound', updatedAt: now } : candidate) },
+        value: undefined,
+      }
+    })
+    const pctLabel = victim.meta?.contextPct === undefined ? '' : ` (${Math.round(victim.meta.contextPct * 100)}% context)`
+    await this.deliverV2(masterId, victim.sessionId, root, `context ceiling reached${pctLabel} — released for recycling; you are unbound and visible to every master again`)
+    const masterAgent = this.ctx.agents.get(SessionId(masterEntry.sessionId))
+    if (masterAgent === undefined) {
+      await this.deliverV2(masterId, masterEntry.sessionId, root, `worker ${victim.sessionId} hit the context ceiling${pctLabel} and was released, but no live master agent can spawn a replacement here — call coop_worker_create(role="worker")`)
+      return false
+    }
+    try {
+      await this.createNodeV2(masterAgent, { role: 'worker' })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await this.deliverV2(masterId, masterEntry.sessionId, root, `worker ${victim.sessionId} was released at the context ceiling but spawning a replacement failed: ${message}`)
+      return false
+    }
+    await this.deliverV2(masterId, masterEntry.sessionId, root, `worker ${victim.sessionId} hit the context ceiling${pctLabel} — released and a fresh replacement worker was spawned`)
+    return true
   }
 
   /**
@@ -1763,9 +1909,13 @@ export class CoopService extends Service {
       skills?: string[]
       worktreeId?: string
       deadlines?: { softMs?: number; hardMs?: number }
+      pinnedAssignee?: string
     },
   ): Promise<CoopV2Task> {
     const { masterId, root } = await this.requireV2Master(agent)
+    if (req.pinnedAssignee !== undefined) {
+      await this.assertPinnedWorkerV2(root, String(masterId), req.pinnedAssignee)
+    }
     const sessionId = String(agent.session.id)
     const task = await store.mutateV2Plan(
       store.v2PlanPath(root, String(masterId), planId),
@@ -1796,6 +1946,7 @@ export class CoopService extends Service {
           executor: req.executor ?? 'inline',
           skills: req.skills ?? [],
           ...(req.worktreeId === undefined ? {} : { worktreeId: req.worktreeId }),
+          ...(req.pinnedAssignee === undefined ? {} : { pinnedAssignee: req.pinnedAssignee }),
           ...(req.deadlines === undefined ? {} : { deadlines: req.deadlines }),
           attempts: 0,
           createdAt: now,
@@ -1822,16 +1973,19 @@ export class CoopService extends Service {
        * @param agent - updating live master.
        * @param planId - owning plan.
        * @param taskId - target task.
-       * @param req - optional title, spec, executor style, and skill demands.
+       * @param req - optional title, spec, executor style, skill demands, and worker pin (`''` clears).
        * @returns the committed task.
        */
   async updateTaskV2(
     agent: Agent,
     planId: string,
     taskId: string,
-    req: { title?: string; spec?: string; executor?: 'inline' | 'subagent'; skills?: string[] },
+    req: { title?: string; spec?: string; executor?: 'inline' | 'subagent'; skills?: string[]; pinnedAssignee?: string },
   ): Promise<CoopV2Task> {
     const { masterId, root } = await this.requireV2Master(agent)
+    if (req.pinnedAssignee !== undefined && req.pinnedAssignee !== '') {
+      await this.assertPinnedWorkerV2(root, String(masterId), req.pinnedAssignee)
+    }
     const sessionId = String(agent.session.id)
     return store.mutateV2Plan(
       store.v2PlanPath(root, String(masterId), planId),
@@ -1843,8 +1997,15 @@ export class CoopService extends Service {
           throw new CoopError(`task "${taskId}" is "${task.status}" and locked while in flight`, 'COOP_INVALID_TRANSITION')
         }
         const now = Date.now()
+        // An empty-string pin clears the designation; any other value re-pins
+        // (validated pre-flight). The pin steers the next scheduler
+        // assignment; an already-assigned task keeps its current assignee.
+        const { pinnedAssignee: _clearedPin, ...taskWithoutPin } = task
+        const pinnedTask: CoopV2Task = req.pinnedAssignee === ''
+          ? taskWithoutPin
+          : { ...task, ...(req.pinnedAssignee === undefined ? {} : { pinnedAssignee: req.pinnedAssignee }) }
         const next: CoopV2Task = {
-          ...task,
+          ...pinnedTask,
           ...(req.title === undefined ? {} : { title: req.title }),
           ...(req.spec === undefined ? {} : { spec: req.spec }),
           ...(req.executor === undefined ? {} : { executor: req.executor }),

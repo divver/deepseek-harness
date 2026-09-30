@@ -30,6 +30,8 @@ export interface ResolvedCoopConfig {
   maxReviewers: number
   /** v2 per-master limit on concurrently assigned+executing tasks across plans. */
   maxParallelTasks: number
+  /** v2 context-occupancy ceiling (0..1): workers at/above it schedule last and, at `maxWorkers`, get recycled. */
+  workerContextCeilingPct: number
   /** v2 whether the master may verify its own tasks when no reviewer is bound (§12.4; default off). */
   allowSelfReview: boolean
   /** v2 rework rounds before a task escalates to blocked (§5.2). */
@@ -74,6 +76,7 @@ export function resolveCoopConfig(config: {
   maxWorkers?: number
   maxReviewers?: number
   maxParallelTasks?: number
+  workerContextCeilingPct?: number
   allowSelfReview?: boolean
   maxReworkAttempts?: number
   memoryInjectTopK?: number
@@ -102,6 +105,10 @@ export function resolveCoopConfig(config: {
   }
   const roleLlm = resolveRoleLlm(config.roleLlm)
   const spawnRegisterTimeoutMs = positive(config.spawnRegisterTimeoutMs, 'spawnRegisterTimeoutMs') ?? 30_000
+  const workerContextCeilingPct = config.workerContextCeilingPct
+  if (workerContextCeilingPct !== undefined && (typeof workerContextCeilingPct !== 'number' || !Number.isFinite(workerContextCeilingPct) || workerContextCeilingPct <= 0 || workerContextCeilingPct > 1)) {
+    throw new CoopError(`config workerContextCeilingPct must be a number in (0, 1], got ${String(workerContextCeilingPct)}`, 'COOP_CONFIG_UNSUPPORTED')
+  }
   return {
     mode: config.mode ?? 'v1',
     defaultReviewLevel: config.defaultReviewLevel ?? 'standard',
@@ -118,6 +125,7 @@ export function resolveCoopConfig(config: {
     maxWorkers: positive(config.maxWorkers, 'maxWorkers') ?? 4,
     maxReviewers: positive(config.maxReviewers, 'maxReviewers') ?? 2,
     maxParallelTasks: positive(config.maxParallelTasks, 'maxParallelTasks') ?? 3,
+    workerContextCeilingPct: workerContextCeilingPct ?? 0.65,
     allowSelfReview: config.allowSelfReview ?? false,
     maxReworkAttempts: positive(config.maxReworkAttempts, 'maxReworkAttempts') ?? 3,
     memoryInjectTopK: positive(config.memoryInjectTopK, 'memoryInjectTopK') ?? 8,
@@ -134,6 +142,23 @@ export function resolveCoopConfig(config: {
 /** Brand a string as a coop plan id. */
 export function PlanId(id: string): PlanId {
   return id as PlanId
+}
+
+/**
+ * Occupancy ratio in `0..1` from one token-meter `contextPressure` view
+ * (`projectedTokens`/`pressureTokens` over `contextWindow`). Unknown or
+ * partial views — seam absent, no provider sample yet, no advertised window —
+ * yield `undefined`; callers must treat that as "unknown", never zero.
+ * @param view - the projection's wire value, or anything else.
+ * @returns the clamped ratio, or `undefined` when it cannot be computed.
+ */
+export function contextPctOf(view: unknown): number | undefined {
+  if (typeof view !== 'object' || view === null) return undefined
+  const pressure = view as { projectedTokens?: unknown; pressureTokens?: unknown; contextWindow?: unknown }
+  const used = pressure.projectedTokens ?? pressure.pressureTokens
+  if (typeof used !== 'number' || !Number.isFinite(used)) return undefined
+  if (typeof pressure.contextWindow !== 'number' || !Number.isFinite(pressure.contextWindow) || pressure.contextWindow <= 0) return undefined
+  return Math.min(1, Math.max(0, used / pressure.contextWindow))
 }
 
 /** Error raised at the coop domain boundary. */

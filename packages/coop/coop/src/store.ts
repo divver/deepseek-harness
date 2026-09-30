@@ -481,14 +481,29 @@ export async function mutateV2Registry<T>(
  * @param path - v2 registry file path.
  * @param sessionId - owning session.
  * @param now - epoch ms to stamp.
+ * @param meta - optional partial meta patch merged into the entry (e.g. context occupancy).
  */
-export async function touchHeartbeatV2(path: string, sessionId: string, now: number): Promise<void> {
+export async function touchHeartbeatV2(
+  path: string,
+  sessionId: string,
+  now: number,
+  meta?: { contextPct?: number; contextTokens?: number; contextWindow?: number },
+): Promise<void> {
   await mutateV2Registry(path, (current) => {
     if (current === undefined) return { value: undefined }
     const touched = current.entries.some(entry => entry.sessionId === sessionId)
     if (!touched) return { value: undefined }
     return {
-      next: { version: 2, entries: current.entries.map(entry => entry.sessionId === sessionId ? { ...entry, heartbeatAt: now } : entry) },
+      next: {
+        version: 2,
+        entries: current.entries.map(entry => entry.sessionId === sessionId
+          ? {
+            ...entry,
+            heartbeatAt: now,
+            ...(meta === undefined || Object.keys(meta).length === 0 ? {} : { meta: { ...entry.meta, ...meta } }),
+          }
+          : entry),
+      },
       value: undefined,
     }
   })
