@@ -32,8 +32,10 @@ export interface ResolvedCoopConfig {
   maxParallelTasks: number
   /** v2 context-occupancy ceiling (0..1): workers at/above it schedule last and, at `maxWorkers`, get recycled. */
   workerContextCeilingPct: number
-  /** v2 whether the master may verify its own tasks when no reviewer is bound (§12.4; default off). */
+  /** v2 let the master self-review even while a reviewer is bound; no reviewer bound → master self-gates (§12.4). */
   allowSelfReview: boolean
+  /** v2 auto-approve without a reviewer: submit activates the plan; only a report from the master's own session passes immediately. */
+  autoApproveNoReviewer: boolean
   /** v2 rework rounds before a task escalates to blocked (§5.2). */
   maxReworkAttempts: number
   /** v2 memory records injected into the coop:memory prompt section (§12.3 recency top-K). */
@@ -78,6 +80,7 @@ export function resolveCoopConfig(config: {
   maxParallelTasks?: number
   workerContextCeilingPct?: number
   allowSelfReview?: boolean
+  autoApproveNoReviewer?: boolean
   maxReworkAttempts?: number
   memoryInjectTopK?: number
   memoryRetainEntries?: number
@@ -127,6 +130,7 @@ export function resolveCoopConfig(config: {
     maxParallelTasks: positive(config.maxParallelTasks, 'maxParallelTasks') ?? 3,
     workerContextCeilingPct: workerContextCeilingPct ?? 0.65,
     allowSelfReview: config.allowSelfReview ?? false,
+    autoApproveNoReviewer: config.autoApproveNoReviewer ?? false,
     maxReworkAttempts: positive(config.maxReworkAttempts, 'maxReworkAttempts') ?? 3,
     memoryInjectTopK: positive(config.memoryInjectTopK, 'memoryInjectTopK') ?? 8,
     memoryRetainEntries: positive(config.memoryRetainEntries, 'memoryRetainEntries') ?? 256,

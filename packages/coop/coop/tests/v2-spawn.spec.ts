@@ -114,7 +114,7 @@ describe('node spawn', () => {
     const { resolveCoopConfig } = await import('../src/runtime.ts')
     expect(resolveCoopConfig({}).spawnLayout).toBe('columns')
     expect(resolveCoopConfig({ spawnLayout: 'right' }).spawnLayout).toBe('right')
-    expect(() => resolveCoopConfig({ spawnLayout: 'grid' as never })).toThrowError(/spawnLayout/)
+    expect(() => resolveCoopConfig({ spawnLayout: 'grid' })).toThrowError(/spawnLayout/)
   })
 
   it('planColumnSplit arranges clean full-height role columns', async () => {

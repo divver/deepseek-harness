@@ -98,8 +98,10 @@ export interface Config {
   maxParallelTasks?: number
   /** v2 context-occupancy ceiling (0..1): workers at/above it schedule last and, at `maxWorkers`, get recycled (default 0.65). */
   workerContextCeilingPct?: number
-  /** v2 whether the master may verify its own tasks when no reviewer is bound (§12.4; default off). */
+  /** v2 let the master self-review even while a reviewer is bound; no reviewer bound → master self-gates (§12.4). */
   allowSelfReview?: boolean
+  /** v2 auto-approve without a reviewer: submit activates the plan; only a report from the master's own session passes (default off). */
+  autoApproveNoReviewer?: boolean
   /** v2 rework rounds before a task escalates to blocked (§5.2). */
   maxReworkAttempts?: number
   /** v2 memory records injected into the coop:memory prompt section (§12.3). */
@@ -137,6 +139,7 @@ export const Config: z<Config> = z.object({
   maxParallelTasks: z.number(),
   workerContextCeilingPct: z.number(),
   allowSelfReview: z.boolean(),
+  autoApproveNoReviewer: z.boolean(),
   maxReworkAttempts: z.number(),
   memoryInjectTopK: z.number(),
   memoryRetainEntries: z.number(),
@@ -1286,6 +1289,12 @@ export class CoopService extends Service {
       bindState: result.entry.bindState,
       updatedAt: now,
     })
+    // A worker joining (or re-registering with new skills) can unblock ready
+    // tasks that no earlier pass could place — the wake-up push for assignment
+    // rides on registration itself instead of waiting for a master mutation.
+    if (result.entry.roles.includes('worker') && result.entry.bindState === 'bound' && result.masterId !== undefined) {
+      await this.scheduleV2(root, result.masterId)
+    }
     return result.entry
   }
 
@@ -1388,6 +1397,9 @@ export class CoopService extends Service {
     })
     this.appendMirror(agent.session, 'coop/registry-v2', { op: 'bind', roles: bound.roles, masterId: String(bound.masterId), bindState: 'bound', updatedAt: now })
     await this.deliverV2(callerId, sessionId, root, `bound by master ${String(bound.masterId)} — you now take task signals from this master only`)
+    // A freshly bound worker may be the first eligible one: run one scheduling
+    // pass so ready tasks are assigned and delivered at bind time.
+    await this.scheduleV2(root, String(bound.masterId))
     return bound
   }
 
@@ -1625,6 +1637,7 @@ export class CoopService extends Service {
         if (picked.length === 0) return plan === current ? { value: [] } : { next: plan, value: [] }
         return { next: plan, value: picked }
       })
+      const repoRoot = (await store.readV2PlanFile(path))?.repoRoot
       for (const task of taken) {
         if (task.assignee === undefined) continue
         busy.add(task.assignee)
@@ -1632,8 +1645,14 @@ export class CoopService extends Service {
         const workOrder = task.executor === 'subagent'
           ? 'delegate the work to a subagent with the task spec as its objective, then coop_execute_report'
           : 'do the work per the spec, then coop_execute_report'
+          // Name the working root: the worker pane's own cwd is not
+          // authoritative. Files belong in the assigned worktree, or in the
+          // plan's repo root when no worktree backs the task.
+        const location = task.worktreeId !== undefined
+          ? ` in worktree ${task.worktreeId}`
+          : repoRoot === undefined ? '' : ` in repo ${repoRoot} — create all files under that root`
         await this.deliverTask(root, masterId, task.assignee, planId, masterId, task,
-          `task assigned — call coop_execute_begin(planId="${planId}", taskId="${task.taskId}"), ${workOrder}${task.worktreeId === undefined ? '' : ` in worktree ${task.worktreeId}`}`)
+          `task assigned — call coop_execute_begin(planId="${planId}", taskId="${task.taskId}"), ${workOrder}${location}`)
       }
     }
     return assigned
@@ -1792,7 +1811,9 @@ export class CoopService extends Service {
 
   /**
        * Submit a designing plan to review (master only): designing → reviewing
-       * and every fresh bound reviewer is woken (§6.3).
+       * and every fresh bound reviewer is woken (§6.3); with none bound, the
+           * master itself is woken to self-review (v1 fallback), or with
+           * `autoApproveNoReviewer` on the plan activates immediately on submit.
        * @param agent - submitting live master.
        * @param planId - plan to submit.
        * @returns the committed reviewing plan.
@@ -1802,12 +1823,31 @@ export class CoopService extends Service {
     const sessionId = String(agent.session.id)
     const now = Date.now()
     const masterIdStr = String(masterId)
+    const reviewers = (await this.v2Tables(root)).filter(entry => entry.bindState === 'bound'
+            && String(entry.masterId) === masterIdStr
+            && entry.roles.includes('reviewer')
+            && this.isFreshV2(entry, now))
+    // autoApproveNoReviewer: with no live bound reviewer, submit IS the
+    // review — the plan activates immediately (readiness recomputed,
+    // scheduler runs) instead of waking the master to gate its own DAG.
+    const auto = this.resolved.autoApproveNoReviewer && reviewers.length === 0
     const plan = await store.mutateV2Plan(
       store.v2PlanPath(root, masterIdStr, planId),
       (current): { next?: CoopV2PlanFile; value: CoopV2PlanFile } => {
         if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
         if (current.status !== 'designing') {
           throw new CoopError(`plan "${planId}" is "${current.status}", expected designing`, 'COOP_INVALID_TRANSITION')
+        }
+        if (auto) {
+          const staged: CoopV2PlanFile = {
+            ...current,
+            status: 'active',
+            history: [...current.history,
+              { time: now, sessionId, op: 'submit_review' },
+              { time: now, sessionId, op: 'plan_review pass', summary: 'auto-approved: no reviewer bound (autoApproveNoReviewer)' }],
+          }
+          const activated = recomputeReady(staged, now)
+          return { next: activated, value: activated }
         }
         const next: CoopV2PlanFile = {
           ...current,
@@ -1816,13 +1856,20 @@ export class CoopService extends Service {
         }
         return { next, value: next }
       })
-    const reviewers = (await this.v2Tables(root)).filter(entry => entry.bindState === 'bound'
-          && String(entry.masterId) === masterIdStr
-          && entry.roles.includes('reviewer')
-          && this.isFreshV2(entry, Date.now()))
+    if (auto) {
+      await this.scheduleV2(root, masterIdStr)
+      return plan
+    }
     for (const reviewer of reviewers) {
       await this.deliverPlan(root, sessionId, reviewer.sessionId, planId, masterIdStr, plan,
         `plan ready for review — call coop_plan_review(planId="${planId}", decision) after judging the DAG against the objective`)
+    }
+    if (reviewers.length === 0) {
+      // Reviewer-optional fallback: with no live bound reviewer the plan
+      // would sit in `reviewing` with no actor — wake the master itself to
+      // gate it (v1-style master↔worker mode).
+      await this.deliverPlan(root, sessionId, sessionId, planId, masterIdStr, plan,
+        `no reviewer bound — review the plan yourself: coop_plan_review(planId="${planId}", decision)`)
     }
     return plan
   }
@@ -1831,7 +1878,8 @@ export class CoopService extends Service {
        * Reviewer gate on a submitted plan (§6.3): pass → active (readiness
        * recomputed, scheduler runs); request_changes → designing for the master
        * to revise and resubmit. Gate: a reviewer bound to the owning master, or
-       * the master with `allowSelfReview` (§12.4).
+       * the master itself when no reviewer is bound (v1 fallback) or with
+       * `allowSelfReview` (§12.4).
        * @param agent - reviewing live reviewer (or self-reviewing master).
        * @param planId - plan under review.
        * @param decision - pass or request_changes.
@@ -1847,7 +1895,8 @@ export class CoopService extends Service {
     const sessionId = String(agent.session.id)
     const root = await this.v2RootOf(agent)
     const now = Date.now()
-    const own = (await this.v2Tables(root)).find(entry => entry.sessionId === sessionId)
+    const tables = await this.v2Tables(root)
+    const own = tables.find(entry => entry.sessionId === sessionId)
     if (own === undefined || !this.isFreshV2(own, now)) {
       throw new CoopError('this session holds no live v2 coop role — register first', 'COOP_NODE_NOT_FOUND')
     }
@@ -1857,8 +1906,15 @@ export class CoopService extends Service {
     }
     const isReviewer = own.roles.includes('reviewer')
     const isMaster = own.roles.includes('master')
-    if (!isReviewer && !(isMaster && this.resolved.allowSelfReview)) {
-      throw new CoopError('plan review requires a reviewer bound to this master (or allowSelfReview)', 'COOP_NOT_ASSIGNED_WORKER')
+    // Reviewer-optional fallback: with no live bound reviewer the master
+    // gates its own plan (v1-style master↔worker); allowSelfReview
+    // additionally permits self-review while reviewers are bound.
+    const hasReviewer = tables.some(entry => entry.bindState === 'bound'
+      && String(entry.masterId) === String(masterId)
+      && entry.roles.includes('reviewer')
+      && this.isFreshV2(entry, now))
+    if (!isReviewer && !(isMaster && (!hasReviewer || this.resolved.allowSelfReview))) {
+      throw new CoopError('plan review requires a reviewer bound to this master (or none bound / allowSelfReview)', 'COOP_NOT_ASSIGNED_WORKER')
     }
     const masterIdStr = String(masterId)
     const plan = await store.mutateV2Plan(
@@ -1987,7 +2043,7 @@ export class CoopService extends Service {
       await this.assertPinnedWorkerV2(root, String(masterId), req.pinnedAssignee)
     }
     const sessionId = String(agent.session.id)
-    return store.mutateV2Plan(
+    const task = await store.mutateV2Plan(
       store.v2PlanPath(root, String(masterId), planId),
       (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
         if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
@@ -2019,6 +2075,11 @@ export class CoopService extends Service {
         }
         return { next: plan, value: next }
       })
+    // A task mutation can unblock scheduling (cleared skill demands, a new pin,
+    // or a changed executor style); run one pass so ready work finds idle workers
+    // without waiting for the next master-side plan mutation.
+    await this.scheduleV2(root, String(masterId))
+    return task
   }
 
   /**
@@ -2179,12 +2240,15 @@ export class CoopService extends Service {
   /**
        * Assigned worker reports finished execution: executing → verifying, then
        * the master and every fresh bound reviewer are woken to verify and the
-       * freed worker becomes schedulable again.
+       * freed worker becomes schedulable again. With `autoApproveNoReviewer`
+       * on, only a report from the master's own session passes immediately
+       * (task done, `auto` verify record); a worker report always goes to
+       * verify — reviewer when bound, else the master (v1 fallback).
        * @param agent - reporting live worker.
        * @param planId - owning plan.
        * @param taskId - target task.
        * @param summary - what was done.
-       * @returns the committed verifying task.
+       * @returns the committed task (verifying, or done under auto-approve).
        */
   async executeReportV2(agent: Agent, planId: string, taskId: string, summary: string): Promise<CoopV2Task> {
     const sessionId = String(agent.session.id)
@@ -2223,20 +2287,67 @@ export class CoopService extends Service {
           && String(entry.masterId) === masterId
           && entry.roles.includes('reviewer')
           && this.isFreshV2(entry, now))
-    const text = `execution reported — call coop_task_verify(planId="${planId}", taskId="${taskId}", decision)`
+    // autoApproveNoReviewer only short-circuits a report made by the
+    // master's own session (gating self-reviewed work is meaningless); a
+    // worker report ALWAYS goes to verify — reviewer when bound, else the
+    // master itself (v1 fallback).
+    const auto = this.resolved.autoApproveNoReviewer && reviewers.length === 0
+      && masterEntry !== undefined && masterEntry.sessionId === sessionId
+    const text = auto
+      ? 'execution reported — auto-verified (no reviewer bound), task done'
+      : `execution reported — call coop_task_verify(planId="${planId}", taskId="${taskId}", decision)${reviewers.length === 0 ? ' (no reviewer bound — you verify)' : ''}`
     if (masterEntry !== undefined) {
       await this.deliverTask(root, sessionId, masterEntry.sessionId, planId, masterId, reported, text)
     }
     for (const reviewer of reviewers) {
       await this.deliverTask(root, sessionId, reviewer.sessionId, planId, masterId, reported, text)
     }
+    let final = reported
+    if (auto) {
+      // autoApproveNoReviewer: the report IS the verification — pass the
+      // task immediately (downstream ready, capacity freed) and tell the
+      // worker it is free for the next assignment.
+      final = await store.mutateV2Plan(
+        store.v2PlanPath(root, masterId, planId),
+        (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
+          if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+          const task = current.tasks.find(candidate => candidate.taskId === taskId)
+          if (task === undefined) throw new CoopError(`task "${taskId}" not found in plan "${planId}"`, 'COOP_TASK_NOT_FOUND')
+          if (task.status !== 'verifying') return { value: task }
+          const at = Date.now()
+          const next: CoopV2Task = {
+            ...task,
+            status: 'done',
+            updatedAt: at,
+            verify: { decision: 'pass', summary: 'auto-approved: no reviewer bound (autoApproveNoReviewer)', by: 'auto', at },
+          }
+          const staged: CoopV2PlanFile = {
+            ...current,
+            tasks: current.tasks.map(candidate => candidate.taskId === taskId ? next : candidate),
+            history: [...current.history, { time: at, sessionId, op: `task_verify ${taskId} pass`, summary: 'auto-approved: no reviewer bound' }],
+          }
+          return { next: recomputeReady(staged, at), value: next }
+        })
+      if (final.status === 'done' && final.assignee !== undefined) {
+        await this.deliverTask(root, sessionId, final.assignee, planId, masterId, final,
+          'task auto-verified (no reviewer bound) — done; you are free for the next assignment')
+      }
+      await this.recordMemory(root, masterId, {
+        time: Date.now(),
+        kind: 'task',
+        ref: `${final.taskId}@${planId}`,
+        title: final.title,
+        summary: final.report?.summary ?? 'completed',
+      })
+    }
     await this.scheduleV2(root, masterId)
-    return reported
+    return final
   }
 
   /**
        * Verify one reported task. Gate: a reviewer bound to the owning master,
-       * or the master itself when `allowSelfReview` is on (§12.4, default off).
+       * or the master itself when no reviewer is bound (v1 fallback) or with
+       * `allowSelfReview` on (§12.4, default off).
        * pass → done (downstream goes ready, capacity freed, scheduler runs);
        * request_changes → rework with `attempts` incremented and the assignee
        * re-signalled to begin again.
@@ -2258,14 +2369,22 @@ export class CoopService extends Service {
     const { plan, root } = await this.planForNode(agent, planId)
     const masterId = String(plan.masterId)
     const now = Date.now()
-    const own = (await this.v2Tables(root)).find(entry => entry.sessionId === sessionId)
+    const tables = await this.v2Tables(root)
+    const own = tables.find(entry => entry.sessionId === sessionId)
     if (own === undefined || !this.isFreshV2(own, now)) {
       throw new CoopError('this session holds no live v2 coop role — register first', 'COOP_NODE_NOT_FOUND')
     }
     const isReviewer = own.roles.includes('reviewer') && String(own.masterId) === masterId
     const isMaster = own.roles.includes('master') && String(own.masterId) === masterId
-    if (!isReviewer && !(isMaster && this.resolved.allowSelfReview)) {
-      throw new CoopError('task verification requires a reviewer bound to this master (or allowSelfReview)', 'COOP_NOT_ASSIGNED_WORKER')
+    // Reviewer-optional fallback: with no live bound reviewer the master
+    // verifies its own tasks (v1-style); allowSelfReview additionally
+    // permits self-verify while reviewers are bound (§12.4).
+    const hasReviewer = tables.some(entry => entry.bindState === 'bound'
+      && String(entry.masterId) === masterId
+      && entry.roles.includes('reviewer')
+      && this.isFreshV2(entry, now))
+    if (!isReviewer && !(isMaster && (!hasReviewer || this.resolved.allowSelfReview))) {
+      throw new CoopError('task verification requires a reviewer bound to this master (or none bound / allowSelfReview)', 'COOP_NOT_ASSIGNED_WORKER')
     }
     const verified = await store.mutateV2Plan(
       store.v2PlanPath(root, masterId, planId),

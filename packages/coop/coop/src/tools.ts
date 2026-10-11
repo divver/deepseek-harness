@@ -599,7 +599,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
 
   ctx.tools.register(defineTool({
     name: 'coop_plan_submit_review',
-    description: 'Submit a designing plan to review (master only): the plan moves to reviewing and every bound reviewer of your master is woken to judge the DAG against the objective.',
+    description: 'Submit a designing plan to review (master only): the plan moves to reviewing and every bound reviewer of your master is woken to judge the DAG against the objective. With autoApproveNoReviewer on and no reviewer bound, submitting activates the plan immediately.',
     parameters: {
       planId: { type: 'string', required: true, description: 'Plan id from coop_plan_create.' },
     },
@@ -624,7 +624,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
 
   ctx.tools.register(defineTool({
     name: 'coop_plan_review',
-    description: 'Review a submitted plan (reviewer bound to the plan\'s master; the master itself only with allowSelfReview). pass → active (ready tasks schedule); request_changes → back to designing for the master.',
+    description: 'Review a submitted plan (reviewer bound to the plan\'s master; the master itself when no reviewer is bound, or with allowSelfReview). pass → active (ready tasks schedule); request_changes → back to designing for the master.',
     parameters: {
       planId: { type: 'string', required: true, description: 'Plan under review.' },
       decision: { type: 'string', required: true, enum: ['pass', 'request_changes'], description: 'Review verdict.' },
@@ -878,7 +878,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
   }))
 
   ctx.tools.register(defineTool({
-    description: 'Assigned worker reports finished execution: the task moves to verifying and the master/reviewers are woken.',
+    description: 'Assigned worker reports finished execution: the task moves to verifying and the master/reviewers are woken (the master verifies when no reviewer is bound). With autoApproveNoReviewer on, only a report from the master\'s own session passes immediately (task done).',
     name: 'coop_execute_report',
     parameters: {
       planId: { type: 'string', required: true, description: 'Owning plan id.' },
@@ -906,7 +906,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
 
   ctx.tools.register(defineTool({
     name: 'coop_task_verify',
-    description: 'Verify a reported task (reviewer bound to the plan\'s master; the master itself only with allowSelfReview). pass → done; request_changes → rework for the assignee.',
+    description: 'Verify a reported task (reviewer bound to the plan\'s master; the master itself when no reviewer is bound, or with allowSelfReview). pass → done; request_changes → rework for the assignee.',
     parameters: {
       planId: { type: 'string', required: true, description: 'Owning plan id.' },
       taskId: { type: 'string', required: true, description: 'Target task id.' },

@@ -206,7 +206,9 @@ async initWorkspace(agent: Agent, target?: string): Promise<string>
      * Register this session as a v2 node. A master mints (or resumes) its
      * masterId and profile; a worker/reviewer lands `unbound` for any master to
      * adopt, or pre-bound when `masterId` names a live master with spare
-     * capacity. Empty roles deregister.
+     * capacity. Empty roles deregister. A bound worker registration runs one
+     * scheduler pass for its master, so ready tasks whose skill demands the
+     * (re-)registration newly covers are assigned and delivered immediately.
      * @param agent - registering live agent.
      * @param req - target roles, optional owning master, model route, and directory scope.
      * @returns the committed registry entry.
@@ -227,7 +229,8 @@ async listNodesV2(agent: Agent, opts: { unboundOnly?: boolean } = {}): Promise<C
      * Adopt one `unbound` worker/reviewer for the calling master. The bind
      * commits under the registry writer lock; once bound, the node disappears
      * from every other master's view — isolation is enforced by visibility, not
-     * by a second lock domain.
+     * by a second lock domain. Binding runs one scheduler pass, so ready work
+     * is assigned and delivered at bind time.
      * @param agent - binding live master.
      * @param sessionId - target node session id.
      * @returns the bound entry.
@@ -262,7 +265,9 @@ async createPlanV2(agent: Agent, req: { title: string; objective: string; repoRo
 
 /**
      * Submit a designing plan to review (master only): designing → reviewing
-     * and every fresh bound reviewer is woken (§6.3).
+     * and every fresh bound reviewer is woken (§6.3); with none bound, the
+     * master itself is woken to self-review (v1 fallback), or with
+     * `autoApproveNoReviewer` on the plan activates immediately on submit.
      * @param agent - submitting live master.
      * @param planId - plan to submit.
      * @returns the committed reviewing plan.
@@ -273,7 +278,8 @@ async submitReviewV2(agent: Agent, planId: string): Promise<CoopV2PlanFile>
      * Reviewer gate on a submitted plan (§6.3): pass → active (readiness
      * recomputed, scheduler runs); request_changes → designing for the master
      * to revise and resubmit. Gate: a reviewer bound to the owning master, or
-     * the master with `allowSelfReview` (§12.4).
+     * the master itself when no reviewer is bound (v1 fallback) or with
+     * `allowSelfReview` (§12.4).
      * @param agent - reviewing live reviewer (or self-reviewing master).
      * @param planId - plan under review.
      * @param decision - pass or request_changes.
@@ -299,7 +305,9 @@ async addTaskV2( agent: Agent, planId: string, req: { title: string spec: string
      * @param planId - owning plan.
      * @param taskId - target task.
      * @param req - optional title, spec, executor style, and skill demands.
-     * @returns the committed task.
+     * @returns the committed task. A mutation runs one scheduler pass —
+     * cleared skill demands or a new pin can place a task that no earlier
+     * pass could assign.
      */
 async updateTaskV2( agent: Agent, planId: string, taskId: string, req: { title?: string; spec?: string; executor?: 'inline' | 'subagent'; skills?: string[] }, ): Promise<CoopV2Task>
 
@@ -343,7 +351,10 @@ async executeBeginV2(agent: Agent, planId: string, taskId: string): Promise<Coop
 /**
      * Assigned worker reports finished execution: executing → verifying, then
      * the master and every fresh bound reviewer are woken to verify and the
-     * freed worker becomes schedulable again.
+     * freed worker becomes schedulable again. With `autoApproveNoReviewer`
+     * on, only a report from the master's own session passes immediately
+     * (task done, `auto` verify record); a worker report always goes to
+     * verify — reviewer when bound, else the master (v1 fallback).
      * @param agent - reporting live worker.
      * @param planId - owning plan.
      * @param taskId - target task.
@@ -354,7 +365,8 @@ async executeReportV2(agent: Agent, planId: string, taskId: string, summary: str
 
 /**
      * Verify one reported task. Gate: a reviewer bound to the owning master,
-     * or the master itself when `allowSelfReview` is on (§12.4, default off).
+     * or the master itself when no reviewer is bound (v1 fallback) or with
+     * `allowSelfReview` on (§12.4, default off).
      * pass → done (downstream goes ready, capacity freed, scheduler runs);
      * request_changes → rework with `attempts` incremented and the assignee
      * re-signalled to begin again.

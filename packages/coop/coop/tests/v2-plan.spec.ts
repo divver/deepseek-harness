@@ -79,6 +79,7 @@ async function editPlanFile(cwd: string, masterId: string, planId: string, edit:
   await writeV2PlanFile(path, edit(plan))
 }
 
+
 /** The `[coop]`-sourced follow-up turns one agent received, as text. */
 function coopNotices(agent: Agent): string[] {
   return [...agent.session.snapshotEvents()]
@@ -333,19 +334,44 @@ describe('plan review gate', () => {
     expect(board[0]?.tasks[0]?.status).toBe('assigned')
   })
 
-  it('gates non-reviewers and honors allowSelfReview for plan review', async () => {
-    const { ctx, master } = await harness()
+  it('rejects the master while a reviewer is bound; allowSelfReview overrides', async () => {
+    const { ctx, master, reviewer } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.submitReviewV2(master, plan.planId)
     await expect(ctx.coop.reviewPlanV2(master, plan.planId, 'pass')).rejects.toMatchObject({ code: 'COOP_NOT_ASSIGNED_WORKER' })
 
-    const { ctx: ctx2, master: m2 } = await harness({ allowSelfReview: true })
+    const { ctx: ctx2, master: m2, reviewer: r2 } = await harness({ allowSelfReview: true })
     await ctx2.coop.registerV2(m2, { roles: ['master'] })
+    const m2id = String((await ctx2.coop.statusV2(m2)).self?.masterId)
+    await ctx2.coop.registerV2(r2, { roles: ['reviewer'], masterId: m2id })
     const plan2 = await ctx2.coop.createPlanV2(m2, { title: 'P', objective: 'O' })
     await ctx2.coop.submitReviewV2(m2, plan2.planId)
     const active = await ctx2.coop.reviewPlanV2(m2, plan2.planId, 'pass')
     expect(active.status).toBe('active')
+  })
+
+  it('falls back to master self-gating when no reviewer is bound (v1 mode)', async () => {
+    const { ctx, master, worker } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't', spec: 'do' })
+    await ctx.coop.submitReviewV2(master, plan.planId)
+    // No reviewer bound: submit wakes the master itself to gate the plan.
+    expect(coopNotices(master).some(text => text.includes('no reviewer bound'))).toBe(true)
+    const active = await ctx.coop.reviewPlanV2(master, plan.planId, 'pass')
+    expect(active.status).toBe('active')
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.assignee).toBe('worker')
+    await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done')
+    expect(coopNotices(master).some(text => text.includes('no reviewer bound — you verify'))).toBe(true)
+    const verified = await ctx.coop.verifyTaskV2(master, plan.planId, 't1', 'pass', 'self')
+    expect(verified.status).toBe('done')
   })
 })
 
@@ -407,5 +433,67 @@ describe('watchdog and escalation', () => {
     expect(blocked.attempts).toBe(1)
     expect(coopNotices(master).some(text => text.includes('blocked — rework budget exhausted'))).toBe(true)
     expect(coopNotices(worker).some(text => text.includes('rework budget exhausted'))).toBe(true)
+  })
+})
+
+describe('auto-approve without reviewer', () => {
+  it('auto-activates the plan on submit; worker reports go to the master to verify', async () => {
+    const { ctx, master, worker } = await harness({ autoApproveNoReviewer: true })
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't2', spec: 'next', dependsOn: ['t1'] })
+    const submitted = await ctx.coop.submitReviewV2(master, plan.planId)
+    expect(submitted.status).toBe('active')
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.assignee).toBe('worker')
+    await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    const reported = await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done work')
+    expect(reported.status).toBe('verifying')
+    expect(coopNotices(master).some(text => text.includes('no reviewer bound — you verify'))).toBe(true)
+    const verified = await ctx.coop.verifyTaskV2(master, plan.planId, 't1', 'pass', 'ok')
+    expect(verified.status).toBe('done')
+    const after = await ctx.coop.boardV2(master, plan.planId)
+    expect(after[0]?.tasks[1]?.status).toBe('assigned')
+  })
+
+  it('auto-passes only a report made by the master session itself', async () => {
+    const { ctx, cwd, master, worker } = await harness({ autoApproveNoReviewer: true })
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do' })
+    const submitted = await ctx.coop.submitReviewV2(master, plan.planId)
+    expect(submitted.status).toBe('active')
+    // Only workers hold tasks today; seed the plan file so t1 is executing
+    // under the master's own session to exercise the self-report fast path.
+    await editPlanFile(cwd, m, plan.planId, p => ({
+      ...p,
+      tasks: p.tasks.map(t => t.taskId === 't1'
+        ? { ...t, assignee: String(master.session.id), status: 'executing' as const, execution: { startedAt: Date.now(), heartbeatAt: Date.now() } }
+        : t),
+    }))
+    const reported = await ctx.coop.executeReportV2(master, plan.planId, 't1', 'did it myself')
+    expect(reported.status).toBe('done')
+    expect(reported.verify?.by).toBe('auto')
+  })
+
+  it('keeps the reviewer gate when one is bound', async () => {
+    const { ctx, master, reviewer, worker } = await harness({ autoApproveNoReviewer: true })
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do' })
+    const submitted = await ctx.coop.submitReviewV2(master, plan.planId)
+    expect(submitted.status).toBe('reviewing')
+    await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass')
+    await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    const reported = await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done')
+    expect(reported.status).toBe('verifying')
   })
 })
