@@ -1,8 +1,8 @@
-import { mkdir, mkdtemp } from 'node:fs/promises'
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
@@ -139,6 +139,15 @@ describe('registration', () => {
     await expect(ctx2.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: String(m.masterId) }))
       .rejects.toMatchObject({ code: 'COOP_NODE_NOT_FOUND' })
   })
+
+  it('re-registering the same roles without a masterId keeps the bind', async () => {
+    const { ctx, master, worker } = await harness()
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+    const again = await ctx.coop.registerV2(worker, { roles: ['worker'] })
+    expect(again.bindState).toBe('bound')
+    expect(String(again.masterId)).toBe(String(m.masterId))
+  })
 })
 
 describe('binding', () => {
@@ -234,5 +243,35 @@ describe('release and lifecycle', () => {
     expect(profile?.status).toBe('retired')
     const status = await ctx.coop.statusV2(master)
     expect(status.self).toBeUndefined()
+  })
+})
+
+describe('poll liveness', () => {
+  it('keeps heartbeating an agent whose inbox drain fails every tick', async () => {
+    vi.useFakeTimers()
+    try {
+      const { ctx, cwd, worker } = await harness({ inboxPollMs: 50, staleMs: 4_000 })
+      await ctx.coop.registerV2(worker, { roles: ['worker'] })
+      const root = v2Root(cwd, '.dsh/coop')
+      const registry = v2RegistryPath(root)
+      const heartbeat = async (): Promise<number> =>
+        (await readV2Registry(registry))?.entries.find(entry => entry.sessionId === 'worker')?.heartbeatAt ?? 0
+      const poll = (): Promise<void> =>
+        (ctx.coop as unknown as { pollLiveInboxes: () => Promise<void> }).pollLiveInboxes()
+      const before = await heartbeat()
+      // A corrupt inbox line makes every drain tick throw at JSON.parse; the
+      // heartbeat touch runs before the drain, so the entry must stay live.
+      await mkdir(join(root, 'inbox'), { recursive: true })
+      await writeFile(join(root, 'inbox', 'worker.jsonl'), '{ not json\n')
+      vi.setSystemTime(before + 1_500)
+      await poll()
+      expect(await heartbeat()).toBeGreaterThan(before)
+      vi.setSystemTime(before + 3_000)
+      await poll()
+      const status = await ctx.coop.statusV2(worker)
+      expect(status.self?.roles).toEqual(['worker'])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

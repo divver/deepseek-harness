@@ -976,7 +976,9 @@ export class CoopService extends Service {
 
   /**
    * Drain every live agent's inbox once per tick. Non-participants cost one
-   * ENOENT read each; failures are logged by the caller and retried next tick.
+   * ENOENT read each; the heartbeat touch runs before the drain and each
+   * agent's failure is logged in isolation, so a drain failing every tick
+   * can neither freeze that agent's liveness nor starve the other agents.
    */
   private async pollLiveInboxes(): Promise<void> {
     for (const agent of this.ctx.agents.list()) {
@@ -984,10 +986,15 @@ export class CoopService extends Service {
       if (this.draining.has(id)) continue
       this.draining.add(id)
       try {
+        // Touch before draining: the heartbeat must never be hostage to inbox
+        // delivery below, or an agent whose drain fails every tick freezes its
+        // entry and ages out of visibility after `staleMs`.
+        await this.touchActive(agent)
         const root = await this.activeRootOf(agent)
         await this.drainAgentInbox(agent, root)
-        await this.touchActive(agent)
         await this.reportNodeStates(root)
+      } catch (error) {
+        this.ctx.logger.warn(`coop: poll for agent "${id}" failed: ${String(error)}`)
       } finally {
         this.draining.delete(id)
       }
@@ -1260,6 +1267,15 @@ export class CoopService extends Service {
         ...(req.skills === undefined ? {} : { skills: req.skills }),
       }
       if (req.masterId === undefined) {
+        // Re-registering the same roles without a master stays idempotent:
+        // an already-bound node keeps its master instead of silently
+        // returning to the adoptable pool (release is the explicit path).
+        const existing = entries.find(candidate => candidate.sessionId === sessionId)
+        if (existing?.bindState === 'bound' && existing.masterId !== undefined
+            && existing.roles.length === req.roles.length && req.roles.every(role => existing.roles.includes(role))) {
+          const rebound: CoopV2RegistryEntry = { ...next, masterId: existing.masterId, bindState: 'bound' }
+          return { next: { version: 2, entries: [...others, rebound] }, value: { entry: rebound, masterId: String(existing.masterId) } }
+        }
         return { next: { version: 2, entries: [...others, next] }, value: { entry: next, masterId: undefined as string | undefined } }
       }
       const master = entries.find(candidate => String(candidate.masterId ?? '') === req.masterId)
