@@ -1451,27 +1451,37 @@ export class CoopService extends Service {
 
   /**
        * Human/model summary across the workspace: live masters, the caller's own
-       * nodes, and the adoptable unbound count. Cross-master detail stays
-       * summarized — isolation applies to agents, not to the human operator.
+       * nodes, and the adoptable unbound count. Roles are persistent — quiet
+       * nodes stay listed under `own` and are surfaced in `stale` instead of
+       * vanishing; only `masters` and the adoptable `unbound` count are
+       * heartbeat-gated. Cross-master detail stays summarized — isolation
+       * applies to agents, not to the human operator.
        * @param agent - querying live agent.
-       * @returns the caller's entry, master ids, own nodes, and unbound count.
+       * @returns the caller's entry, master ids, own nodes, unbound count, and
+       * the session ids whose roles persist but whose heartbeat went silent.
        */
   async statusV2(agent: Agent): Promise<{
     self: CoopV2RegistryEntry | undefined
     masters: string[]
     own: CoopV2RegistryEntry[]
     unbound: number
+    stale: string[]
   }> {
     await this.touchOwnEntryV2(agent)
     const now = Date.now()
-    const entries = (await this.v2Tables(await this.v2RootOf(agent))).filter(entry => this.isFreshV2(entry, now))
+    const entries = await this.v2Tables(await this.v2RootOf(agent))
+    // Roles are persistent registry rows; liveness is an overlay. Stale nodes
+    // keep their role and bind in every listing (surfaced as `stale`), while
+    // live-only counts (masters, adoptable unbound) stay heartbeat-gated.
+    const live = entries.filter(entry => this.isFreshV2(entry, now))
+    const stale = entries.filter(entry => !this.isFreshV2(entry, now)).map(entry => entry.sessionId)
     const own = entries.find(entry => entry.sessionId === String(agent.session.id))
-    const masters = [...new Set(entries.filter(entry => entry.roles.includes('master')).map(entry => String(entry.masterId)))]
+    const masters = [...new Set(live.filter(entry => entry.roles.includes('master')).map(entry => String(entry.masterId)))]
     const ownNodes = own?.roles.includes('master') === true && own.masterId !== undefined
       ? entries.filter(entry => entry.bindState === 'bound' && String(entry.masterId) === String(own.masterId))
       : []
-    const unbound = entries.filter(entry => entry.bindState === 'unbound' && !entry.roles.includes('master')).length
-    return { self: own, masters, own: ownNodes, unbound }
+    const unbound = live.filter(entry => entry.bindState === 'unbound' && !entry.roles.includes('master')).length
+    return { self: own, masters, own: ownNodes, unbound, stale }
   }
 
   /**

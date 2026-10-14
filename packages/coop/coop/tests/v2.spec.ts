@@ -275,3 +275,50 @@ describe('poll liveness', () => {
     }
   })
 })
+
+describe('role persistence', () => {
+  async function rows(cwd: string): Promise<Map<string, { roles: string[]; bindState: string }>> {
+    const table = await readV2Registry(v2RegistryPath(v2Root(cwd, '.dsh/coop')))
+    return new Map((table?.entries ?? []).map(entry => [entry.sessionId, { roles: entry.roles, bindState: entry.bindState }]))
+  }
+
+  it('keeps every role and bind through a full plan and task lifecycle', async () => {
+    const { ctx, cwd, master, worker, reviewer } = await harness()
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
+    await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: String(m.masterId) })
+    await ctx.coop.submitReviewV2(master, plan.planId)
+    await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass')
+    await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done')
+    await ctx.coop.verifyTaskV2(reviewer, plan.planId, 't1', 'pass')
+    const closed = await ctx.coop.closePlanV2(master, plan.planId)
+    expect(closed.status).toBe('closed')
+    const after = await rows(cwd)
+    expect(after.get('master')).toMatchObject({ roles: ['master'] })
+    expect(after.get('worker')).toMatchObject({ roles: ['worker'], bindState: 'bound' })
+    expect(after.get('reviewer')).toMatchObject({ roles: ['reviewer'], bindState: 'bound' })
+  })
+
+  it("keeps a quiet node's row on disk and reports it as stale instead of dropping it", async () => {
+    vi.useFakeTimers()
+    try {
+      const { ctx, cwd, master, worker } = await harness({ staleMs: 4_000 })
+      const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+      await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+      vi.setSystemTime(Date.now() + 10_000)
+      const registry = v2RegistryPath(v2Root(cwd, '.dsh/coop'))
+      const row = (await readV2Registry(registry))?.entries.find(entry => entry.sessionId === 'worker')
+      expect(row?.roles).toEqual(['worker'])
+      expect(row?.bindState).toBe('bound')
+      const status = await ctx.coop.statusV2(master)
+      expect(status.own.some(entry => entry.sessionId === 'worker' && entry.roles.includes('worker'))).toBe(true)
+      expect(status.stale).toContain('worker')
+      expect(status.masters.length).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

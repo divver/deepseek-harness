@@ -545,10 +545,11 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
           masters: { type: 'integer', required: true },
           ownNodes: { type: 'integer', required: true },
           unbound: { type: 'integer', required: true },
-          detail: { type: 'array', items: { type: 'string' }, description: 'Per-node line: sessionId, roles, bind state, context occupancy.' },
+          stale: { type: 'array', items: { type: 'string' }, description: 'Session ids whose role persists but whose heartbeat went silent.' },
+          detail: { type: 'array', items: { type: 'string' }, description: 'Per-node line: sessionId, roles, bind state, context occupancy, stale marker.' },
         },
       },
-      render: (_args, value) => textOut(`${value.self ?? 'unregistered'} · masters: ${String(value.masters)} · your nodes: ${String(value.ownNodes)} · unbound: ${String(value.unbound)}${(value.detail ?? []).length === 0 ? '' : `\n${(value.detail ?? []).join('\n')}`}`),
+      render: (_args, value) => textOut(`${value.self ?? 'unregistered'} · masters: ${String(value.masters)} · your nodes: ${String(value.ownNodes)} · unbound: ${String(value.unbound)}${(value.stale ?? []).length === 0 ? '' : ` · stale: ${String(value.stale)}`}${(value.detail ?? []).length === 0 ? '' : `\n${(value.detail ?? []).join('\n')}`}`),
     },
     async execute(_args, exec) {
       const agent = needAgent(exec)
@@ -560,7 +561,8 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
         masters: status.masters.length,
         ownNodes: status.own.length,
         unbound: status.unbound,
-        detail: status.own.map(entry => `${entry.sessionId}: ${entry.roles.join('+')}${entry.meta?.contextPct === undefined ? '' : ` · ctx ${Math.round(entry.meta.contextPct * 100)}%`}`),
+        stale: status.stale,
+        detail: status.own.map(entry => `${entry.sessionId}: ${entry.roles.join('+')}${entry.meta?.contextPct === undefined ? '' : ` · ctx ${Math.round(entry.meta.contextPct * 100)}%`}${status.stale.includes(entry.sessionId) ? ' · STALE (session silent, role persists)' : ''}`),
       }
     },
   }))
