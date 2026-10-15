@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-coop",
   "description": "Cross-session master/worker plan cooperation over a workspace-shared file store",
-  "version": "0.1.7-rc.3",
+  "version": "0.1.7-rc.5",
   "publishConfig": {
     "access": "public"
   },

@@ -322,3 +322,63 @@ describe('role persistence', () => {
     }
   })
 })
+
+describe('auto reactivation', () => {
+  it('reactivates a quiet master on its next operation without re-registering', async () => {
+    vi.useFakeTimers()
+    try {
+      const { ctx, master } = await harness({ staleMs: 4_000 })
+      const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+      const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+      vi.setSystemTime(Date.now() + 10_000)
+      const task = await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
+      expect(task.title).toBe('t1')
+      const status = await ctx.coop.statusV2(master)
+      expect(status.self?.roles).toEqual(['master'])
+      expect(String(status.self?.masterId)).toBe(String(m.masterId))
+      expect(status.stale).not.toContain('master')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reactivates a quiet worker at execute time', async () => {
+    vi.useFakeTimers()
+    try {
+      const { ctx, master, worker, reviewer } = await harness({ staleMs: 4_000 })
+      const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+      await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+      const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+      await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
+      await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: String(m.masterId) })
+      await ctx.coop.submitReviewV2(master, plan.planId)
+      await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass')
+      vi.setSystemTime(Date.now() + 10_000)
+      const executing = await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+      expect(executing.status).toBe('executing')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('adopts the stale master identity when a restarted session registers', async () => {
+    vi.useFakeTimers()
+    try {
+      const { ctx, cwd, master, second, worker } = await harness({ staleMs: 4_000 })
+      const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+      await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+      vi.setSystemTime(Date.now() + 10_000)
+      const revived = await ctx.coop.registerV2(second, { roles: ['master'] })
+      expect(String(revived.masterId)).toBe(String(m.masterId))
+      const rows = await readV2Registry(v2RegistryPath(v2Root(cwd, '.dsh/coop')))
+      expect(rows?.entries.some(entry => entry.sessionId === 'master')).toBe(false)
+      const bound = rows?.entries.find(entry => entry.sessionId === 'worker')
+      expect(bound?.bindState).toBe('bound')
+      expect(String(bound?.masterId)).toBe(String(m.masterId))
+      const status = await ctx.coop.statusV2(second)
+      expect(status.own.some(entry => entry.sessionId === 'worker')).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

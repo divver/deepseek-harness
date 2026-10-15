@@ -1127,9 +1127,16 @@ export class CoopService extends Service {
     // Read through an opaque record: the session-projection service may or
     // may not be mounted in this process, and its Context augmentation
     // declares the member non-optional even when it is absent at runtime.
-    const seam = (this.ctx as unknown as Record<string, unknown>)['sessionProjections'] as
-      | { snapshot(session: object, keys?: readonly string[]): { values: Record<string, unknown> } }
-      | undefined
+    // Read the optional seam defensively: cordis resolves declared services
+    // through the context proxy, which THROWS ("cannot get property without
+    // inject") for unmounted services instead of returning undefined — a
+    // thrown read here would silently kill every heartbeat write.
+    let seam: { snapshot(session: object, keys?: readonly string[]): { values: Record<string, unknown> } } | undefined
+    try {
+      seam = (this.ctx as unknown as Record<string, unknown>)['sessionProjections'] as typeof seam
+    } catch {
+      return {}
+    }
     if (seam === undefined) return {}
     try {
       const view = seam.snapshot(agent.session, ['contextPressure']).values['contextPressure']
@@ -1220,8 +1227,20 @@ export class CoopService extends Service {
       }
     if (req.roles.includes('master')) {
       const entry = await store.mutateV2Registry(localPath, (current) => {
-        const existing = (current?.entries ?? []).find(candidate => candidate.sessionId === sessionId && candidate.roles.includes('master'))
-        const masterId = existing?.masterId ?? mintMasterId(cwd)
+        const entries = current?.entries ?? []
+        const existing = entries.find(candidate => candidate.sessionId === sessionId && candidate.roles.includes('master'))
+        // A restarted master session revives the most recently active stale
+        // master identity here: the same masterId keeps every plan path and
+        // node bind pointing where they already point. Fresh identities are
+        // never taken over.
+        const adoptable = existing === undefined
+          ? entries.filter(candidate => candidate.roles.includes('master')
+              && !this.isFreshV2(candidate, now)
+              && canCommunicate({ cwd, cwdScope: scope }, candidate))
+            .sort((a, b) => b.updatedAt - a.updatedAt)[0]
+          : undefined
+        const masterId = existing?.masterId ?? adoptable?.masterId ?? mintMasterId(cwd)
+        const replacedSessionId = adoptable?.sessionId
         const next: CoopV2RegistryEntry = {
           sessionId,
           roles: ['master'],
@@ -1235,17 +1254,20 @@ export class CoopService extends Service {
           ...(req.skills === undefined ? {} : { skills: req.skills }),
         }
         return {
-          next: { version: 2, entries: [...(current?.entries ?? []).filter(candidate => candidate.sessionId !== sessionId), next] },
+          next: { version: 2, entries: [...entries.filter(candidate => candidate.sessionId !== sessionId
+              && candidate.sessionId !== replacedSessionId), next] },
           value: next,
         }
       })
       const masterId = entry.masterId
       if (masterId === undefined) throw new CoopError('master registration lost its masterId', 'COOP_CONFIG_UNSUPPORTED')
-      await store.writeMasterProfile(store.masterProfilePath(root, String(masterId)), {
+      const profilePath = store.masterProfilePath(root, String(masterId))
+      const prior = await store.readMasterProfile(profilePath)
+      await store.writeMasterProfile(profilePath, {
         masterId,
         sessionId,
         displayName: String(masterId).split('#')[0] ?? 'master',
-        createdAt: now,
+        createdAt: prior?.createdAt ?? now,
         status: 'active',
       })
       if (roleRoute !== undefined) this.applyRoleRoute(agent, roleRoute)
@@ -1391,6 +1413,8 @@ export class CoopService extends Service {
     const callerId = String(agent.session.id)
     const now = Date.now()
     const root = await this.v2RootOf(agent)
+    // Same reactivation rule as requireV2Master: touch before the gate.
+    await this.touchOwnEntryV2(agent)
     const bound = await store.mutateV2Registry(store.v2RegistryPath(root), (current) => {
       const entries = current?.entries ?? []
       const caller = entries.find(candidate => candidate.sessionId === callerId)
@@ -1512,6 +1536,9 @@ export class CoopService extends Service {
        */
   private async requireV2Master(agent: Agent): Promise<{ masterId: MasterId; root: string }> {
     const root = await this.v2RootOf(agent)
+    // A quiet session reactivates on first use: refresh the heartbeat before
+    // gating on it, so a stale-but-alive caller keeps its role and bind.
+    await this.touchOwnEntryV2(agent)
     const now = Date.now()
     const own = (await this.v2Tables(root)).find(entry => entry.sessionId === String(agent.session.id))
     if (own === undefined || !own.roles.includes('master') || !this.isFreshV2(own, now)) {
@@ -1532,6 +1559,8 @@ export class CoopService extends Service {
        */
   private async planForNode(agent: Agent, planId: string): Promise<{ plan: CoopV2PlanFile; root: string }> {
     const root = await this.v2RootOf(agent)
+    // Same reactivation rule as requireV2Master: touch before the gate.
+    await this.touchOwnEntryV2(agent)
     const now = Date.now()
     const own = (await this.v2Tables(root)).find(entry => entry.sessionId === String(agent.session.id))
     if (own === undefined || !this.isFreshV2(own, now)) {
