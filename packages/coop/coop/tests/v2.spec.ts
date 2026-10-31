@@ -11,6 +11,9 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import CoopService, { masterProfilePath, readMasterProfile, readV2Registry, v2RegistryPath, v2Root } from '../src/index.ts'
 
+// The dev shell may sit inside a herdr pane; revival must not see an ambient pane id (panes come from config `paneId`).
+delete process.env.HERDR_PANE_ID
+
 /**
  * v2 registry suite over a real agent spine: workspace anchoring (nearest
  * anchor, silent-cwd fallback, ancestor guard), multi-master registration,

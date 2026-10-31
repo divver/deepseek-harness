@@ -46,12 +46,14 @@ import {
   mintMasterId,
   normalizeCwd,
   resolveCoopConfig,
-  v2Root, applyRoleLlmRoute, planColumnSplit, PaneBox } from './runtime.ts'
+  v2Root, applyRoleLlmRoute, planColumnSplit, PaneBox, spawnRouteEnv } from './runtime.ts'
 import type { ResolvedCoopConfig, RoleLlmRoute, RoleLlmSettings } from './runtime.ts'
 import * as store from './store.ts'
 import { COOP_POLICY_ORDER, COOP_POLICY_SECTION_NAME, COOP_POLICY_TEXT, COOP_V2_POLICY_TEXT } from './policy.ts'
 import { registerCoopCommands } from './commands.ts'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
+/** Rows dead past this horizon leave the registry on the periodic heal; adoption only revives recent stale rows. */
+const STALE_ROW_PRUNE_MS = 7 * 24 * 3_600_000
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -120,6 +122,8 @@ export interface Config {
   spawnRegisterTimeoutMs?: number
   /** v2 pane arrangement for auto-spawned nodes: role `columns` or legacy `right`. */
   spawnLayout?: 'columns' | 'right'
+  /** v2 pane identity for pane-keyed master revival; unset falls back to `HERDR_PANE_ID` (test seam). */
+  paneId?: string
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -148,6 +152,7 @@ export const Config: z<Config> = z.object({
   spawnReadyRegex: z.string(),
   spawnRegisterTimeoutMs: z.number(),
   spawnLayout: z.string(),
+  paneId: z.string(),
   roleLlm: z.any(),
   inboxPollMs: z.number(),
   mirrorEvents: z.boolean(),
@@ -271,6 +276,9 @@ export class CoopService extends Service {
       const timer = setInterval(() => {
         this.pollLiveInboxes().catch((error: unknown) => {
           this.ctx.logger.warn(`coop: inbox poll failed: ${String(error)}`)
+        })
+        this.healV2().catch((error: unknown) => {
+          this.ctx.logger.warn(`coop: v2 heal failed: ${String(error)}`)
         })
       }, this.resolved.inboxPollMs)
       return () => {
@@ -974,6 +982,10 @@ export class CoopService extends Service {
   /** Session ids with an in-flight drain, so poll ticks never double-deliver. */
   private readonly draining = new Set<string>()
 
+  /** Guard + last-run throttle for the periodic v2 heal pass (heartbeat-touch cadence). */
+  private healingV2 = false
+  private lastHealV2 = 0
+
   /**
    * Drain every live agent's inbox once per tick. Non-participants cost one
    * ENOENT read each; the heartbeat touch runs before the drain and each
@@ -1214,7 +1226,7 @@ export class CoopService extends Service {
     const root = await this.v2RootOf(agent)
     const localPath = store.v2RegistryPath(root)
     const roleRoute = this.roleLlmForRoles(req.roles)
-    const paneEnv = process.env.HERDR_PANE_ID
+    const paneEnv = this.resolved.paneId ?? process.env.HERDR_PANE_ID
     const meta = req.model === undefined && paneEnv === undefined
       ? {}
       : {
@@ -1226,21 +1238,38 @@ export class CoopService extends Service {
         },
       }
     if (req.roles.includes('master')) {
+      // Same-process live sessions back the pane-keyed revival below.
+      const liveSessionIds = new Set(this.ctx.agents.list().map(candidate => String(candidate.session.id)))
       const entry = await store.mutateV2Registry(localPath, (current) => {
         const entries = current?.entries ?? []
         const existing = entries.find(candidate => candidate.sessionId === sessionId && candidate.roles.includes('master'))
-        // A restarted master session revives the most recently active stale
-        // master identity here: the same masterId keeps every plan path and
-        // node bind pointing where they already point. Fresh identities are
-        // never taken over.
-        const adoptable = existing === undefined
+        // Pane-keyed revival first: one pane hosts one TUI, so a master row
+        // from the same herdr pane is this pane's own prior identity. Reuse
+        // it when the row's session still lives in this process (a session
+        // switch in the same TUI) or its heartbeat went silent past half
+        // the stale window (the pane restarted; the old process died). A
+        // row still being touched has a live owner — or a nested process
+        // that inherited the pane id — and is never taken over.
+        const paneRevivable = existing === undefined && paneEnv !== undefined
+          ? entries.find(candidate => candidate.roles.includes('master')
+                && candidate.meta?.paneId === paneEnv
+                && canCommunicate({ cwd, cwdScope: scope }, candidate)
+                && (liveSessionIds.has(candidate.sessionId)
+                  || now - candidate.heartbeatAt > this.resolved.staleMs / 2))
+          : undefined
+          // A restarted master session revives the most recently active stale
+          // master identity here: the same masterId keeps every plan path and
+          // node bind pointing where they already point.
+        const adoptable = existing === undefined && paneRevivable === undefined
           ? entries.filter(candidate => candidate.roles.includes('master')
-              && !this.isFreshV2(candidate, now)
-              && canCommunicate({ cwd, cwdScope: scope }, candidate))
+                && !this.isFreshV2(candidate, now)
+                && canCommunicate({ cwd, cwdScope: scope }, candidate))
             .sort((a, b) => b.updatedAt - a.updatedAt)[0]
           : undefined
-        const masterId = existing?.masterId ?? adoptable?.masterId ?? mintMasterId(cwd)
-        const replacedSessionId = adoptable?.sessionId
+        const masterId = existing?.masterId ?? paneRevivable?.masterId ?? adoptable?.masterId ?? mintMasterId(cwd)
+        const replacedSessionId = existing === undefined
+          ? (paneRevivable ?? adoptable)?.sessionId
+          : undefined
         const next: CoopV2RegistryEntry = {
           sessionId,
           roles: ['master'],
@@ -1300,8 +1329,11 @@ export class CoopService extends Service {
         }
         return { next: { version: 2, entries: [...others, next] }, value: { entry: next, masterId: undefined as string | undefined } }
       }
-      const master = entries.find(candidate => String(candidate.masterId ?? '') === req.masterId)
-      if (master === undefined || !master.roles.includes('master') || !this.isFreshV2(master, now)) {
+      // A stale row sharing the masterId (a dead worker bound to the same
+      // master, earlier in file order) must not shadow the live master.
+      const master = entries.find(candidate => String(candidate.masterId ?? '') === req.masterId
+          && candidate.roles.includes('master') && this.isFreshV2(candidate, now))
+      if (master === undefined) {
         throw new CoopError(`master "${req.masterId}" is not a live master in this workspace`, 'COOP_NODE_NOT_FOUND')
       }
       const masterId = master.masterId
@@ -1552,12 +1584,14 @@ export class CoopService extends Service {
   /**
        * Resolve one plan visible to the calling node: masters reach their own
        * plans; bound workers/reviewers reach their owning master's plans. Unbound
-       * nodes and cross-master ids see nothing (isolation by visibility).
+       * nodes and cross-master ids see nothing (isolation by visibility). A plan
+       * id may be any unique prefix of the canonical id — status surfaces shorten
+       * them, and a worker echoing a short id must still resolve the plan.
        * @param agent - acting live node.
-       * @param planId - plan to resolve.
-       * @returns the plan snapshot and the v2 root.
+       * @param planId - plan id or unique prefix to resolve.
+       * @returns the plan snapshot, the v2 root, and the canonical plan id.
        */
-  private async planForNode(agent: Agent, planId: string): Promise<{ plan: CoopV2PlanFile; root: string }> {
+  private async planForNode(agent: Agent, planId: string): Promise<{ plan: CoopV2PlanFile; root: string; planId: string }> {
     const root = await this.v2RootOf(agent)
     // Same reactivation rule as requireV2Master: touch before the gate.
     await this.touchOwnEntryV2(agent)
@@ -1570,9 +1604,27 @@ export class CoopService extends Service {
     if (masterId === undefined) {
       throw new CoopError('this node is not bound to a master', 'COOP_NODE_NOT_FOUND')
     }
-    const plan = await store.readV2PlanFile(store.v2PlanPath(root, String(masterId), planId))
+    const exact = await store.readV2PlanFile(store.v2PlanPath(root, String(masterId), planId))
+    if (exact !== undefined) return { plan: exact, root, planId }
+    let names: string[] = []
+    try {
+      names = await readdir(store.v2PlansDir(root, String(masterId)))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    const matches = names
+      .filter(name => name.endsWith('.json') && name.slice(0, -5).startsWith(planId))
+      .map(name => name.slice(0, -5))
+    if (matches.length !== 1) {
+      throw new CoopError(matches.length > 1
+        ? `plan prefix "${planId}" is ambiguous between ${String(matches.length)} plans: ${matches.slice(0, 4).join(', ')}`
+        : `plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+    }
+    const canonical = matches[0]
+    if (canonical === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
+    const plan = await store.readV2PlanFile(store.v2PlanPath(root, String(masterId), canonical))
     if (plan === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
-    return { plan, root }
+    return { plan, root, planId: canonical }
   }
 
   /**
@@ -2263,9 +2315,9 @@ export class CoopService extends Service {
        */
   async executeBeginV2(agent: Agent, planId: string, taskId: string): Promise<CoopV2Task> {
     const sessionId = String(agent.session.id)
-    const { plan, root } = await this.planForNode(agent, planId)
+    const { plan, root, planId: canonical } = await this.planForNode(agent, planId)
     return store.mutateV2Plan(
-      store.v2PlanPath(root, String(plan.masterId), planId),
+      store.v2PlanPath(root, String(plan.masterId), canonical),
       (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
         if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
         const task = current.tasks.find(candidate => candidate.taskId === taskId)
@@ -2307,10 +2359,10 @@ export class CoopService extends Service {
        */
   async executeReportV2(agent: Agent, planId: string, taskId: string, summary: string): Promise<CoopV2Task> {
     const sessionId = String(agent.session.id)
-    const { plan, root } = await this.planForNode(agent, planId)
+    const { plan, root, planId: canonical } = await this.planForNode(agent, planId)
     const masterId = String(plan.masterId)
     const reported = await store.mutateV2Plan(
-      store.v2PlanPath(root, masterId, planId),
+      store.v2PlanPath(root, masterId, canonical),
       (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
         if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
         const task = current.tasks.find(candidate => candidate.taskId === taskId)
@@ -2350,12 +2402,12 @@ export class CoopService extends Service {
       && masterEntry !== undefined && masterEntry.sessionId === sessionId
     const text = auto
       ? 'execution reported — auto-verified (no reviewer bound), task done'
-      : `execution reported — call coop_task_verify(planId="${planId}", taskId="${taskId}", decision)${reviewers.length === 0 ? ' (no reviewer bound — you verify)' : ''}`
+      : `execution reported — call coop_task_verify(planId="${canonical}", taskId="${taskId}", decision)${reviewers.length === 0 ? ' (no reviewer bound — you verify)' : ''}`
     if (masterEntry !== undefined) {
-      await this.deliverTask(root, sessionId, masterEntry.sessionId, planId, masterId, reported, text)
+      await this.deliverTask(root, sessionId, masterEntry.sessionId, canonical, masterId, reported, text)
     }
     for (const reviewer of reviewers) {
-      await this.deliverTask(root, sessionId, reviewer.sessionId, planId, masterId, reported, text)
+      await this.deliverTask(root, sessionId, reviewer.sessionId, canonical, masterId, reported, text)
     }
     let final = reported
     if (auto) {
@@ -2363,7 +2415,7 @@ export class CoopService extends Service {
       // task immediately (downstream ready, capacity freed) and tell the
       // worker it is free for the next assignment.
       final = await store.mutateV2Plan(
-        store.v2PlanPath(root, masterId, planId),
+        store.v2PlanPath(root, masterId, canonical),
         (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
           if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
           const task = current.tasks.find(candidate => candidate.taskId === taskId)
@@ -2384,13 +2436,13 @@ export class CoopService extends Service {
           return { next: recomputeReady(staged, at), value: next }
         })
       if (final.status === 'done' && final.assignee !== undefined) {
-        await this.deliverTask(root, sessionId, final.assignee, planId, masterId, final,
+        await this.deliverTask(root, sessionId, final.assignee, canonical, masterId, final,
           'task auto-verified (no reviewer bound) — done; you are free for the next assignment')
       }
       await this.recordMemory(root, masterId, {
         time: Date.now(),
         kind: 'task',
-        ref: `${final.taskId}@${planId}`,
+        ref: `${final.taskId}@${canonical}`,
         title: final.title,
         summary: final.report?.summary ?? 'completed',
       })
@@ -2421,7 +2473,7 @@ export class CoopService extends Service {
     summary?: string,
   ): Promise<CoopV2Task> {
     const sessionId = String(agent.session.id)
-    const { plan, root } = await this.planForNode(agent, planId)
+    const { plan, root, planId: canonical } = await this.planForNode(agent, planId)
     const masterId = String(plan.masterId)
     const now = Date.now()
     const tables = await this.v2Tables(root)
@@ -2442,7 +2494,7 @@ export class CoopService extends Service {
       throw new CoopError('task verification requires a reviewer bound to this master (or none bound / allowSelfReview)', 'COOP_NOT_ASSIGNED_WORKER')
     }
     const verified = await store.mutateV2Plan(
-      store.v2PlanPath(root, masterId, planId),
+      store.v2PlanPath(root, masterId, canonical),
       (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
         if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
         const task = current.tasks.find(candidate => candidate.taskId === taskId)
@@ -2473,12 +2525,12 @@ export class CoopService extends Service {
         : verified.status === 'blocked'
           ? `rework budget exhausted (attempts ${String(verified.attempts)}) — task blocked; stop working on it, your master decides`
           : `rework requested${summary === undefined ? '' : `: ${summary}`} — call coop_execute_begin again, address the feedback, then coop_execute_report`
-      await this.deliverTask(root, sessionId, verified.assignee, planId, masterId, verified, text)
+      await this.deliverTask(root, sessionId, verified.assignee, canonical, masterId, verified, text)
     }
     if (verified.status === 'blocked') {
       const masterEntry = (await this.v2Tables(root)).find(entry => entry.roles.includes('master') && String(entry.masterId) === masterId)
       if (masterEntry !== undefined) {
-        await this.deliverTask(root, sessionId, masterEntry.sessionId, planId, masterId, verified,
+        await this.deliverTask(root, sessionId, masterEntry.sessionId, canonical, masterId, verified,
           `task ${verified.taskId} blocked — rework budget exhausted; cancel, revise, or re-scope it`)
       }
     }
@@ -2486,7 +2538,7 @@ export class CoopService extends Service {
       await this.recordMemory(root, masterId, {
         time: Date.now(),
         kind: 'task',
-        ref: `${verified.taskId}@${planId}`,
+        ref: `${verified.taskId}@${canonical}`,
         title: verified.title,
         summary: verified.report?.summary ?? 'completed',
         ...(verified.verify?.summary === undefined ? {} : { lessons: [verified.verify.summary] }),
@@ -2773,9 +2825,9 @@ export class CoopService extends Service {
        */
   async touchExecutionV2(agent: Agent, planId: string, taskId: string): Promise<void> {
     const sessionId = String(agent.session.id)
-    const { plan, root } = await this.planForNode(agent, planId)
+    const { plan, root, planId: canonical } = await this.planForNode(agent, planId)
     await store.mutateV2Plan(
-      store.v2PlanPath(root, String(plan.masterId), planId),
+      store.v2PlanPath(root, String(plan.masterId), canonical),
       (current): { next?: CoopV2PlanFile; value: undefined } => {
         if (current === undefined) throw new CoopError(`plan "${planId}" not found`, 'COOP_PLAN_NOT_FOUND')
         const task = current.tasks.find(candidate => candidate.taskId === taskId)
@@ -2989,16 +3041,10 @@ export class CoopService extends Service {
     // from its entry config over the persisted /model pick, so seeding
     // DSH_COOP_* here makes the pane boot (display AND first request) on the
     // role's route instead of the workspace's last picker choice.
-    const roleRoute = this.roleLlmForRoles([req.role])
-    const env: string[] = roleRoute === undefined
-      ? []
-      : [
-        '--env', `DSH_COOP_PROVIDER=${roleRoute.provider}`,
-        '--env', `DSH_COOP_MODEL=${roleRoute.model}`,
-        ...(roleRoute.reasoningEffort === undefined
-          ? []
-          : ['--env', `DSH_COOP_EFFORT=${String(roleRoute.reasoningEffort)}`]),
-      ]
+    // An explicit per-node model wins over the role route: `provider/model` pins
+    // both halves, a bare model keeps the role's (or the master's) provider.
+    const env = spawnRouteEnv(req.model, this.roleLlmForRoles([req.role]), (agent.options as { provider?: string }).provider)
+
     const split = await this.runHerdr(['pane', 'split', plan.targetPane, '--direction', plan.direction, '--no-focus', '--cwd', cwd, ...env])
     if (split.code !== 0) {
       throw new CoopError(`herdr pane split failed: ${split.stderr || split.stdout}`, 'COOP_SPAWN_FAILED')
@@ -3061,8 +3107,13 @@ export class CoopService extends Service {
     }
     const route = agent.options as { provider?: string; model?: string }
     const roleRoute = this.roleLlmForRoles([req.role])
-    const model = req.model ?? roleRoute?.model ?? route.model
-    const provider = roleRoute?.provider ?? route.provider
+    // `provider/model` pins both halves; a bare model keeps the role's (or
+    // master's) provider, matching the pane-route rules.
+    const slash = req.model === undefined ? -1 : req.model.indexOf('/')
+    const model = (req.model === undefined ? undefined : slash >= 0 ? req.model.slice(slash + 1) : req.model)
+      ?? roleRoute?.model ?? route.model
+    const provider = (req.model !== undefined && slash >= 0 ? req.model.slice(0, slash) : undefined)
+      ?? roleRoute?.provider ?? route.provider
     const spawned = await loop.create(
       SessionId(`coop-${req.role}-${randomUUID().slice(0, 8)}`),
       {
@@ -3293,6 +3344,61 @@ export class CoopService extends Service {
       // The event seam is optional; the request-waterfall pin alone carries
       // the route.
     }
+  }
+
+  /**
+       * Periodic v2 self-heal, throttled to the heartbeat-touch cadence. Task
+       * assignment has no event of its own when a stale worker's heartbeat
+       * recovers (the touch refreshes the row silently), and rows of crashed
+       * panes would otherwise linger forever, so every inbox-poll tick runs one
+       * pass: schedule each live master's ready work, then prune long-dead rows.
+       */
+  private async healV2(): Promise<void> {
+    const now = Date.now()
+    if (this.healingV2 || now - this.lastHealV2 < Math.min(this.resolved.staleMs / 4, 30_000)) return
+    this.healingV2 = true
+    this.lastHealV2 = now
+    try {
+      const roots = new Set<string>()
+      for (const agent of this.ctx.agents.list()) {
+        roots.add(await this.v2RootOf(agent))
+      }
+      const masters: Array<{ root: string; masterId: string }> = []
+      for (const root of roots) {
+        await this.pruneV2Registry(store.v2RegistryPath(root), now)
+        const entries = (await store.readV2Registry(store.v2RegistryPath(root)))?.entries ?? []
+        for (const entry of entries) {
+          const masterId = entry.masterId
+          if (masterId === undefined || !entry.roles.includes('master') || !this.isFreshV2(entry, now)) continue
+          const id = String(masterId)
+          if (!masters.some(candidate => candidate.root === root && candidate.masterId === id)) {
+            masters.push({ root, masterId: id })
+          }
+        }
+      }
+      await this.pruneV2Registry(this.v2GlobalRegistryPath(), now)
+      for (const { root, masterId } of masters) {
+        await this.scheduleV2(root, masterId)
+      }
+    } finally {
+      this.healingV2 = false
+    }
+  }
+
+  /**
+       * Drop registry rows whose heartbeat died far beyond `staleMs` (adoption
+       * only ever revives recent stale identities, so a horizon of days never
+       * disturbs a master revival); the write commits only when a row aged out.
+       * @param path - v2 registry file path.
+       * @param now - current epoch ms.
+       */
+  private async pruneV2Registry(path: string, now: number): Promise<void> {
+    await store.mutateV2Registry(path, (current) => {
+      if (current === undefined) return { value: undefined }
+      const alive = current.entries.filter(entry => now - entry.heartbeatAt <= STALE_ROW_PRUNE_MS)
+      if (alive.length === current.entries.length) return { value: undefined }
+      return { next: { version: 2, entries: alive }, value: undefined }
+    })
   }
 }
 /**

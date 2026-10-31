@@ -54,6 +54,8 @@ export interface ResolvedCoopConfig {
   spawnLayout: 'columns' | 'right'
   /** v2 per-role LLM routes applied to every request of a registered session (mode v2 only). */
   roleLlm: RoleLlmRoutes
+  /** v2 pane identity for pane-keyed master revival; unset falls back to `HERDR_PANE_ID`. */
+  paneId?: string
 }
 
 /**
@@ -90,6 +92,7 @@ export function resolveCoopConfig(config: {
   spawnRegisterTimeoutMs?: number
   roleLlm?: RoleLlmSettings | null
   spawnLayout?: string
+  paneId?: string
 }): ResolvedCoopConfig {
   const positive = (value: number | undefined, name: string): number | undefined => {
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
@@ -140,6 +143,7 @@ export function resolveCoopConfig(config: {
     spawnRegisterTimeoutMs,
     spawnLayout: config.spawnLayout === 'right' ? 'right' : 'columns',
     roleLlm,
+    paneId: config.paneId,
   }
 }
 
@@ -333,4 +337,35 @@ export function planColumnSplit(
     return { targetPane: bottom.paneId, direction: 'down' }
   }
   return { targetPane: masterPane, direction: 'right' }
+}
+/**
+ * Build the `--env` seed pairs that pin a spawned pane's LLM route. An
+ * explicit per-node model wins over the role route: `provider/model` pins
+ * both halves, a bare model keeps the role route's (or the creating
+ * master's) provider, and the role route's effort rides along when set.
+ * @param model - explicit per-node model route, if requested.
+ * @param roleRoute - the role's configured route, if any.
+ * @param masterProvider - creating master's provider, as a bare-model fallback.
+ * @returns the flat `--env` argument pairs for `herdr pane split`.
+ */
+export function spawnRouteEnv(
+  model: string | undefined,
+  roleRoute: RoleLlmRoute | undefined,
+  masterProvider: string | undefined,
+): string[] {
+  const slash = model === undefined ? -1 : model.indexOf('/')
+  const routeModel = model === undefined
+    ? roleRoute?.model
+    : slash >= 0 ? model.slice(slash + 1) : model
+  if (routeModel === undefined) return []
+  const provider = model !== undefined && slash >= 0
+    ? model.slice(0, slash)
+    : roleRoute?.provider ?? masterProvider
+  return [
+    ...(provider === undefined ? [] : ['--env', `DSH_COOP_PROVIDER=${provider}`]),
+    '--env', `DSH_COOP_MODEL=${routeModel}`,
+    ...(roleRoute?.reasoningEffort === undefined
+      ? []
+      : ['--env', `DSH_COOP_EFFORT=${String(roleRoute.reasoningEffort)}`]),
+  ]
 }

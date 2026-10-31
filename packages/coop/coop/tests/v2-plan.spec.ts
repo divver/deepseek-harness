@@ -12,6 +12,9 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import CoopService, { readV2PlanFile, v2PlanPath, v2Root, writeV2PlanFile } from '../src/index.ts'
 import type { CoopV2PlanFile } from '../src/index.ts'
 
+// The dev shell may sit inside a herdr pane; revival must not see an ambient pane id (panes come from config `paneId`).
+delete process.env.HERDR_PANE_ID
+
 /**
  * v2 plan-DAG suite over a real agent spine: plan lifecycle, task add/link
  * with cycle rejection, ready computation, scheduler assignment with skill
@@ -495,5 +498,181 @@ describe('auto-approve without reviewer', () => {
     await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
     const reported = await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done')
     expect(reported.status).toBe('verifying')
+  })
+})
+
+describe('plan id prefixes and self-heal', () => {
+  it('resolves a unique plan-id prefix and canonicalizes downstream ids', async () => {
+    const { ctx, master, worker, reviewer } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't', spec: 'do' })
+    await activate(ctx, master, reviewer, plan.planId)
+    const short = plan.planId.slice(0, 12)
+    const begun = await ctx.coop.executeBeginV2(worker, short, 't1')
+    expect(begun.status).toBe('executing')
+    const reported = await ctx.coop.executeReportV2(worker, short, 't1', 'done via short id')
+    expect(reported.status).toBe('verifying')
+    // The verify wake-up carries the canonical id, so the loop never depends
+    // on prefix tolerance again.
+    expect(coopNotices(reviewer).some(text => text.includes('coop_task_verify') && text.includes(plan.planId))).toBe(true)
+    const verified = await ctx.coop.verifyTaskV2(reviewer, short, 't1', 'pass', 'lgtm')
+    expect(verified.status).toBe('done')
+  })
+
+  it('rejects an ambiguous plan-id prefix', async () => {
+    const { ctx, master, worker, reviewer } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    const planA = await ctx.coop.createPlanV2(master, { title: 'A', objective: 'O' })
+    await ctx.coop.createPlanV2(master, { title: 'B', objective: 'O' })
+    await ctx.coop.addTaskV2(master, planA.planId, { title: 't', spec: 'do' })
+    await activate(ctx, master, reviewer, planA.planId)
+    await expect(ctx.coop.executeBeginV2(worker, 'plan-', 't1')).rejects.toMatchObject({ code: 'COOP_PLAN_NOT_FOUND' })
+  })
+
+  it('assigns ready pinned work on the heal pass once the worker heartbeat recovers', async () => {
+    const { ctx, cwd, master, worker, reviewer } = await harness({ inboxPollMs: 3_600_000 })
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't', spec: 'do' })
+    await ctx.coop.updateTaskV2(master, plan.planId, 't1', { pinnedAssignee: 'worker' })
+    // The worker pane dies: its heartbeat ages past staleMs before the plan
+    // activates, so every scheduler pass at activation finds nobody fresh.
+    const registryPath = join(cwd, '.dsh', 'coop', 'v2', 'registry.json')
+    const { readFile, writeFile } = await import('node:fs/promises')
+    const rewriteHeartbeat = async (heartbeatAt: number): Promise<void> => {
+      const table = JSON.parse(await readFile(registryPath, 'utf8')) as { entries: Array<{ sessionId: string; heartbeatAt: number }> }
+      for (const entry of table.entries) {
+        if (entry.sessionId === 'worker') entry.heartbeatAt = heartbeatAt
+      }
+      await writeFile(registryPath, `${JSON.stringify(table, null, 2)}\n`)
+    }
+    await rewriteHeartbeat(Date.now() - 10 * 300_000)
+    await activate(ctx, master, reviewer, plan.planId)
+    let board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.status).toBe('ready')
+    // The pane comes back: its heartbeat recovers silently, with no scheduling
+    // event of its own — only the periodic heal pass can place the task now.
+    await rewriteHeartbeat(Date.now())
+    await (ctx.coop as unknown as { healV2: () => Promise<void> }).healV2()
+    board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.status).toBe('assigned')
+    expect(board[0]?.tasks[0]?.assignee).toBe('worker')
+    expect(coopNotices(worker).some(text => text.includes('task assigned') && text.includes('coop_execute_begin'))).toBe(true)
+  })
+
+  it('prunes registry rows dead beyond the heal horizon', async () => {
+    const { ctx, cwd, master, worker } = await harness({ inboxPollMs: 3_600_000 })
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    const registryPath = join(cwd, '.dsh', 'coop', 'v2', 'registry.json')
+    const { readFile, writeFile } = await import('node:fs/promises')
+    const table = JSON.parse(await readFile(registryPath, 'utf8')) as { entries: Array<{ sessionId: string; heartbeatAt: number }> }
+    for (const entry of table.entries) {
+      if (entry.sessionId === 'worker') entry.heartbeatAt = Date.now() - 8 * 24 * 3_600_000
+    }
+    await writeFile(registryPath, `${JSON.stringify(table, null, 2)}\n`)
+    await (ctx.coop as unknown as { healV2: () => Promise<void> }).healV2()
+    const after = JSON.parse(await readFile(registryPath, 'utf8')) as { entries: Array<{ sessionId: string }> }
+    expect(after.entries.some(entry => entry.sessionId === 'worker')).toBe(false)
+    expect(after.entries.some(entry => entry.sessionId === 'master')).toBe(true)
+  })
+})
+
+describe('registration by masterId', () => {
+  it('binds a worker even when a stale row shares the masterId earlier in the table', async () => {
+    const { ctx, cwd, master, worker, extra } = await harness({ inboxPollMs: 3_600_000 })
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const m = String((await ctx.coop.statusV2(master)).self?.masterId)
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m })
+    // A dead bound worker keeps its masterId, and file order can put that
+    // stale row ahead of the live master — binding by masterId must still
+    // resolve to the live master row.
+    const registryPath = join(cwd, '.dsh', 'coop', 'v2', 'registry.json')
+    const { readFile, writeFile } = await import('node:fs/promises')
+    const table = JSON.parse(await readFile(registryPath, 'utf8')) as { entries: Array<{ sessionId: string; heartbeatAt: number }> }
+    const dead = table.entries.splice(table.entries.findIndex(entry => entry.sessionId === 'worker'), 1)[0]
+    if (dead === undefined) throw new Error('worker row missing')
+    dead.heartbeatAt = Date.now() - 10 * 300_000
+    table.entries.unshift(dead)
+    await writeFile(registryPath, `${JSON.stringify(table, null, 2)}\n`)
+    const entry = await ctx.coop.registerV2(extra, { roles: ['worker'], masterId: m })
+    expect(entry.bindState).toBe('bound')
+    expect(String(entry.masterId)).toBe(m)
+  })
+})
+
+
+describe('concurrent masters in one workspace', () => {
+  it('binds workers to distinct masters and keeps signals isolated', async () => {
+    const { ctx, cwd, master, second, worker, extra, reviewer } = await harness()
+    // Two fresh masters share one cwd and one registry table.
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(second, { roles: ['master'] })
+    const m1 = String((await ctx.coop.statusV2(master)).self?.masterId)
+    const m2 = String((await ctx.coop.statusV2(second)).self?.masterId)
+    expect(m1).not.toBe(m2)
+    // A worker binds explicitly by masterId and serves exactly one master.
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: m1 })
+    await ctx.coop.registerV2(extra, { roles: ['worker'], masterId: m2 })
+    const reviewer2 = await ctx.agentLoop.create(SessionId('reviewer2'), { provider: 'mock', model: 'mock' }, { cwd })
+    await ctx.coop.registerV2(reviewer2, { roles: ['reviewer'], masterId: m2 })
+    const p1 = await ctx.coop.createPlanV2(master, { title: 'P1', objective: 'O' })
+    const p2 = await ctx.coop.createPlanV2(second, { title: 'P2', objective: 'O' })
+    await ctx.coop.addTaskV2(master, p1.planId, { title: 't', spec: 'A' })
+    await ctx.coop.addTaskV2(second, p2.planId, { title: 't', spec: 'B' })
+    await activate(ctx, master, reviewer, p1.planId)
+    await activate(ctx, second, reviewer2, p2.planId)
+    // Each master's scheduler placed its own task on its own worker.
+    const b1 = await ctx.coop.boardV2(master, p1.planId)
+    const b2 = await ctx.coop.boardV2(second, p2.planId)
+    expect(b1[0]?.tasks[0]?.assignee).toBe('worker')
+    expect(b2[0]?.tasks[0]?.assignee).toBe('extra')
+    // Push isolation: each worker only heard its own master's plan.
+    expect(coopNotices(worker).some(text => text.includes(p1.planId))).toBe(true)
+    expect(coopNotices(worker).some(text => text.includes(p2.planId))).toBe(false)
+    expect(coopNotices(extra).some(text => text.includes(p2.planId))).toBe(true)
+    expect(coopNotices(extra).some(text => text.includes(p1.planId))).toBe(false)
+    // Cross-master plan ids stay invisible to the other master's worker.
+    await expect(ctx.coop.executeBeginV2(worker, p2.planId, 't1')).rejects.toMatchObject({ code: 'COOP_PLAN_NOT_FOUND' })
+    await expect(ctx.coop.executeBeginV2(extra, p1.planId, 't1')).rejects.toMatchObject({ code: 'COOP_PLAN_NOT_FOUND' })
+    // Report routing: master1's verify wake goes to master1 (+ its reviewer), never to master2.
+    await ctx.coop.executeBeginV2(worker, p1.planId, 't1')
+    await ctx.coop.executeReportV2(worker, p1.planId, 't1', 'done A')
+    expect(coopNotices(master).some(text => text.includes('coop_task_verify') && text.includes(p1.planId))).toBe(true)
+    expect(coopNotices(second).some(text => text.includes(p1.planId))).toBe(false)
+    await ctx.coop.verifyTaskV2(reviewer, p1.planId, 't1', 'pass', 'lgtm')
+    expect((await ctx.coop.boardV2(master, p1.planId))[0]?.tasks[0]?.status).toBe('done')
+  })
+
+  it('arbitrates the unbound pool: first bind wins, the loser stops seeing the node', async () => {
+    const { ctx, master, second, extra } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(second, { roles: ['master'] })
+    const m1 = String((await ctx.coop.statusV2(master)).self?.masterId)
+    const m2 = String((await ctx.coop.statusV2(second)).self?.masterId)
+    await ctx.coop.registerV2(extra, { roles: ['worker'] })
+    const unboundOf = async (agent: typeof master): Promise<number> =>
+      (await ctx.coop.listNodesV2(agent, { unboundOnly: true })).length
+    expect(await unboundOf(master)).toBe(1)
+    expect(await unboundOf(second)).toBe(1)
+    await ctx.coop.bindNode(master, 'extra')
+    expect(await unboundOf(master)).toBe(0)
+    expect(await unboundOf(second)).toBe(0)
+    // The registry writer lock made the bind exclusive: master2 cannot take the same node.
+    await expect(ctx.coop.bindNode(second, 'extra')).rejects.toMatchObject({ code: 'COOP_NODE_NOT_FOUND' })
+    // Re-registration without a master keeps the winning binding (idempotent), and the
+    // bound worker is only visible to its owning master.
+    await ctx.coop.registerV2(extra, { roles: ['worker'] })
+    const secondView = await ctx.coop.listNodesV2(second)
+    expect(secondView.some(entry => entry.sessionId === 'extra')).toBe(false)
+    expect(m1).not.toBe(m2)
   })
 })

@@ -10,6 +10,9 @@ import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-test
 import { SessionId } from '@deepseek-ai/dsh-session'
 import CoopService, { memoryPath, readMemory, v2Root } from '../src/index.ts'
 
+// The dev shell may sit inside a herdr pane; revival must not see an ambient pane id (panes come from config `paneId`).
+delete process.env.HERDR_PANE_ID
+
 /**
  * v2 memory suite over a real agent spine: task/plan records land in the
  * master's jsonl trail with a markdown mirror, recency injection reads them

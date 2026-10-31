@@ -13,6 +13,9 @@ import { contextPctOf } from '../src/runtime.ts'
 import * as store from '../src/store.ts'
 import type { CoopV2RegistryFile } from '../src/types.ts'
 
+// The dev shell may sit inside a herdr pane; revival must not see an ambient pane id (panes come from config `paneId`).
+delete process.env.HERDR_PANE_ID
+
 /**
  * v2 scheduling suite over a real agent spine: master-designated worker pins
  * (`pinnedAssignee`), context-occupancy-aware worker priority, and

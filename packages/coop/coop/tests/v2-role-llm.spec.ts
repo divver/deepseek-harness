@@ -10,6 +10,9 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import CoopService, { readV2Registry, v2RegistryPath, v2Root } from '../src/index.ts'
 import { applyRoleLlmRoute, resolveCoopConfig } from '../src/runtime.ts'
 
+// The dev shell may sit inside a herdr pane; revival must not see an ambient pane id (panes come from config `paneId`).
+delete process.env.HERDR_PANE_ID
+
 /**
  * Per-role LLM routes: config validation, request rewrite, and the
  * registration-time wiring that pins a session onto its role route.
@@ -41,23 +44,23 @@ describe('resolveCoopConfig roleLlm', () => {
 
   it('rejects unknown role keys', () => {
     expect(() => resolveCoopConfig({ roleLlm: { waiter: { provider: 'p', model: 'm' } } as never }))
-      .toThrowError(/roleLlm role must be one of/)
+      .toThrow(/roleLlm role must be one of/)
   })
 
   it('requires provider and model together', () => {
     expect(() => resolveCoopConfig({ roleLlm: { worker: { model: 'm' } } }))
-      .toThrowError(/roleLlm\.worker requires provider and model together/)
+      .toThrow(/roleLlm\.worker requires provider and model together/)
     expect(() => resolveCoopConfig({ roleLlm: { worker: { provider: 'p' } } }))
-      .toThrowError(/roleLlm\.worker requires provider and model together/)
+      .toThrow(/roleLlm\.worker requires provider and model together/)
   })
 
   it('rejects empty strings and non-object values', () => {
     expect(() => resolveCoopConfig({ roleLlm: { worker: { provider: '', model: 'm' } } }))
-      .toThrowError(/must be non-empty/)
+      .toThrow(/must be non-empty/)
     expect(() => resolveCoopConfig({ roleLlm: { worker: { provider: 'p', model: 'm', reasoningEffort: '' } } }))
-      .toThrowError(/reasoningEffort must be non-empty/)
+      .toThrow(/reasoningEffort must be non-empty/)
     expect(() => resolveCoopConfig({ roleLlm: 'nope' as never }))
-      .toThrowError(/roleLlm must be an object/)
+      .toThrow(/roleLlm must be an object/)
   })
 
   it('skips empty entries', () => {
@@ -91,7 +94,7 @@ describe('registration wiring', () => {
     worker: Agent
   }
 
-  async function harness(config: ConstructorParameters<typeof CoopService>[1] = {}): Promise<Harness> {
+  async function harness(config: Partial<ConstructorParameters<typeof CoopService>[1]> = {}): Promise<Harness> {
     const cwd = await mkdtemp(join(tmpdir(), 'dsh-coop-role-llm-'))
     const previousCleanup = cleanup
     cleanup = async () => {
@@ -110,6 +113,7 @@ describe('registration wiring', () => {
 
   it('pins each registered session onto its role route and records meta.model', async () => {
     const { ctx, cwd, master, worker } = await harness({
+      paneId: 't1:pL',
       roleLlm: {
         master: { provider: 'deepseek-official', model: 'deepseek-reasoner', reasoningEffort: 'max' },
         worker: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' },

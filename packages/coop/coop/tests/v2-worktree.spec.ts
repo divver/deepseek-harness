@@ -13,6 +13,9 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import CoopService from '../src/index.ts'
 
+// The dev shell may sit inside a herdr pane; revival must not see an ambient pane id (panes come from config `paneId`).
+delete process.env.HERDR_PANE_ID
+
 /**
  * v2 worktree suite over a real git repo and the mounted shell seam:
  * occupancy naming, scheduler allocation, the merge-on-close happy path,

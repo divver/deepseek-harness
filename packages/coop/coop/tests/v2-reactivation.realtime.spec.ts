@@ -9,6 +9,9 @@ import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-test
 import { SessionId } from '@deepseek-ai/dsh-session'
 import CoopService, { readV2Registry, v2RegistryPath, v2Root } from '../src/index.ts'
 
+// The dev shell may sit inside a herdr pane; revival must not see an ambient pane id (panes come from config `paneId`).
+delete process.env.HERDR_PANE_ID
+
 /**
  * Real-time companion to the fake-clock 'auto reactivation' suite: one full
  * 15-minute idle period under the default 5-minute stale window (three stale

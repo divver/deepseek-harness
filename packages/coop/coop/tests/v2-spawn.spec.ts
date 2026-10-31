@@ -10,6 +10,9 @@ import { LocalSubprocessRuntime } from '@deepseek-ai/dsh-subprocess-local'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import CoopService from '../src/index.ts'
 
+// The dev shell may sit inside a herdr pane; revival must not see an ambient pane id (panes come from config `paneId`).
+delete process.env.HERDR_PANE_ID
+
 /**
  * v2 node-spawn suite (§8.2): the headless fallback creates and pre-binds an
  * in-process session, explicit herdr spawn fails loud outside a herdr pane,
@@ -90,31 +93,24 @@ describe('node spawn', () => {
   })
 
   it('herdr-hosted sessions self-report pane metadata at registration', async () => {
-    const { ctx, cwd } = await harness()
+    const { ctx, cwd } = await harness({ paneId: 't9:p7' })
     const worker = await ctx.agentLoop.create(SessionId('wtwo'), { provider: 'mock', model: 'mock' }, { cwd })
-    const hadPane = process.env.HERDR_PANE_ID
-    process.env.HERDR_PANE_ID = 't9:p7'
-    try {
-      const entry = await ctx.coop.registerV2(worker, { roles: ['worker'] })
-      expect(entry.meta?.paneId).toBe('t9:p7')
-      expect(entry.meta?.spawn).toBe('herdr')
-    } finally {
-      if (hadPane === undefined) delete process.env.HERDR_PANE_ID
-      else process.env.HERDR_PANE_ID = hadPane
-    }
+    const entry = await ctx.coop.registerV2(worker, { roles: ['worker'] })
+    expect(entry.meta?.paneId).toBe('t9:p7')
+    expect(entry.meta?.spawn).toBe('herdr')
   })
 
   it('spawnRegisterTimeoutMs defaults to 30s and rejects non-positive values', async () => {
     const { resolveCoopConfig } = await import('../src/runtime.ts')
     expect(resolveCoopConfig({}).spawnRegisterTimeoutMs).toBe(30_000)
-    expect(() => resolveCoopConfig({ spawnRegisterTimeoutMs: 0 })).toThrowError(/spawnRegisterTimeoutMs/)
+    expect(() => resolveCoopConfig({ spawnRegisterTimeoutMs: 0 })).toThrow(/spawnRegisterTimeoutMs/)
   })
 
   it('spawnLayout defaults to columns and validates the enum', async () => {
     const { resolveCoopConfig } = await import('../src/runtime.ts')
     expect(resolveCoopConfig({}).spawnLayout).toBe('columns')
     expect(resolveCoopConfig({ spawnLayout: 'right' }).spawnLayout).toBe('right')
-    expect(() => resolveCoopConfig({ spawnLayout: 'grid' })).toThrowError(/spawnLayout/)
+    expect(() => resolveCoopConfig({ spawnLayout: 'grid' })).toThrow(/spawnLayout/)
   })
 
   it('planColumnSplit arranges clean full-height role columns', async () => {
@@ -172,5 +168,109 @@ describe('node spawn', () => {
     expect(outcome.entry?.bindState).toBe('bound')
     await expect(ctx.coop.createNodeV2(master, { role: 'worker', worktree: 'coop/ghost' }))
       .rejects.toMatchObject({ code: 'COOP_NODE_NOT_FOUND' })
+  })
+})
+
+describe('spawn route env', () => {
+  it('seeds nothing without a route', async () => {
+    const { spawnRouteEnv } = await import('../src/runtime.ts')
+    expect(spawnRouteEnv(undefined, undefined, undefined)).toEqual([])
+  })
+
+  it('uses the role route verbatim when no per-node model is set', async () => {
+    const { spawnRouteEnv } = await import('../src/runtime.ts')
+    const route = { provider: 'zai-coding-cn', model: 'glm-5.3-flash', reasoningEffort: 'high' } as NonNullable<Parameters<typeof spawnRouteEnv>[1]>
+    expect(spawnRouteEnv(undefined, route, 'other')).toEqual([
+      '--env', 'DSH_COOP_PROVIDER=zai-coding-cn',
+      '--env', 'DSH_COOP_MODEL=glm-5.3-flash',
+      '--env', 'DSH_COOP_EFFORT=high',
+    ])
+  })
+
+  it('lets an explicit provider/model pair override the role route', async () => {
+    const { spawnRouteEnv } = await import('../src/runtime.ts')
+    const route = { provider: 'zai-coding-cn', model: 'glm-5.3-flash' } as NonNullable<Parameters<typeof spawnRouteEnv>[1]>
+    expect(spawnRouteEnv('deepseek/deepseek-chat', route, 'other')).toEqual([
+      '--env', 'DSH_COOP_PROVIDER=deepseek',
+      '--env', 'DSH_COOP_MODEL=deepseek-chat',
+    ])
+  })
+
+  it('keeps the role provider for a bare model and falls back to the master provider', async () => {
+    const { spawnRouteEnv } = await import('../src/runtime.ts')
+    expect(spawnRouteEnv('glm-5.3', { provider: 'zai-coding-cn', model: 'glm-5.3-flash' }, 'other')).toEqual([
+      '--env', 'DSH_COOP_PROVIDER=zai-coding-cn',
+      '--env', 'DSH_COOP_MODEL=glm-5.3',
+    ])
+    expect(spawnRouteEnv('glm-5.3', undefined, 'master-prov')).toEqual([
+      '--env', 'DSH_COOP_PROVIDER=master-prov',
+      '--env', 'DSH_COOP_MODEL=glm-5.3',
+    ])
+  })
+})
+
+describe('pane-keyed master revival', () => {
+  async function paneHarness(cwd: string, paneId: string, staleMs = 300_000): Promise<Context> {
+    const ctx = new Context()
+    await mountAgentLoopTestDependencies(ctx)
+    await ctx.plugin(AgentLoop, { agents: [] })
+    await ctx.plugin(CoopService, { mode: 'v2', mirrorEvents: true, inboxPollMs: 3_600_000, staleMs, paneId })
+    return ctx
+  }
+
+  async function tmpRoot(): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-coop-v2-pane-'))
+    const previousCleanup = cleanup
+    cleanup = async () => {
+      await previousCleanup?.()
+      const { rm } = await import('node:fs/promises')
+      await rm(root, { recursive: true, force: true })
+    }
+    return root
+  }
+
+  it('reuses the same-pane identity once its heartbeat went silent past half the stale window', async () => {
+    const root = await tmpRoot()
+    const ctx = await paneHarness(root, 't1:pR', 400)
+    const first = await ctx.agentLoop.create(SessionId('pm1'), { provider: 'mock', model: 'mock' }, { cwd: root })
+    await ctx.coop.registerV2(first, { roles: ['master'] })
+    const id1 = String((await ctx.coop.statusV2(first)).self?.masterId)
+    // The pane dies; with the poll silent the heartbeat ages past staleMs / 2
+    // while the row is still formally fresh — the pane match must revive it.
+    await new Promise(resolve => setTimeout(resolve, 250))
+    const second = await ctx.agentLoop.create(SessionId('pm2'), { provider: 'mock', model: 'mock' }, { cwd: root })
+    const entry = await ctx.coop.registerV2(second, { roles: ['master'] })
+    expect(String(entry.masterId)).toBe(id1)
+    const { readFile } = await import('node:fs/promises')
+    const table = JSON.parse(await readFile(join(root, '.dsh', 'coop', 'v2', 'registry.json'), 'utf8')) as { entries: Array<{ roles: string[] }> }
+    expect(table.entries.filter(candidate => candidate.roles.includes('master'))).toHaveLength(1)
+  })
+
+  it('follows a session switch inside one TUI process', async () => {
+    const root = await tmpRoot()
+    const ctx = await paneHarness(root, 't1:pS')
+    const first = await ctx.agentLoop.create(SessionId('sm1'), { provider: 'mock', model: 'mock' }, { cwd: root })
+    await ctx.coop.registerV2(first, { roles: ['master'] })
+    const id1 = String((await ctx.coop.statusV2(first)).self?.masterId)
+    // The prior session still lives in this process, so the successor
+    // reuses the pane identity even though the heartbeat is fresh.
+    const second = await ctx.agentLoop.create(SessionId('sm2'), { provider: 'mock', model: 'mock' }, { cwd: root })
+    const entry = await ctx.coop.registerV2(second, { roles: ['master'] })
+    expect(String(entry.masterId)).toBe(id1)
+  })
+
+  it('mints a new identity for a different pane', async () => {
+    const root = await tmpRoot()
+    const ctx1 = await paneHarness(root, 't1:pD1')
+    const ctx2 = await paneHarness(root, 't1:pD2')
+    const first = await ctx1.agentLoop.create(SessionId('dm1'), { provider: 'mock', model: 'mock' }, { cwd: root })
+    await ctx1.coop.registerV2(first, { roles: ['master'] })
+    const id1 = String((await ctx1.coop.statusV2(first)).self?.masterId)
+    const second = await ctx2.agentLoop.create(SessionId('dm2'), { provider: 'mock', model: 'mock' }, { cwd: root })
+    const entry = await ctx2.coop.registerV2(second, { roles: ['master'] })
+    expect(String(entry.masterId)).not.toBe(id1)
+    const { readFile } = await import('node:fs/promises')
+    const table = JSON.parse(await readFile(join(root, '.dsh', 'coop', 'v2', 'registry.json'), 'utf8')) as { entries: Array<{ roles: string[] }> }
+    expect(table.entries.filter(candidate => candidate.roles.includes('master'))).toHaveLength(2)
   })
 })
