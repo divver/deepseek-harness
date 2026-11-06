@@ -124,6 +124,9 @@ export interface Config {
   spawnLayout?: 'columns' | 'right'
   /** v2 pane identity for pane-keyed master revival; unset falls back to `HERDR_PANE_ID` (test seam). */
   paneId?: string
+  /** v2 scheduler skill-demand matching: `strict` gate (default), `fallback` to
+     * any free worker when none declares the demanded skills, or `off` ignoring demands. */
+  skillMatch?: 'strict' | 'fallback' | 'off'
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -152,6 +155,7 @@ export const Config: z<Config> = z.object({
   spawnReadyRegex: z.string(),
   spawnRegisterTimeoutMs: z.number(),
   spawnLayout: z.string(),
+  skillMatch: z.string(),
   paneId: z.string(),
   roleLlm: z.any(),
   inboxPollMs: z.number(),
@@ -1632,12 +1636,15 @@ export class CoopService extends Service {
        * Single-writer per master (the acting process); each assignment commits
        * under its plan's writer lock and the busy set is rebuilt from a fresh scan
        * of every active plan, so `maxParallelTasks` holds across plans. A worker
-       * without declared skills only receives tasks with no skill demand. A
-       * master-pinned task (`pinnedAssignee`) only ever goes to its designated
-       * worker; otherwise the lowest-context free worker wins, and when every
-       * bound worker sits at/above `workerContextCeilingPct` while the master
-       * already holds `maxWorkers`, the hottest idle one is recycled for a
-         * fresh replacement (§4.4 spawn transport).
+       * without declared skills only receives tasks with no skill demand under
+       * `skillMatch: strict` (the default); `fallback` lets any idle worker take
+       * a task no idle worker declares the skills for, and `off` ignores skill
+       * demands entirely. A
+         * master-pinned task (`pinnedAssignee`) only ever goes to its designated
+         * worker; otherwise the lowest-context free worker wins, and when every
+         * bound worker sits at/above `workerContextCeilingPct` while the master
+         * already holds `maxWorkers`, the hottest idle one is recycled for a
+           * fresh replacement (§4.4 spawn transport).
          * @param root - absolute v2 root.
          * @param masterId - owning master id.
          * @returns how many tasks were assigned.
@@ -1704,8 +1711,18 @@ export class CoopService extends Service {
         for (const task of plan.tasks) {
           if (task.status !== 'ready') continue
           if (inflight + picked.length >= this.resolved.maxParallelTasks) break
-          const free = workers.filter(worker => !busy.has(worker.sessionId)
-                && task.skills.every(skill => (worker.skills ?? []).includes(skill)))
+          const idle = workers.filter(worker => !busy.has(worker.sessionId))
+          // Skill gating: `strict` keeps the declaring-only gate; `fallback`
+          // lets any idle worker take a task whose demanded skills no idle
+          // worker declares (skills are host-global in single-machine
+          // deployments, so an undeclared worker can still load them);
+          // `off` ignores demands entirely.
+          let free = this.resolved.skillMatch === 'off'
+            ? idle
+            : idle.filter(worker => task.skills.every(skill => (worker.skills ?? []).includes(skill)))
+          if (free.length === 0 && idle.length > 0 && this.resolved.skillMatch === 'fallback') {
+            free = idle
+          }
           // A master-pinned task only ever goes to its designated worker;
           // otherwise the lowest-context free worker wins, so saturated
           // contexts sink in scheduling priority.
@@ -3000,7 +3017,7 @@ export class CoopService extends Service {
        */
   async createNodeV2(
     agent: Agent,
-    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string; worktree?: string },
+    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string; worktree?: string; skills?: string[] },
   ): Promise<{ spawned: 'herdr' | 'headless'; paneId?: string; entry?: CoopV2RegistryEntry }> {
     const { masterId, root } = await this.requireV2Master(agent)
     // Where the node LIVES: an assigned worktree wins, then an explicit
@@ -3069,7 +3086,7 @@ export class CoopService extends Service {
         throw new CoopError(`spawned pane never matched spawnReadyRegex: ${ready.stderr || ready.stdout}`, 'COOP_SPAWN_FAILED')
       }
     }
-    const line = `/coop ${req.role} --master ${String(masterId)}${req.model === undefined ? '' : ` --model ${req.model}`}`
+    const line = `/coop ${req.role} --master ${String(masterId)}${req.model === undefined ? '' : ` --model ${req.model}`}${req.skills === undefined || req.skills.length === 0 ? '' : ` --skills ${req.skills.join(',')}`}`
     const send = await this.runHerdr(['pane', 'send-text', paneId, line])
     if (send.code !== 0) {
       throw new CoopError(`herdr pane send-text failed: ${send.stderr || send.stdout}`, 'COOP_SPAWN_FAILED')
@@ -3095,7 +3112,7 @@ export class CoopService extends Service {
        */
   private async createNodeHeadless(
     agent: Agent,
-    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string },
+    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string; skills?: string[] },
     masterId: MasterId,
     cwd: string,
   ): Promise<{ spawned: 'headless'; entry: CoopV2RegistryEntry }> {
@@ -3126,6 +3143,7 @@ export class CoopService extends Service {
       roles: [req.role],
       masterId: String(masterId),
       ...(req.model === undefined ? {} : { model: req.model }),
+      ...(req.skills === undefined ? {} : { skills: req.skills }),
     })
     return { spawned: 'headless', entry }
   }

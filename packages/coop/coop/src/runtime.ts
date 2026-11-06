@@ -55,7 +55,9 @@ export interface ResolvedCoopConfig {
   /** v2 per-role LLM routes applied to every request of a registered session (mode v2 only). */
   roleLlm: RoleLlmRoutes
   /** v2 pane identity for pane-keyed master revival; unset falls back to `HERDR_PANE_ID`. */
-  paneId?: string
+  paneId?: string | undefined
+  /** v2 scheduler skill-demand matching: strict gate, fallback to any free worker when none declares, or off (default strict). */
+  skillMatch: 'strict' | 'fallback' | 'off'
 }
 
 /**
@@ -92,6 +94,7 @@ export function resolveCoopConfig(config: {
   spawnRegisterTimeoutMs?: number
   roleLlm?: RoleLlmSettings | null
   spawnLayout?: string
+  skillMatch?: 'strict' | 'fallback' | 'off'
   paneId?: string
 }): ResolvedCoopConfig {
   const positive = (value: number | undefined, name: string): number | undefined => {
@@ -108,6 +111,9 @@ export function resolveCoopConfig(config: {
   }
   if (config.spawnLayout !== undefined && config.spawnLayout !== 'columns' && config.spawnLayout !== 'right') {
     throw new CoopError(`config spawnLayout must be "columns" | "right", got "${config.spawnLayout}"`, 'COOP_CONFIG_UNSUPPORTED')
+  }
+  if (config.skillMatch !== undefined && config.skillMatch !== 'strict' && config.skillMatch !== 'fallback' && config.skillMatch !== 'off') {
+    throw new CoopError(`config skillMatch must be "strict" | "fallback" | "off", got "${String(config.skillMatch)}"`, 'COOP_CONFIG_UNSUPPORTED')
   }
   const roleLlm = resolveRoleLlm(config.roleLlm)
   const spawnRegisterTimeoutMs = positive(config.spawnRegisterTimeoutMs, 'spawnRegisterTimeoutMs') ?? 30_000
@@ -142,6 +148,7 @@ export function resolveCoopConfig(config: {
     spawnReadyRegex: config.spawnReadyRegex ?? '',
     spawnRegisterTimeoutMs,
     spawnLayout: config.spawnLayout === 'right' ? 'right' : 'columns',
+    skillMatch: config.skillMatch ?? 'strict',
     roleLlm,
     paneId: config.paneId,
   }

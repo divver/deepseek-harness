@@ -261,6 +261,40 @@ describe('availability-driven rescheduling', () => {
     expect(board[0]?.tasks[0]?.assignee).toBe('worker')
   })
 
+  it('skillMatch fallback assigns a skills-demanded task to a skills-less worker', async () => {
+    const { ctx, master, worker, reviewer } = await harness({ skillMatch: 'fallback' })
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'go work', skills: ['go'] })
+    await activate(ctx, master, reviewer, plan.planId)
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.assignee).toBe('worker')
+  })
+
+  it('skillMatch fallback still prefers the declaring worker over a skills-less one', async () => {
+    const { ctx, master, worker, extra, reviewer } = await harness({ skillMatch: 'fallback' })
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId), skills: ['go'] })
+    await ctx.coop.registerV2(extra, { roles: ['worker'], masterId: String(m.masterId) })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'go work', skills: ['go'] })
+    await activate(ctx, master, reviewer, plan.planId)
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.assignee).toBe('worker')
+  })
+
+  it('skillMatch off assigns skill-demanded tasks regardless of declarations', async () => {
+    const { ctx, master, worker, reviewer } = await harness({ skillMatch: 'off' })
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'go work', skills: ['go'] })
+    await activate(ctx, master, reviewer, plan.planId)
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.assignee).toBe('worker')
+  })
+
   it('schedules a ready task when the master binds an idle worker', async () => {
     const { ctx, master, worker, reviewer } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
