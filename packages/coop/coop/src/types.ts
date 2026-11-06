@@ -205,6 +205,8 @@ export interface CoopV2RegistryEntry {
     contextPct?: number
     contextTokens?: number
     contextWindow?: number
+    /** When a dead-pane forced handoff claimed this entry (cross-process dedupe). */
+    contextHandoffAt?: number
   }
 }
 

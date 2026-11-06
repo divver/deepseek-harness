@@ -194,6 +194,155 @@ describe('context-aware scheduling', () => {
   })
 })
 
+describe('context hard guard', () => {
+  /** Deterministic scheduling trigger: a task depending on t1 — t1 stays executing
+   * (locked for updateTaskV2) and the dependent stays pending, but scheduleV2 (and the
+   * hard-context guard with it) runs on every add. Re-registering the worker would
+   * rebuild its registry row and drop the seeded contextPct. */
+  const retick = async (ctx: Context, master: Agent, planId: string): Promise<void> => {
+    await ctx.coop.addTaskV2(master, planId, { title: 'guard-tick', spec: 'x', dependsOn: ['t1'] })
+  }
+
+  it('delivers a handoff order once when an executing assignee crosses the hard pct (worker default: handoff)', async () => {
+    const { ctx, cwd, master, worker, reviewer } = await harness({ contextHardPct: 0.9, contextHardGraceMs: 3_600_000 })
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
+    await activate(ctx, master, reviewer, plan.planId)
+    await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    await seedContext(cwd, 'worker', 0.95)
+    await retick(ctx, master, plan.planId)
+    const first = coopNotices(worker).filter(text => text.includes('context hard limit'))
+    expect(first).toHaveLength(1)
+    expect(first[0]).toContain('coop_handoff')
+    await retick(ctx, master, plan.planId)
+    expect(coopNotices(worker).filter(text => text.includes('context hard limit'))).toHaveLength(1)
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.status).toBe('executing')
+    expect(board[0]?.tasks[0]?.assignee).toBe('worker')
+  })
+
+  it('forces a grace-expired handoff: task reclaimed, worker released, replacement spawned', async () => {
+    const { ctx, cwd, master, worker, reviewer } = await harness({ contextHardPct: 0.9, contextHardGraceMs: 150, maxWorkers: 1 })
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
+    await activate(ctx, master, reviewer, plan.planId)
+    await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    await seedContext(cwd, 'worker', 0.95)
+    await retick(ctx, master, plan.planId)
+    await new Promise(resolve => setTimeout(resolve, 200))
+    await retick(ctx, master, plan.planId)
+    const registry = await readV2Registry(v2RegistryPath(v2Root(cwd, '.dsh/coop')))
+    const entries = registry?.entries ?? []
+    expect(entries.find(entry => entry.sessionId === 'worker')).toBeUndefined()
+    const replacement = entries.find(entry => entry.sessionId.startsWith('coop-worker-'))
+    expect(replacement?.bindState).toBe('bound')
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.assignee).toMatch(/^coop-worker-/)
+    expect(coopNotices(master).some(text => text.includes('replacement spawned'))).toBe(true)
+    expect(coopNotices(worker).some(text => text.includes('released'))).toBe(true)
+  })
+
+  it('coop_handoff reclaims tasks and hands skills to the successor without a pane', async () => {
+    const { ctx, cwd, master, worker, reviewer } = await harness({ maxWorkers: 1 })
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId), skills: ['go'] })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'go work', skills: ['go'] })
+    await activate(ctx, master, reviewer, plan.planId)
+    await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
+    const result = await ctx.coop.handoffV2(worker, { handoverPath: '/tmp/handoff.md' })
+    expect(result).toContain('replaced')
+    const registry = await readV2Registry(v2RegistryPath(v2Root(cwd, '.dsh/coop')))
+    const entries = registry?.entries ?? []
+    expect(entries.find(entry => entry.sessionId === 'worker')).toBeUndefined()
+    const replacement = entries.find(entry => entry.sessionId.startsWith('coop-worker-'))
+    expect(replacement?.skills).toEqual(['go'])
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.assignee).toMatch(/^coop-worker-/)
+  })
+
+  it('master at the hard pct gets the compact-hint notice once (master default: compact)', async () => {
+    const { ctx, cwd, master } = await harness({ contextHardPct: 0.9 })
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
+    await seedContext(cwd, 'master', 0.95)
+    await retick(ctx, master, plan.planId)
+    const notices = coopNotices(master).filter(text => text.includes('context hard limit'))
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toContain('/compact')
+    await retick(ctx, master, plan.planId)
+    expect(coopNotices(master).filter(text => text.includes('context hard limit'))).toHaveLength(1)
+  })
+
+  it('per-role limit override gates only the named role', async () => {
+    const { ctx, cwd, master, worker, reviewer } = await harness({
+      contextHardPctByRole: { worker: 0.6 },
+      contextHardGraceMs: 3_600_000,
+    })
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
+    await activate(ctx, master, reviewer, plan.planId)
+    await seedContext(cwd, 'worker', 0.55)
+    await retick(ctx, master, plan.planId)
+    expect(coopNotices(worker).filter(text => text.includes('context hard limit'))).toHaveLength(0)
+    await seedContext(cwd, 'worker', 0.65)
+    await retick(ctx, master, plan.planId)
+    expect(coopNotices(worker).filter(text => text.includes('context hard limit'))).toHaveLength(1)
+  })
+
+  it('a dead saturated pane is handed off by any surviving process', async () => {
+    const { ctx, cwd, master, reviewer } = await harness({ contextHardPct: 0.9, contextHardGraceMs: 150, maxWorkers: 2 })
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
+    await activate(ctx, master, reviewer, plan.planId)
+    // A worker row no process hosts: heartbeat frozen past the stale window.
+    const registryPath = v2RegistryPath(v2Root(cwd, '.dsh/coop'))
+    const file = JSON.parse(await readFile(registryPath, 'utf8')) as CoopV2RegistryFile
+    const dead = {
+      sessionId: 'ghost-worker',
+      roles: ['worker'],
+      masterId: String(m.masterId),
+      bindState: 'bound',
+      cwd,
+      cwdScope: 'cwd' as const,
+      updatedAt: Date.now() - 400_000,
+      heartbeatAt: Date.now() - 400_000,
+      meta: { contextPct: 0.95, paneId: 'w9:pZ' },
+    }
+    file.entries = [...file.entries, dead]
+    await writeFile(registryPath, `${JSON.stringify(file, null, 2)}\n`)
+    await retick(ctx, master, plan.planId)
+    const after = await readV2Registry(registryPath)
+    const entries = after?.entries ?? []
+    expect(entries.find(entry => entry.sessionId === 'ghost-worker')).toBeUndefined()
+    const replacement = entries.find(entry => entry.sessionId.startsWith('coop-worker-'))
+    expect(replacement?.bindState).toBe('bound')
+    const board = await ctx.coop.boardV2(master, plan.planId)
+    expect(board[0]?.tasks[0]?.assignee).toMatch(/^coop-worker-/)
+    expect(coopNotices(master).some(text => text.includes('ghost-worker'))).toBe(true)
+  })
+
+  it('strategy none stays silent at the hard pct', async () => {
+    const { ctx, cwd, master, worker, reviewer } = await harness({ contextHardPct: 0.9, contextStrategy: { worker: 'none' } })
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(worker, { roles: ['worker'], masterId: String(m.masterId) })
+    const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
+    await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
+    await activate(ctx, master, reviewer, plan.planId)
+    await seedContext(cwd, 'worker', 0.95)
+    await retick(ctx, master, plan.planId)
+    expect(coopNotices(worker).filter(text => text.includes('context hard limit'))).toHaveLength(0)
+  })
+})
+
 describe('context occupancy helpers', () => {
   it('contextPctOf computes, clamps, and stays undefined on partial views', () => {
     expect(contextPctOf({ projectedTokens: 650, contextWindow: 1000 })).toBe(0.65)
@@ -296,8 +445,10 @@ describe('availability-driven rescheduling', () => {
   })
 
   it('schedules a ready task when the master binds an idle worker', async () => {
-    const { ctx, master, worker, reviewer } = await harness()
+    const { ctx, master, extra, worker, reviewer } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
+    // A second live master keeps the bare worker registration unbound for the bind below.
+    await ctx.coop.registerV2(extra, { roles: ['master'] })
     await ctx.coop.registerV2(worker, { roles: ['worker'] })
     const plan = await ctx.coop.createPlanV2(master, { title: 'P', objective: 'O' })
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })

@@ -143,6 +143,27 @@ describe('registration', () => {
       .rejects.toMatchObject({ code: 'COOP_NODE_NOT_FOUND' })
   })
 
+  it('auto-binds a bare worker registration to the sole live master', async () => {
+    const { ctx, master, worker, reviewer } = await harness()
+    const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    const workerEntry = await ctx.coop.registerV2(worker, { roles: ['worker'] })
+    expect(workerEntry.bindState).toBe('bound')
+    expect(String(workerEntry.masterId)).toBe(String(m.masterId))
+    const reviewerEntry = await ctx.coop.registerV2(reviewer, { roles: ['reviewer'] })
+    expect(reviewerEntry.bindState).toBe('bound')
+    expect(String(reviewerEntry.masterId)).toBe(String(m.masterId))
+  })
+
+  it('keeps a bare registration unbound with zero or several live masters', async () => {
+    const { ctx, master, second, worker } = await harness()
+    const bare = await ctx.coop.registerV2(worker, { roles: ['worker'] })
+    expect(bare.bindState).toBe('unbound')
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(second, { roles: ['master'] })
+    const again = await ctx.coop.registerV2(worker, { roles: ['worker'] })
+    expect(again.bindState).toBe('unbound')
+  })
+
   it('re-registering the same roles without a masterId keeps the bind', async () => {
     const { ctx, master, worker } = await harness()
     const m = await ctx.coop.registerV2(master, { roles: ['master'] })
@@ -155,8 +176,10 @@ describe('registration', () => {
 
 describe('binding', () => {
   it('binds an unbound node exclusively and wakes it in-process', async () => {
-    const { ctx, master, worker } = await harness()
+    const { ctx, master, second, worker } = await harness()
     const m = await ctx.coop.registerV2(master, { roles: ['master'] })
+    // A second live master keeps the bare worker registration unbound (auto-bind needs a sole master).
+    await ctx.coop.registerV2(second, { roles: ['master'] })
     await ctx.coop.registerV2(worker, { roles: ['worker'] })
     const bound = await ctx.coop.bindNode(master, 'worker')
     expect(bound.bindState).toBe('bound')
@@ -178,8 +201,9 @@ describe('binding', () => {
   })
 
   it('enforces per-master worker capacity at bind', async () => {
-    const { ctx, master, worker, extra } = await harness({ maxWorkers: 1 })
+    const { ctx, master, second, worker, extra } = await harness({ maxWorkers: 1 })
     await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(second, { roles: ['master'] })
     await ctx.coop.registerV2(worker, { roles: ['worker'] })
     await ctx.coop.registerV2(extra, { roles: ['worker'] })
     await ctx.coop.bindNode(master, 'worker')
@@ -187,8 +211,9 @@ describe('binding', () => {
   })
 
   it('binds reviewers under their own capacity', async () => {
-    const { ctx, master, reviewer, extra } = await harness({ maxReviewers: 1 })
+    const { ctx, master, second, reviewer, extra } = await harness({ maxReviewers: 1 })
     await ctx.coop.registerV2(master, { roles: ['master'] })
+    await ctx.coop.registerV2(second, { roles: ['master'] })
     await ctx.coop.registerV2(reviewer, { roles: ['reviewer'] })
     await ctx.coop.registerV2(extra, { roles: ['reviewer'] })
     await ctx.coop.bindNode(master, 'reviewer')

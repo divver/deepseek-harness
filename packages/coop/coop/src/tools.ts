@@ -1176,4 +1176,34 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
     },
     presentCall: args => ({ card: 'generic', title: 'Spawn coop node', kind: 'other', rawInput: args.role }),
   }))
+
+  ctx.tools.register(defineTool({
+    name: 'coop_handoff',
+    description: 'Hand this saturated session\'s coop role to a fresh session in the same herdr pane (context hard limit path). Write the handover document first (load the "handoff" skill when present), then call this: executing tasks are reclaimed with their worktrees, the pane is reset with /new, and the role\'s registration line re-establishes the same role and bindings on the successor session.',
+    parameters: {
+      handoverPath: { type: 'string', description: 'Path of the handover document just written (recorded in the completion notice).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          result: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => textOut(value.result),
+    },
+    async execute(args, exec) {
+      const agent = needAgent(exec)
+      try {
+        const result = await service.handoffV2(agent, {
+          ...(args.handoverPath === undefined ? {} : { handoverPath: args.handoverPath }),
+        })
+        return { result }
+      } catch (error) {
+        throw new Error(failMessage(error))
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Coop handoff', kind: 'other', rawInput: args.handoverPath ?? '' }),
+  }))
 }

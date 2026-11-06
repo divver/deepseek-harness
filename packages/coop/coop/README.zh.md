@@ -58,7 +58,10 @@ executing heartbeat timeout → needs_rework (worker may re-begin)
 | `roleLlm` | _（空）_ | v2 按角色固定 LLM 路由 `{ master\|worker\|reviewer: { provider, model, reasoningEffort? } }`；注册为该角色的会话其每个请求都改走此路由（provider+model 成对，effort 档位由目标 adapter 解释） |
 | `spawnRegisterTimeoutMs` | `30000` | v2 等待新窗格注册落入注册表的窗口；期间每约 4 秒重发注册行，超时 fail-loud 并给出手动注册行 |
 | `skillMatch` | `strict` | v2 调度器 skill 需求匹配：`strict` —— worker 声明了任务要求的全部 skill 才可接；`fallback` —— 声明者优先，但无任何空闲 worker 声明时允许任意空闲 worker 接（单机部署下 skill 是全局的）；`off` —— 忽略 skill 需求 |
-| `spawnLayout` | `columns` | v2 自动建窗格的排布：`columns` —— master 一列，worker 一列（上下堆叠），reviewer 一列（上下堆叠，在 worker 列右侧）；`right` —— 旧行为，全部切在 master 右侧 |
+| `contextHardPct` | `0.5` | v2 硬限护栏，覆盖**全部角色**（master/worker/reviewer）：会话上下文占比达到该阈值即触发该角色的 `contextStrategy` |
+| `contextHardPctByRole` | _(空)_ | v2 按角色覆盖护栏阈值（`worker`/`master`/`reviewer`），优先于 `contextHardPct` |
+| `contextHardGraceMs` | `300000` | v2 handoff 收尾指令到强制重置窗格之间的宽限期 |
+| `contextStrategy` | worker `handoff`，master/reviewer `compact` | v2 按角色的护栏策略：`handoff` —— 下发收尾指令（写交接文档后调 `coop_handoff`），宽限期后用 `/new` 把窗格重置到同角色新会话（master 身份经 pane 复活保留，worker 执行中的任务连 worktree 一起回收、skills 透传）；窗格已死（心跳冻结超过 stale 窗口）的饱和节点由任一存活进程代执行 handoff，注册表戳记跨进程去重；`compact` —— 会话空闲时经 compaction 服务原地压缩（忙时下发收尾提示）；`none` —— 不护栏 | v2 自动建窗格的排布：`columns` —— master 一列，worker 一列（上下堆叠），reviewer 一列（上下堆叠，在 worker 列右侧）；`right` —— 旧行为，全部切在 master 右侧 |
 
 ## v2 模式（已交付 P0）
 
@@ -67,7 +70,7 @@ executing heartbeat timeout → needs_rework (worker may re-begin)
 - **角色** —— `master` / `worker` / `reviewer` 注册到 `.dsh/coop/v2/registry.json`。master 铸造 `masterId`（`<slug>#<uuid>`）；worker/reviewer 以 `unbound` 落地。
 - **独占绑定** —— `coop_bind` 在注册表写锁内领养 unbound 节点；绑定后该节点仅对该 master 可见（隔离靠可见性实现）。`coop_release` 将其退回 unbound 池；容量遵循 `maxWorkers` / `maxReviewers`。
 - **Workspace 锚点** —— 节点自 session cwd 逐级向上找最近的 `.dsh/coop/workspace.json`，找不到则以 cwd 自身为 workspace。父目录只有通过 `/coop workspace init [path]` 才会成为 workspace —— 绝不静默创建。
-- **命令** —— `/coop master|worker|reviewer [--master <id>] [--model <route>] [--any-cwd]`、`/coop list [--unbound]`、`/coop bind|release <sessionId>`、`/coop status`、`/coop off`、`/coop workspace init [path]`。
+- **命令** —— `/coop master|worker|reviewer [--master <id>] [--model <route>] [--any-cwd]`（工作区只有一个存活 master 时，裸 `/coop worker|reviewer` 自动绑定该 master）、`/coop list [--unbound]`、`/coop bind|release <sessionId>`、`/coop status`、`/coop off`、`/coop workspace init [path]`。
 - **工具** —— `coop_register`、`coop_list`、`coop_bind`、`coop_release`、`coop_status`；v2 模式下不注册 v1 的十一个工具。
 - **Worktree（P2）** —— `coop_worktree_create` 把 plan 的 `repoRoot` 通过 shell seam（git 一律走 `ctx.shell`，禁止裸 `child_process`）分支到 `<workspace>/wt/<masterId>/<seq>-<slug>`；目录名在全局 `wt-registry.json` 锁内占位，master 之间绝不撞车。调度器给被分派任务分配空闲 worktree（独占），并在唤醒信令里指名。`coop_worktree_merge` 用 `git merge --no-ff` 合回（base 移动或冲突 → `COOP_WORKTREE_MERGE_CONFLICT` fail-loud，绝不自动解冲突，§6.4）；`coop_plan_close` 先自动合并全部活跃 worktree；`coop_worktree_clean` 移除（`force` 丢弃改动）。
 - **Reviewer 门控与升级（P3）** —— 激活现在经由评审：`coop_plan_submit_review`（designing → reviewing，唤醒被绑 reviewer）与 `coop_plan_review`（pass → active 并调度；request_changes → 回到 designing；与任务验证同构的 reviewer/allowSelfReview 门；无存活 reviewer 时由 master 自行门控两者——即 v1 回退；`autoApproveNoReviewer: true` 则无 reviewer 时 submit 直接激活，且仅 master 本会话的 report 自动通过；worker 报告始终进入验收）。任务携带执行心跳（`coop_execute_touch`），静默超过 `executingStaleMs` 回落 rework；`hardDeadlineMs` 自首次分派计时，到期任务 blocked；`maxReworkAttempts` 耗尽的 `request_changes` 判定同样 blocked，并同时通知 worker 与 master。subagent 执行型任务会在分派信令中指示 worker 把任务 spec 委托给 sub-agent。

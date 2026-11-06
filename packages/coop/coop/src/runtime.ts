@@ -4,6 +4,10 @@ import { isAbsolute, join, normalize, resolve, basename } from 'node:path'
 import { HarnessError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { CwdScope, CoopErrorCode, MasterId, PlanId, ReviewLevel, Role, V2Role } from './types.ts'
 import { randomUUID } from 'node:crypto'
+/** v2 hard-context-guard handling strategy for one role. */
+export type ContextGuardStrategy = 'handoff' | 'compact' | 'none'
+
+
 
 
 /** All roles that may hold `cwdScope: "any"` when the deployment allows any-scope at all. */
@@ -58,6 +62,14 @@ export interface ResolvedCoopConfig {
   paneId?: string | undefined
   /** v2 scheduler skill-demand matching: strict gate, fallback to any free worker when none declares, or off (default strict). */
   skillMatch: 'strict' | 'fallback' | 'off'
+  /** v2 hard context guard threshold per role (0..1): by-role override, else `contextHardPct`, else 0.5. */
+  contextLimit: { worker: number; master: number; reviewer: number }
+  /** v2 grace between the wrap-up order and the forced task reclaim (default 300,000). */
+  contextHardGraceMs: number
+  /** v2 hard context guard strategy per role: `handoff` resets the pane onto a
+   * fresh session of the same role, `compact` compacts in place, `none`
+   * disables (default: worker handoff, master/reviewer compact). */
+  contextStrategy: { worker: ContextGuardStrategy; master: ContextGuardStrategy; reviewer: ContextGuardStrategy }
 }
 
 /**
@@ -95,6 +107,10 @@ export function resolveCoopConfig(config: {
   roleLlm?: RoleLlmSettings | null
   spawnLayout?: string
   skillMatch?: 'strict' | 'fallback' | 'off'
+  contextHardPct?: number
+  contextHardPctByRole?: { worker?: number; master?: number; reviewer?: number }
+  contextHardGraceMs?: number
+  contextStrategy?: { worker?: string; master?: string; reviewer?: string }
   paneId?: string
 }): ResolvedCoopConfig {
   const positive = (value: number | undefined, name: string): number | undefined => {
@@ -114,6 +130,25 @@ export function resolveCoopConfig(config: {
   }
   if (config.skillMatch !== undefined && config.skillMatch !== 'strict' && config.skillMatch !== 'fallback' && config.skillMatch !== 'off') {
     throw new CoopError(`config skillMatch must be "strict" | "fallback" | "off", got "${String(config.skillMatch)}"`, 'COOP_CONFIG_UNSUPPORTED')
+  }
+  const contextHardPct = config.contextHardPct
+  const inUnit = (value: number | undefined, name: string): void => {
+    if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 1)) {
+      throw new CoopError(`config ${name} must be a number in (0, 1], got ${String(value)}`, 'COOP_CONFIG_UNSUPPORTED')
+    }
+  }
+  inUnit(contextHardPct, 'contextHardPct')
+  const byRole = config.contextHardPctByRole ?? {}
+  inUnit(byRole.worker, 'contextHardPctByRole.worker')
+  inUnit(byRole.master, 'contextHardPctByRole.master')
+  inUnit(byRole.reviewer, 'contextHardPctByRole.reviewer')
+  const limitOf = (role: 'worker' | 'master' | 'reviewer'): number => byRole[role] ?? contextHardPct ?? 0.5
+  const strategyOf = (value: string | undefined, role: 'worker' | 'master' | 'reviewer', fallback: ContextGuardStrategy): ContextGuardStrategy => {
+    if (value === undefined) return fallback
+    if (value !== 'handoff' && value !== 'compact' && value !== 'none') {
+      throw new CoopError(`config contextStrategy.${role} must be "handoff" | "compact" | "none", got "${value}"`, 'COOP_CONFIG_UNSUPPORTED')
+    }
+    return value
   }
   const roleLlm = resolveRoleLlm(config.roleLlm)
   const spawnRegisterTimeoutMs = positive(config.spawnRegisterTimeoutMs, 'spawnRegisterTimeoutMs') ?? 30_000
@@ -149,6 +184,13 @@ export function resolveCoopConfig(config: {
     spawnRegisterTimeoutMs,
     spawnLayout: config.spawnLayout === 'right' ? 'right' : 'columns',
     skillMatch: config.skillMatch ?? 'strict',
+    contextLimit: { worker: limitOf('worker'), master: limitOf('master'), reviewer: limitOf('reviewer') },
+    contextHardGraceMs: positive(config.contextHardGraceMs, 'contextHardGraceMs') ?? 300_000,
+    contextStrategy: {
+      worker: strategyOf(config.contextStrategy?.worker, 'worker', 'handoff'),
+      master: strategyOf(config.contextStrategy?.master, 'master', 'compact'),
+      reviewer: strategyOf(config.contextStrategy?.reviewer, 'reviewer', 'compact'),
+    },
     roleLlm,
     paneId: config.paneId,
   }

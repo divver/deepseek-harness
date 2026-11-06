@@ -47,7 +47,7 @@ import {
   normalizeCwd,
   resolveCoopConfig,
   v2Root, applyRoleLlmRoute, planColumnSplit, PaneBox, spawnRouteEnv } from './runtime.ts'
-import type { ResolvedCoopConfig, RoleLlmRoute, RoleLlmSettings } from './runtime.ts'
+import type { ContextGuardStrategy, ResolvedCoopConfig, RoleLlmRoute, RoleLlmSettings } from './runtime.ts'
 import * as store from './store.ts'
 import { COOP_POLICY_ORDER, COOP_POLICY_SECTION_NAME, COOP_POLICY_TEXT, COOP_V2_POLICY_TEXT } from './policy.ts'
 import { registerCoopCommands } from './commands.ts'
@@ -127,6 +127,16 @@ export interface Config {
   /** v2 scheduler skill-demand matching: `strict` gate (default), `fallback` to
      * any free worker when none declares the demanded skills, or `off` ignoring demands. */
   skillMatch?: 'strict' | 'fallback' | 'off'
+  /** v2 hard context guard: executing assignees at/above this context fraction get a wrap-up order, then a forced reclaim (default 0.9). */
+  contextHardPct?: number
+  /** v2 per-role override of the hard context guard threshold (wins over `contextHardPct`, which itself defaults to 0.5). */
+  contextHardPctByRole?: { worker?: number; master?: number; reviewer?: number }
+  /** v2 grace between the wrap-up order and the forced task reclaim (default 300,000). */
+  contextHardGraceMs?: number
+  /** v2 hard context guard strategy per role: handoff (pane reset onto a fresh
+     * same-role session), compact (in-place compaction), none (default: worker
+   * handoff, master/reviewer compact). */
+  contextStrategy?: { worker?: ContextGuardStrategy; master?: ContextGuardStrategy; reviewer?: ContextGuardStrategy }
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -156,6 +166,10 @@ export const Config: z<Config> = z.object({
   spawnRegisterTimeoutMs: z.number(),
   spawnLayout: z.string(),
   skillMatch: z.string(),
+  contextHardPct: z.number(),
+  contextHardPctByRole: z.any(),
+  contextHardGraceMs: z.number(),
+  contextStrategy: z.any(),
   paneId: z.string(),
   roleLlm: z.any(),
   inboxPollMs: z.number(),
@@ -220,6 +234,9 @@ export class CoopService extends Service {
 
   /** Optional session-controller seam that makes a role pin visible in the owning session's model selection. */
   private sessionController: SessionControllerSeam | undefined
+
+  /** Hard-context guard state per session: when the wrap-up/handoff notice fired. Cleared when pressure drops or the handoff executes. */
+  private readonly contextGuardState = new Map<string, { noticedAt: number; pct: number }>()
 
   constructor(ctx: Context, config: Config = {}) {
     super(ctx, 'coop')
@@ -1331,6 +1348,28 @@ export class CoopService extends Service {
           const rebound: CoopV2RegistryEntry = { ...next, masterId: existing.masterId, bindState: 'bound' }
           return { next: { version: 2, entries: [...others, rebound] }, value: { entry: rebound, masterId: String(existing.masterId) } }
         }
+        // Auto-bind: with exactly one live, communicable master in this
+        // workspace, a bare registration (`/coop worker` / `/coop reviewer`)
+        // binds to it — no `--master` needed. Zero or several live masters
+        // keeps the adoptable-pool semantics; a full capacity quota falls
+        // back to the pool instead of failing the registration.
+        const liveMasters = entries.filter(candidate => candidate.roles.includes('master')
+            && candidate.masterId !== undefined
+            && this.isFreshV2(candidate, now)
+            && canCommunicate({ cwd, cwdScope: scope }, candidate))
+        const sole = liveMasters.length === 1 ? liveMasters[0] : undefined
+        if (sole?.masterId !== undefined) {
+          const boundOthers = entries.filter(candidate => candidate.bindState === 'bound'
+              && String(candidate.masterId ?? '') === String(sole.masterId)
+              && candidate.sessionId !== sessionId && this.isFreshV2(candidate, now))
+          try {
+            this.assertCapacity(req.roles, boundOthers)
+            const autobound: CoopV2RegistryEntry = { ...next, masterId: sole.masterId, bindState: 'bound' }
+            return { next: { version: 2, entries: [...others, autobound] }, value: { entry: autobound, masterId: String(sole.masterId) } }
+          } catch {
+            // capacity full — the adoptable pool stays the fallback
+          }
+        }
         return { next: { version: 2, entries: [...others, next] }, value: { entry: next, masterId: undefined as string | undefined } }
       }
       // A stale row sharing the masterId (a dead worker bound to the same
@@ -1650,6 +1689,10 @@ export class CoopService extends Service {
          * @returns how many tasks were assigned.
          */
   private async scheduleV2(root: string, masterId: string): Promise<number> {
+    // Event-driven hard-context guard: wrap-up orders and grace-expired
+    // reclaims ride every scheduling pass (registration, reports, the heal
+    // tick) instead of waiting for the throttled heal alone.
+    await this.guardContextV2(root)
     const now = Date.now()
     const boundWorkersOf = (): Promise<CoopV2RegistryEntry[]> => this.v2Tables(root).then(entries => entries.filter(entry => entry.bindState === 'bound'
           && String(entry.masterId) === masterId
@@ -3255,7 +3298,7 @@ export class CoopService extends Service {
          * @returns the committed registry entry.
          * @throws CoopError `COOP_SPAWN_FAILED` when the window elapses with no entry.
          */
-  private async awaitPaneRegistration(root: string, paneId: string, role: 'worker' | 'reviewer', line: string): Promise<CoopV2RegistryEntry> {
+  private async awaitPaneRegistration(root: string, paneId: string, role: 'master' | 'worker' | 'reviewer', line: string): Promise<CoopV2RegistryEntry> {
     const deadline = Date.now() + this.resolved.spawnRegisterTimeoutMs
     const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
     for (let attempt = 1; ; attempt++) {
@@ -3418,6 +3461,290 @@ export class CoopService extends Service {
       return { next: { version: 2, entries: alive }, value: undefined }
     })
   }
+
+  /**
+       * Hard context guard over every fresh registry entry (all roles). The one
+       * process hosting a live agent for an entry at/above `contextHardPct` acts
+       * for it, so exactly one pane delivers notices and forces deadlines:
+       * - `handoff` (worker default): one wrap-up order — load the `handoff` skill
+       *   if present, write the handover doc, call `coop_handoff` — and after
+       *   `contextHardGraceMs` the pane is reset onto a fresh same-role session
+       *   regardless (`/new` + the role's registration line; master identity is
+       *   reused via pane-keyed revival, workers' executing tasks are reclaimed
+       *   onto the successor with their worktrees intact).
+       * - `compact` (master/reviewer default): try `ctx.compaction.compactNow`
+       *   while idle; a busy agent gets a wrap-up notice and the next pass
+       *   retries.
+       * - `none`: no guard for that role.
+       * @param root - absolute v2 root.
+       */
+  private async guardContextV2(root: string): Promise<void> {
+    const now = Date.now()
+    const entries = await this.v2Tables(root)
+    for (const entry of entries) {
+      const role = entry.roles.includes('master') ? 'master' : entry.roles.includes('reviewer') ? 'reviewer' : 'worker'
+      const limit = this.resolved.contextLimit[role]
+      const pct = entry.meta?.contextPct
+      if (pct === undefined || pct < limit) {
+        this.contextGuardState.delete(entry.sessionId)
+        continue
+      }
+      const strategy = this.resolved.contextStrategy[role]
+      if (strategy === 'none') continue
+      // Only the process hosting this entry's live agent acts; other panes
+      // hosting no agent for it stay silent, so notices never duplicate.
+      const agent = this.ctx.agents.get(SessionId(entry.sessionId))
+      if (agent === undefined) {
+        // Dead-pane fallback: a saturated entry whose heartbeat froze past
+        // the stale window hosts no live agent anywhere (the poll tick
+        // heartbeats every live agent), so any surviving process may force
+        // the handoff — the registry stamp inside dedupes cross-process.
+        const silentFor = now - entry.heartbeatAt
+        if (strategy === 'handoff'
+            && silentFor >= Math.max(this.resolved.staleMs, this.resolved.contextHardGraceMs)) {
+          await this.executeHandoffV2(root, entry, { forced: true, deadPane: true })
+        }
+        continue
+      }
+      if (strategy === 'compact') {
+        const compaction = this.ctx.get('compaction', false) as
+              | { compactNow: (target: Agent, signal: AbortSignal, commandId?: unknown) => Promise<unknown> }
+              | undefined
+        if (compaction !== undefined) {
+          try {
+            const controller = new AbortController()
+            const done = await compaction.compactNow(agent, controller.signal)
+            if (done !== null && done !== undefined) {
+              this.contextGuardState.delete(entry.sessionId)
+              await this.deliverV2(entry.masterId === undefined ? entry.sessionId : String(entry.masterId), entry.sessionId, root,
+                `context hard limit (${String(Math.round(pct * 100))}%) — session compacted in place; continue ${role} work`)
+              continue
+            }
+          } catch {
+            // busy/changed/summary failures: fall through to the wrap-up notice; the next pass retries.
+          }
+        }
+        await this.deliverNoticeOnceV2(root, entry, role, pct,
+          `context hard limit (${String(Math.round(pct * 100))}%) — wrap up the current turn${compaction === undefined ? ' and run /compact (no compaction service is mounted in this process)' : '; compaction runs once you are idle'}`)
+        continue
+      }
+      if (!this.isFreshV2(entry, now)) continue
+      // handoff: one wrap-up order, then a forced pane reset past the grace.
+      const state = this.contextGuardState.get(entry.sessionId)
+      if (state === undefined) {
+        this.contextGuardState.set(entry.sessionId, { noticedAt: now, pct })
+        const graceLabel = `${String(Math.round(this.resolved.contextHardGraceMs / 1000))}s`
+        await this.deliverV2(entry.masterId === undefined ? entry.sessionId : String(entry.masterId), entry.sessionId, root,
+          `context hard limit (${String(Math.round(pct * 100))}%) — handoff NOW: load the "handoff" skill if available, write your handover doc, then call coop_handoff; after ${graceLabel} the pane resets onto a fresh ${role} session regardless`)
+        continue
+      }
+      if (now - state.noticedAt < this.resolved.contextHardGraceMs) continue
+      await this.executeHandoffV2(root, entry, { forced: true })
+    }
+  }
+
+  /** Deliver one guard notice per crossing (handoff wrap-up or compact hint), deduplicated per session. */
+  private async deliverNoticeOnceV2(
+    root: string,
+    entry: CoopV2RegistryEntry,
+    role: 'master' | 'worker' | 'reviewer',
+    pct: number,
+    text: string,
+  ): Promise<void> {
+    if (this.contextGuardState.has(entry.sessionId)) return
+    this.contextGuardState.set(entry.sessionId, { noticedAt: Date.now(), pct })
+    await this.deliverV2(entry.masterId === undefined ? entry.sessionId : String(entry.masterId), entry.sessionId, root,
+      `${text} [${role} ${entry.sessionId}]`)
+  }
+
+  /** Registration line that re-establishes one entry's role after a pane reset. */
+  private registrationLineForV2(entry: CoopV2RegistryEntry): string | undefined {
+    if (entry.roles.includes('master')) return '/coop master'
+    if (entry.roles.includes('reviewer')) {
+      return entry.masterId === undefined ? undefined : `/coop reviewer --master ${String(entry.masterId)}`
+    }
+    if (!entry.roles.includes('worker')) return undefined
+    const skills = (entry.skills ?? []).length === 0 ? '' : ` --skills ${(entry.skills ?? []).join(',')}`
+    return entry.masterId === undefined ? `/coop worker${skills}` : `/coop worker --master ${String(entry.masterId)}${skills}`
+  }
+
+  /** Reclaim every executing task of one assignee to `ready` (worktrees kept, rework budget untouched). */
+  private async reclaimExecutingTasksV2(root: string, masterId: string, assignee: string): Promise<string[]> {
+    const reclaimed: string[] = []
+    let names: string[] = []
+    try {
+      names = await readdir(store.v2PlansDir(root, masterId))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      return reclaimed
+    }
+    for (const name of names.filter(candidate => candidate.endsWith('.json'))) {
+      const planId = name.replace(/\.json$/u, '')
+      const path = store.v2PlanPath(root, masterId, planId)
+      const next = await store.mutateV2Plan(path, (current): { next?: CoopV2PlanFile; value: CoopV2Task | undefined } => {
+        if (current === undefined || current.status !== 'active') return { value: undefined }
+        const task = current.tasks.find(candidate => candidate.status === 'executing' && candidate.assignee === assignee)
+        if (task === undefined) return { value: undefined }
+        const at = Date.now()
+        const { pinnedAssignee: _pin, execution: _exec, assignee: _own, ...keep } = task
+        const nextTask: CoopV2Task = { ...keep, status: 'ready', updatedAt: at }
+        const staged: CoopV2PlanFile = {
+          ...current,
+          tasks: current.tasks.map(candidate => candidate.taskId === task.taskId ? nextTask : candidate),
+          history: [...current.history, { time: at, sessionId: assignee, op: `task_reclaim ${task.taskId} context` }],
+        }
+        return { next: recomputeReady(staged, at), value: nextTask }
+      })
+      if (next !== undefined) reclaimed.push(next.taskId)
+    }
+    return reclaimed
+  }
+
+  /** Drop one worker/reviewer row (keeping master rows for pane-keyed revival). */
+  private async deregisterEntryV2(root: string, entry: CoopV2RegistryEntry): Promise<void> {
+    if (entry.roles.includes('master')) return
+    await store.mutateV2Registry(store.v2RegistryPath(root), (current) => {
+      const entries = current?.entries ?? []
+      if (!entries.some(candidate => candidate.sessionId === entry.sessionId)) return { value: undefined }
+      return {
+        next: { version: 2, entries: entries.filter(candidate => candidate.sessionId !== entry.sessionId) },
+        value: undefined,
+      }
+    })
+    this.roleLlmBySession.delete(entry.sessionId)
+  }
+
+  /**
+   * Cross-process claim for a dead-pane forced handoff: stamps
+   * `meta.contextHandoffAt` atomically; the one winner proceeds, later or
+   * concurrent callers within twice the grace window back off.
+   * @param root - absolute v2 root.
+   * @param entry - the dead saturated node's registry entry.
+   * @returns whether this caller won the claim.
+   */
+  private async claimDeadHandoffV2(root: string, entry: CoopV2RegistryEntry): Promise<boolean> {
+    return store.mutateV2Registry(store.v2RegistryPath(root), (current): { next?: CoopV2RegistryFile; value: boolean } => {
+      const entries = current?.entries ?? []
+      const target = entries.find(candidate => candidate.sessionId === entry.sessionId)
+      if (target === undefined) return { value: false }
+      const at = Date.now()
+      const previous = target.meta?.contextHandoffAt
+      if (previous !== undefined && at - previous < 2 * this.resolved.contextHardGraceMs) return { value: false }
+      const stamped: CoopV2RegistryEntry = {
+        ...target,
+        meta: { ...target.meta, contextHandoffAt: at },
+      }
+      return {
+        next: { version: 2, entries: entries.map(candidate => candidate.sessionId === entry.sessionId ? stamped : candidate) },
+        value: true,
+      }
+    })
+  }
+
+  /**
+   * Execute one handoff: reclaim the assignee's tasks, drop the old row
+       * (masters keep theirs for identity revival), reset the pane with `/new`,
+       * and replay the role's registration line until the successor registers.
+       * Outside a herdr pane the worker path degrades to release + replacement
+       * spawn; master/reviewer panes cannot be reset from here and are reported.
+       * @param root - absolute v2 root.
+       * @param entry - the saturated node's registry entry.
+       * @param opts - `forced` marks a deadline expiry (notifies the master).
+       */
+  private async executeHandoffV2(
+    root: string,
+    entry: CoopV2RegistryEntry,
+    opts: { forced?: boolean; handoverPath?: string; deadPane?: boolean } = {},
+  ): Promise<{ outcome: 'pane-reset' | 'replaced' | 'manual'; detail: string }> {
+    if (opts.deadPane === true && !(await this.claimDeadHandoffV2(root, entry))) {
+      return { outcome: 'manual', detail: 'dead-pane handoff already claimed by another process' }
+    }
+    const role = entry.roles.includes('master') ? 'master' : entry.roles.includes('reviewer') ? 'reviewer' : 'worker'
+    const masterId = entry.masterId === undefined ? undefined : String(entry.masterId)
+    const label = `${role} ${entry.sessionId}`
+    const reclaimed = role === 'worker' && masterId !== undefined
+      ? await this.reclaimExecutingTasksV2(root, masterId, entry.sessionId)
+      : []
+    await this.deregisterEntryV2(root, entry)
+    this.contextGuardState.delete(entry.sessionId)
+    const paneId = entry.meta?.paneId
+    const line = this.registrationLineForV2(entry)
+    if (paneId !== undefined && line !== undefined && (await this.herdrAvailable())) {
+      const reset = await this.runHerdr(['pane', 'send-text', paneId, '/new'])
+      if (reset.code === 0) await this.runHerdr(['pane', 'send-keys', paneId, 'Enter'])
+      if (reset.code === 0) {
+        const successor = await this.awaitPaneRegistration(root, paneId, role, line)
+        if (masterId !== undefined) {
+          const masterEntry = (await this.v2Tables(root))
+            .find(candidate => candidate.roles.includes('master') && String(candidate.masterId) === masterId)
+          if (masterEntry !== undefined) {
+            await this.deliverV2(masterId, masterEntry.sessionId, root,
+              `${opts.deadPane === true ? 'dead-pane' : ''}handoff complete — pane reset; successor ${successor.sessionId} registered as ${role}${reclaimed.length === 0 ? '' : `; reclaimed tasks: ${reclaimed.join(', ')}`}`.trim())
+          }
+        }
+        if (masterId !== undefined) await this.scheduleV2(root, masterId)
+        return { outcome: 'pane-reset', detail: `pane ${paneId} reset; successor ${successor.sessionId}` }
+      }
+    }
+    // No pane (or reset failed): workers degrade to release + replacement
+    // spawn; masters/reviewers cannot be reset from a foreign process.
+    if (opts.deadPane !== true) {
+      await this.deliverV2(masterId ?? entry.sessionId, entry.sessionId, root,
+        `context hard limit handoff${opts.forced === true ? ' (deadline)' : ''} — you are released; ${reclaimed.length === 0 ? 'no tasks were in flight' : `tasks reclaimed: ${reclaimed.join(', ')}`}${opts.handoverPath === undefined ? '' : `; handover doc: ${opts.handoverPath}`}`)
+    }
+    if (role === 'worker' && masterId !== undefined) {
+      const masterEntry = (await this.v2Tables(root))
+        .find(candidate => candidate.roles.includes('master') && String(candidate.masterId) === masterId)
+      if (masterEntry !== undefined) {
+        const masterAgent = this.ctx.agents.get(SessionId(masterEntry.sessionId))
+        if (masterAgent !== undefined) {
+          try {
+            const declared = entry.skills ?? []
+            await this.createNodeV2(masterAgent, {
+              role: 'worker',
+              ...(declared.length === 0 ? {} : { skills: declared }),
+            })
+            await this.deliverV2(masterId, masterEntry.sessionId, root,
+              `${label} hit the context hard limit${opts.forced === true ? ' (handoff deadline)' : ''} — released, tasks reclaimed${reclaimed.length === 0 ? '' : ` (${reclaimed.join(', ')})`}, fresh replacement spawned`)
+            await this.scheduleV2(root, masterId)
+            return { outcome: 'replaced', detail: 'worker released; headless replacement spawned' }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            await this.deliverV2(masterId, masterEntry.sessionId, root,
+              `${label} was released at the context hard limit but spawning a replacement failed: ${message} — call coop_worker_create(role="worker")`)
+          }
+        }
+      }
+    }
+    const report = `${opts.deadPane === true ? `${label} pane died at the context hard limit — entry dropped` : `handoff for ${label}: no resettable pane`} — ${role === 'worker' ? 'worker released' : 'restart the session and replay its registration line'}${line === undefined ? '' : `: ${line}`}${reclaimed.length === 0 ? '' : `; reclaimed tasks: ${reclaimed.join(', ')}`}`
+    if (masterId !== undefined) {
+      const masterEntry = (await this.v2Tables(root))
+        .find(candidate => candidate.roles.includes('master') && String(candidate.masterId) === masterId)
+      if (masterEntry !== undefined) await this.deliverV2(masterId, masterEntry.sessionId, root, report)
+    }
+    return { outcome: 'manual', detail: report }
+  }
+
+  /**
+       * Voluntary handoff for the calling session (the `coop_handoff` tool): the
+       * caller has written its handover doc and hands its role to a fresh session
+       * in the same pane.
+       * @param agent - the saturated session's agent.
+       * @param opts - optional handover-doc path recorded in the completion notice.
+       */
+  async handoffV2(agent: Agent, opts: { handoverPath?: string } = {}): Promise<string> {
+    const sessionId = String(agent.session.id)
+    const root = await this.v2RootOf(agent)
+    await this.touchOwnEntryV2(agent)
+    const entry = (await this.v2Tables(root)).find(candidate => candidate.sessionId === sessionId)
+    if (entry === undefined) throw new CoopError('this session holds no coop role — nothing to hand off', 'COOP_NODE_NOT_FOUND')
+    const result = await this.executeHandoffV2(root, entry, {
+      ...(opts.handoverPath === undefined ? {} : { handoverPath: opts.handoverPath }),
+    })
+    return `handoff executed (${result.outcome}): ${result.detail}`
+  }
+
+
 }
 /**
  * Whether the edge set contains a cycle; returns the cycle path for the
