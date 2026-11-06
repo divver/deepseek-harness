@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,7 +9,8 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import CoopService, { masterProfilePath, readMasterProfile, readV2Registry, v2RegistryPath, v2Root } from '../src/index.ts'
+import CoopService, { MasterId, masterProfilePath, readMasterProfile, readV2Registry, v2RegistryPath, v2Root } from '../src/index.ts'
+import type { CoopV2RegistryEntry, CoopV2RegistryFile } from '../src/types.ts'
 
 // The dev shell may sit inside a herdr pane; revival must not see an ambient pane id (panes come from config `paneId`).
 delete process.env.HERDR_PANE_ID
@@ -116,6 +117,38 @@ describe('registration', () => {
     expect(again.masterId).toBe(first.masterId)
   })
 
+  it('revives the newest same-pane identity after a master-pane restart', async () => {
+    const { ctx, cwd, master, second } = await harness({ paneId: 'w9:pZ', staleMs: 400 })
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    // The pane restart kills the old session: deregister its row so only
+    // the (dead) same-pane restart artifacts remain.
+    await ctx.coop.registerV2(master, { roles: [] })
+    // Two newer same-pane rows from quick restarts (file order ≠ recency):
+    // both silent past the 15s revive-silence window, newer than the
+    // original row's heartbeat.
+    const registryPath = v2RegistryPath(v2Root(cwd, '.dsh/coop'))
+    const file = JSON.parse(await readFile(registryPath, 'utf8')) as CoopV2RegistryFile
+    const base = Date.now()
+    const churn = (sid: string, masterId: string, hbAt: number): CoopV2RegistryEntry => ({
+      sessionId: sid,
+      roles: ['master'],
+      masterId: MasterId(masterId),
+      bindState: 'bound',
+      cwd,
+      cwdScope: 'cwd' as const,
+      updatedAt: hbAt,
+      heartbeatAt: hbAt,
+      meta: { paneId: 'w9:pZ' },
+    })
+    file.entries = [
+      churn('ghost-old', 'm#old', base - 17_000),
+      churn('ghost-new', 'm#new', base - 16_000),
+    ]
+    await writeFile(registryPath, `${JSON.stringify(file, null, 2)}\n`)
+    const revived = await ctx.coop.registerV2(second, { roles: ['master'] })
+    expect(String(revived.masterId)).toBe('m#new')
+  })
+
   it('allows multiple live masters in one workspace', async () => {
     const { ctx, master, second } = await harness()
     await ctx.coop.registerV2(master, { roles: ['master'] })
@@ -152,6 +185,38 @@ describe('registration', () => {
     const reviewerEntry = await ctx.coop.registerV2(reviewer, { roles: ['reviewer'] })
     expect(reviewerEntry.bindState).toBe('bound')
     expect(String(reviewerEntry.masterId)).toBe(String(m.masterId))
+  })
+
+  it('auto-binds through same-pane master restart artifacts (newest identity wins)', async () => {
+    const { ctx, cwd, master, worker } = await harness()
+    await ctx.coop.registerV2(master, { roles: ['master'] })
+    // Simulate two quick master restarts in one pane: fresh rows with new
+    // session ids sharing one paneId (revival cannot reuse identity until the
+    // prior heartbeat went silent past half the stale window). Future
+    // heartbeats keep the ghosts "newest" against the real row's poll ticks.
+    const registryPath = v2RegistryPath(v2Root(cwd, '.dsh/coop'))
+    const file = JSON.parse(await readFile(registryPath, 'utf8')) as CoopV2RegistryFile
+    const now = Date.now()
+    const churn = (sid: string, masterId: string, hbAt: number): CoopV2RegistryEntry => ({
+      sessionId: sid,
+      roles: ['master'],
+      masterId: MasterId(masterId),
+      bindState: 'bound',
+      cwd,
+      cwdScope: 'cwd' as const,
+      updatedAt: now,
+      heartbeatAt: hbAt,
+      meta: { paneId: 'w9:pZ' },
+    })
+    file.entries = [
+      ...file.entries.map(entry => ({ ...entry, meta: { ...entry.meta, paneId: 'w9:pZ' } })),
+      churn('ghost-1', 'm#ghost1', now + 5_000),
+      churn('ghost-2', 'm#ghost2', now + 6_000),
+    ]
+    await writeFile(registryPath, `${JSON.stringify(file, null, 2)}\n`)
+    const bound = await ctx.coop.registerV2(worker, { roles: ['worker'] })
+    expect(bound.bindState).toBe('bound')
+    expect(String(bound.masterId)).toBe('m#ghost2')
   })
 
   it('keeps a bare registration unbound with zero or several live masters', async () => {

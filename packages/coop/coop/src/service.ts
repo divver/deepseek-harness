@@ -189,6 +189,14 @@ const TERMINAL_STATUSES: ReadonlySet<PlanStatus> = new Set(['done', 'closed', 'a
 const WORKER_RECYCLE_COOLDOWN_MS = 60_000
 
 /**
+ * Heartbeat silence (ms) before a same-pane master row becomes revivable.
+ * Silence is the only ownership signal separating "session disposed by /new"
+ * from "owner merely wedged" — 15s favors quick identity reuse (restarts, /new)
+ * and tolerates the small nested-process hijack window that comes with it.
+ */
+const MASTER_PANE_REVIVE_SILENCE_MS = 15_000
+
+/**
  * Apply lazy watchdog transitions to one loaded plan. Executing plans whose
  * heartbeat went silent fall back to `needs_rework`; `aborting` plans whose
  * ack never arrived close as `aborted` past the ack timeout. Returns the same
@@ -1267,16 +1275,23 @@ export class CoopService extends Service {
         // Pane-keyed revival first: one pane hosts one TUI, so a master row
         // from the same herdr pane is this pane's own prior identity. Reuse
         // it when the row's session still lives in this process (a session
-        // switch in the same TUI) or its heartbeat went silent past half
-        // the stale window (the pane restarted; the old process died). A
-        // row still being touched has a live owner — or a nested process
-        // that inherited the pane id — and is never taken over.
+        // switch in the same TUI) or its heartbeat went silent past the
+        // short revive-silence window (the pane restarted, /new disposed the
+        // agent, or the old process died). Silence is the only ownership
+        // signal: a row still being touched has a live owner — or a nested
+        // process that inherited the pane id. The 15s window deliberately
+        // trades a small hijack tolerance for quick identity reuse.
         const paneRevivable = existing === undefined && paneEnv !== undefined
-          ? entries.find(candidate => candidate.roles.includes('master')
+          ? entries.filter(candidate => candidate.roles.includes('master')
                 && candidate.meta?.paneId === paneEnv
                 && canCommunicate({ cwd, cwdScope: scope }, candidate)
                 && (liveSessionIds.has(candidate.sessionId)
-                  || now - candidate.heartbeatAt > this.resolved.staleMs / 2))
+                  || now - candidate.heartbeatAt > MASTER_PANE_REVIVE_SILENCE_MS))
+          // Restart churn leaves several same-pane rows; file order is not
+          // recency — prefer a row whose session still lives here, else the
+          // newest heartbeat, so the newest identity is the one revived.
+            .sort((left, right) => (liveSessionIds.has(right.sessionId) ? 1 : 0) - (liveSessionIds.has(left.sessionId) ? 1 : 0)
+                || right.heartbeatAt - left.heartbeatAt)[0]
           : undefined
           // A restarted master session revives the most recently active stale
           // master identity here: the same masterId keeps every plan path and
@@ -1357,7 +1372,18 @@ export class CoopService extends Service {
             && candidate.masterId !== undefined
             && this.isFreshV2(candidate, now)
             && canCommunicate({ cwd, cwdScope: scope }, candidate))
-        const sole = liveMasters.length === 1 ? liveMasters[0] : undefined
+        // Restart churn collapses here: one pane hosts one master, so several
+        // fresh master rows sharing a paneId are restart artifacts of a single
+        // master (the pane-keyed revival only reuses identity once the prior
+        // row's heartbeat went silent past the revive-silence window). Dedupe
+        // by pane, newest heartbeat wins, before applying the sole-master rule.
+        const mastersByPane = new Map<string, CoopV2RegistryEntry>()
+        for (const candidate of liveMasters) {
+          const key = candidate.meta?.paneId ?? candidate.sessionId
+          const prior = mastersByPane.get(key)
+          if (prior === undefined || candidate.heartbeatAt > prior.heartbeatAt) mastersByPane.set(key, candidate)
+        }
+        const sole = mastersByPane.size === 1 ? [...mastersByPane.values()][0] : undefined
         if (sole?.masterId !== undefined) {
           const boundOthers = entries.filter(candidate => candidate.bindState === 'bound'
               && String(candidate.masterId ?? '') === String(sole.masterId)
