@@ -471,7 +471,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       const entries = await service.listNodesV2(agent, { ...(args.unbound === true ? { unboundOnly: true } : {}) })
       return {
         count: entries.length,
-        detail: entries.map(entry => `${entry.sessionId}: ${entry.roles.join('+')} [${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}]${entry.meta?.contextPct === undefined ? '' : ` · ctx ${Math.round(entry.meta.contextPct * 100)}%`}`),
+        detail: entries.map(entry => `${entry.sessionId}: ${entry.roles.join('+')} [${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}]${entry.meta?.contextPct === undefined ? '' : ` · ctx ${Math.round(entry.meta.contextPct * 100)}% used`}`),
       }
     },
   }))

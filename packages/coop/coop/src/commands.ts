@@ -158,7 +158,7 @@ async function runV2(
   if (head === 'list') {
     const entries = await service.listNodesV2(agent, { ...(parsed.flags.has('unbound') ? { unboundOnly: true } : {}) })
     if (entries.length === 0) return 'No visible coop nodes.'
-    return entries.map(entry => `${entry.sessionId}: ${entry.roles.join('+')} [${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}]`).join('\n')
+    return entries.map(entry => `${entry.sessionId}: ${entry.roles.join('+')} [${entry.bindState}${entry.masterId === undefined ? '' : ` → ${String(entry.masterId)}`}]${entry.meta?.contextPct === undefined ? '' : ` · ctx ${Math.round(entry.meta.contextPct * 100)}% used`}`).join('\n')
   }
   if (head === 'status') {
     const status = await service.statusV2(agent)
