@@ -14,7 +14,8 @@ local adaptations for the coop role model. Upstream repos:
 | architect, benchmark-checklist, blast-radius, how, ketchup, recall, reflect, sharpen, why | pstack `skills/<name>` | none (verbatim copy incl. references/) |
 | tdd, typescript-best-practices, figure-it-out, interrogate, unslop, no-comments | pstack `skills/<name>` | removed `disable-model-invocation: true` so worker/reviewer nodes can load them on wake per the `coop:policy` section (upstream is user-invoked-only for poteto-mode's manual UX) |
 | brainstorming, systematic-debugging | superpowers `skills/<name>` | none |
-| diagnosing-bugs, grilling, handoff | mattpocock/skills (`skills/engineering|productivity/<name>`) | none; `agents/openai.yaml` kept (harness display metadata) |
+| diagnosing-bugs, grilling | mattpocock/skills (`skills/engineering|productivity/<name>`) | none; `agents/openai.yaml` kept (harness display metadata) |
+| handoff | mattpocock/skills (`skills/productivity/handoff`) | removed `disable-model-invocation: true` and extended the description: coop's context guard orders saturated nodes to load this skill, so it must stay model-invocable |
 | coop-flow, coop-help | self-written for dsh-coop | n/a |
 
 Notes:
