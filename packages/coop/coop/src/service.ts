@@ -1199,6 +1199,14 @@ export class CoopService extends Service {
    * @returns the meta patch to merge, possibly empty.
    */
   private contextMetaOf(agent: Agent): { contextPct?: number; contextTokens?: number; contextWindow?: number } {
+    const debugLine = (outcome: string, detail: unknown): void => {
+      if (process.env.DSH_COOP_CTX_DEBUG !== '1') return
+      try {
+        const home = process.env.DSH_HOME ?? `${process.env.HOME ?? '~'}/.dsh`
+        const line = `${JSON.stringify({ t: new Date().toISOString(), session: String(agent.session.id), outcome, detail: detail === undefined ? null : detail })}\n`
+        void import('node:fs').then((fs) => { void fs.promises.appendFile(`${home}/coop-ctx-debug.log`, line).catch(() => {}) })
+      } catch { /* debug only */ }
+    }
     // Read through an opaque record: the session-projection service may or
     // may not be mounted in this process, and its Context augmentation
     // declares the member non-optional even when it is absent at runtime.
@@ -1207,16 +1215,39 @@ export class CoopService extends Service {
     // inject") for unmounted services instead of returning undefined — a
     // thrown read here would silently kill every heartbeat write.
     let seam: { snapshot(session: object, keys?: readonly string[]): { values: Record<string, unknown> } } | undefined
+    // Read from the AGENT's scope first: the session-projection service is
+    // provided inside the per-session composition (the agent spine), so a read
+    // from coop's own profile-root scope throws "without inject" in real TUI
+    // hosts — the agent-scoped context walks the session chain and sees it.
+    const readSeam = (source: unknown): typeof seam => {
+      return (source as unknown as Record<string, unknown>)['sessionProjections'] as typeof seam
+    }
+    const agentCtx = (agent as unknown as { ctx?: unknown }).ctx
     try {
-      seam = (this.ctx as unknown as Record<string, unknown>)['sessionProjections'] as typeof seam
-    } catch {
+      seam = agentCtx === undefined ? readSeam(this.ctx) : readSeam(agentCtx)
+    } catch (firstError) {
+      // The agent scope read may itself throw (older hosts, bare sessions);
+      // fall through to coop's own scope before giving up.
+      try {
+        seam = readSeam(this.ctx)
+      } catch (error) {
+        debugLine('seam-threw', error instanceof Error ? error.message : String(error))
+        void firstError
+        return {}
+      }
+    }
+    if (seam === undefined) {
+      debugLine('seam-undefined', null)
       return {}
     }
-    if (seam === undefined) return {}
     try {
       const view = seam.snapshot(agent.session, ['contextPressure']).values['contextPressure']
       const pct = contextPctOf(view)
-      if (pct === undefined) return {}
+      if (pct === undefined) {
+        debugLine(view === undefined ? 'no-view' : 'pct-undefined', view)
+        return {}
+      }
+      debugLine('ok', { pct })
       const pressure = view as { projectedTokens?: number; pressureTokens?: number; contextWindow?: number }
       const used = pressure.projectedTokens ?? pressure.pressureTokens
       return {
@@ -1224,7 +1255,8 @@ export class CoopService extends Service {
         ...(used === undefined ? {} : { contextTokens: used }),
         ...(pressure.contextWindow === undefined ? {} : { contextWindow: pressure.contextWindow }),
       }
-    } catch {
+    } catch (error) {
+      debugLine('snapshot-threw', error instanceof Error ? error.message : String(error))
       return {}
     }
   }
