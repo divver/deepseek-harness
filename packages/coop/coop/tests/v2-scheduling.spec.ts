@@ -8,7 +8,7 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import CoopService, { readV2Registry, v2RegistryPath, v2Root } from '../src/index.ts'
+import CoopService, { MasterId, readV2Registry, v2RegistryPath, v2Root } from '../src/index.ts'
 import { contextPctOf } from '../src/runtime.ts'
 import * as store from '../src/store.ts'
 import type { CoopV2RegistryFile } from '../src/types.ts'
@@ -308,9 +308,9 @@ describe('context hard guard', () => {
     const file = JSON.parse(await readFile(registryPath, 'utf8')) as CoopV2RegistryFile
     const dead = {
       sessionId: 'ghost-worker',
-      roles: ['worker'],
-      masterId: String(m.masterId),
-      bindState: 'bound',
+      roles: ['worker' as const],
+      masterId: MasterId(String(m.masterId)),
+      bindState: 'bound' as const,
       cwd,
       cwdScope: 'cwd' as const,
       updatedAt: Date.now() - 400_000,

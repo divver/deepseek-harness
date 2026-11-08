@@ -210,7 +210,7 @@ describe('spawn route env', () => {
 })
 
 describe('pane-keyed master revival', () => {
-  async function paneHarness(cwd: string, paneId: string, staleMs = 300_000): Promise<Context> {
+  async function paneHarness(_cwd: string, paneId: string, staleMs = 300_000): Promise<Context> {
     const ctx = new Context()
     await mountAgentLoopTestDependencies(ctx)
     await ctx.plugin(AgentLoop, { agents: [] })
