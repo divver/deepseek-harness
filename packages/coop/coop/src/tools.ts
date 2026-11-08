@@ -451,7 +451,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
 
   ctx.tools.register(defineTool({
     name: 'coop_list',
-    description: 'List coop v2 nodes visible to you: your own master\'s nodes plus every unbound worker/reviewer.',
+    description: 'List coop v2 nodes visible to you: your own master\'s nodes plus every unbound worker/reviewer. Each row ends with "ctx N% used" — the node\'s current context-window occupancy (0% = fresh, the hard limit is far above), never the remaining share.',
     parameters: {
       unbound: { type: 'boolean', description: 'Only show adoptable unbound nodes.' },
     },
