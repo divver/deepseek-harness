@@ -122,7 +122,7 @@ async function runRole(
   }
   return USAGE
 }
-const V2_USAGE = 'usage: /coop master [--any-cwd] · worker|reviewer [--master <masterId>] [--model <route>] [--skills a,b] [--any-cwd] · off · list [--unbound] · status · bind <sessionId> · release <sessionId> · spawn worker|reviewer [--model <route>] [--workdir <dir> | --worktree <dir|branch>] [--skills a,b] · board [planId] · plan close|abort <planId> · workspace init [path]'
+const V2_USAGE = 'usage: /coop master [--any-cwd] · worker|reviewer [--master <masterId>] [--model <route>] [--skills a,b] [--any-cwd] · off · list [--unbound] · status · bind <sessionId> · release <sessionId> · spawn worker|reviewer [--model <route>] [--workdir <dir> | --worktree <dir|branch>] [--skills a,b] [--handover <doc path>] · board [planId] · plan close|abort <planId> · workspace init [path]'
 /** Dispatch the v2 `/coop` grammar for one live agent. */
 async function runV2(
   service: CoopService,
@@ -203,6 +203,7 @@ async function runV2(
     const model = parsed.flags.get('model')
     const workdir = parsed.flags.get('workdir')
     const worktree = parsed.flags.get('worktree')
+    const handover = parsed.flags.get('handover')
     const skillsFlag = parsed.flags.get('skills')
     const skills = typeof skillsFlag === 'string'
       ? skillsFlag.split(',').map(part => part.trim()).filter(part => part.length > 0)
@@ -212,6 +213,7 @@ async function runV2(
       ...(typeof model === 'string' ? { model } : {}),
       ...(typeof workdir === 'string' ? { workdir } : {}),
       ...(typeof worktree === 'string' ? { worktree } : {}),
+      ...(typeof handover === 'string' ? { handoverPath: handover } : {}),
       ...(skills === undefined || skills.length === 0 ? {} : { skills }),
     })
     if (outcome.spawned === 'herdr') {

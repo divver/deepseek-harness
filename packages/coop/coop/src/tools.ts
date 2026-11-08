@@ -1156,13 +1156,14 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
 
   ctx.tools.register(defineTool({
     name: 'coop_worker_create',
-    description: 'Auto-create one bound worker/reviewer node (master only). With herdr reachable from a herdr-hosted master, the node lands in a freshly split pane running spawnCommand at the target directory (worktree > workdir > workspace root) and is confirmed registered-and-bound by watching the registry; otherwise it is an in-process headless session (§8.2).',
+    description: 'Auto-create one bound worker/reviewer node (master only). With herdr reachable from a herdr-hosted master, the node lands in a freshly split pane running spawnCommand at the target directory (worktree > workdir > workspace root) and is confirmed registered-and-bound by watching the registry; otherwise it is an in-process headless session (§8.2). handoverPath wakes the successor on the predecessor’s handover document.',
     parameters: {
       role: { type: 'string', required: true, enum: ['worker', 'reviewer'], description: 'Node role to create.' },
       model: { type: 'string', description: 'Model route for the node: "provider/model" pins both halves, a bare model keeps the role-route provider. The spawned pane boots on it; headless sessions launch with it.' },
       workdir: { type: 'string', description: 'Working directory for the spawned session (defaults to the workspace root; the herdr pane starts there).' },
       worktree: { type: 'string', description: 'Coop worktree to place the node in, by directory or branch name; the pane/session starts inside the worktree (registration still resolves the workspace anchor).' },
       skills: { type: 'array', items: { type: 'string' }, description: 'Skills the node declares at registration (comma-joined onto the /coop registration line); the scheduler only assigns a task to a worker whose declared skills cover every skill the task demands.' },
+      handoverPath: { type: 'string', description: 'Handover document left by the predecessor; the successor’s first wake tells it to read this file and continue the work.' },
     },
     output: {
       schema: {
@@ -1186,6 +1187,7 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
           ...(args.workdir === undefined ? {} : { workdir: args.workdir }),
           ...(args.worktree === undefined ? {} : { worktree: args.worktree }),
           ...(args.skills === undefined || args.skills.length === 0 ? {} : { skills: args.skills }),
+          ...(args.handoverPath === undefined ? {} : { handoverPath: args.handoverPath }),
         })
         return {
           spawned: outcome.spawned,

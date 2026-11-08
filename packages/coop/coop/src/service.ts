@@ -3214,7 +3214,7 @@ export class CoopService extends Service {
        */
   async createNodeV2(
     agent: Agent,
-    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string; worktree?: string; skills?: string[] },
+    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string; worktree?: string; skills?: string[]; handoverPath?: string },
   ): Promise<{ spawned: 'herdr' | 'headless'; paneId?: string; entry?: CoopV2RegistryEntry }> {
     const { masterId, root } = await this.requireV2Master(agent)
     // Where the node LIVES: an assigned worktree wins, then an explicit
@@ -3296,6 +3296,10 @@ export class CoopService extends Service {
     // the truth. Poll for the entry, re-sending the line until it lands —
     // then report the committed bind state instead of hoping it arrived.
     const entry = await this.awaitPaneRegistration(root, paneId, req.role, line)
+    if (req.handoverPath !== undefined) {
+      await this.deliverV2(String(masterId), entry.sessionId, root,
+        `you are the successor ${req.role} for master ${String(masterId)} — your predecessor left a handover document: read ${req.handoverPath} first and continue the work from where it stands`)
+    }
     return { spawned: 'herdr', paneId, entry }
   }
 
@@ -3309,7 +3313,7 @@ export class CoopService extends Service {
        */
   private async createNodeHeadless(
     agent: Agent,
-    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string; skills?: string[] },
+    req: { role: 'worker' | 'reviewer'; model?: string; workdir?: string; skills?: string[]; handoverPath?: string },
     masterId: MasterId,
     cwd: string,
   ): Promise<{ spawned: 'headless'; entry: CoopV2RegistryEntry }> {
@@ -3342,6 +3346,11 @@ export class CoopService extends Service {
       ...(req.model === undefined ? {} : { model: req.model }),
       ...(req.skills === undefined ? {} : { skills: req.skills }),
     })
+    if (req.handoverPath !== undefined) {
+      const headlessRoot = await this.v2RootOf(agent)
+      await this.deliverV2(String(masterId), entry.sessionId, headlessRoot,
+        `you are the successor ${req.role} for master ${String(masterId)} — your predecessor left a handover document: read ${req.handoverPath} first and continue the work from where it stands`)
+    }
     return { spawned: 'headless', entry }
   }
 
@@ -3452,13 +3461,19 @@ export class CoopService extends Service {
          * @returns the committed registry entry.
          * @throws CoopError `COOP_SPAWN_FAILED` when the window elapses with no entry.
          */
-  private async awaitPaneRegistration(root: string, paneId: string, role: 'master' | 'worker' | 'reviewer', line: string): Promise<CoopV2RegistryEntry> {
+  private async awaitPaneRegistration(root: string, paneId: string, role: 'master' | 'worker' | 'reviewer', line: string, exclude?: string): Promise<CoopV2RegistryEntry> {
     const deadline = Date.now() + this.resolved.spawnRegisterTimeoutMs
     const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
     for (let attempt = 1; ; attempt++) {
       await sleep(attempt === 1 ? 1_500 : 1_000)
+      // Fresh rows only: a stale row carrying the same pane id (a long-dead
+      // node of this pane) must not satisfy the wait — the successor has to
+      // be a live registration, never the handed-off or zombie entry.
       const entry = (await store.readV2Registry(store.v2RegistryPath(root)))?.entries
-        .find(candidate => candidate.meta?.paneId === paneId && candidate.roles.includes(role))
+        .find(candidate => candidate.meta?.paneId === paneId
+          && candidate.roles.includes(role)
+          && candidate.sessionId !== exclude
+          && Date.now() - candidate.heartbeatAt <= this.resolved.staleMs)
       if (entry !== undefined) return entry
       if (Date.now() >= deadline) {
         throw new CoopError(`spawned pane ${paneId} never registered as ${role} within ${String(this.resolved.spawnRegisterTimeoutMs)}ms — send the line manually: ${line}`, 'COOP_SPAWN_FAILED')
@@ -3823,11 +3838,27 @@ export class CoopService extends Service {
     this.contextGuardState.delete(entry.sessionId)
     const paneId = entry.meta?.paneId
     const line = this.registrationLineForV2(entry)
-    if (paneId !== undefined && line !== undefined && (await this.herdrAvailable())) {
+    // A pane reset sent from INSIDE the handing-off turn races the TUI: the
+    // still-streaming session swallows `/new` as queued input instead of
+    // executing it. Only attempt the in-pane reset when this process sees the
+    // saturated agent idle (or does not host it at all — the forced/dead-pane
+    // guard paths run after the grace window, past the turn).
+    const agentLocal = this.ctx.agents.get(SessionId(entry.sessionId))
+    const midTurn = agentLocal?.status === 'running'
+    if (!midTurn && paneId !== undefined && line !== undefined && (await this.herdrAvailable())) {
       const reset = await this.runHerdr(['pane', 'send-text', paneId, '/new'])
       if (reset.code === 0) await this.runHerdr(['pane', 'send-keys', paneId, 'Enter'])
+      let successor: CoopV2RegistryEntry | undefined
       if (reset.code === 0) {
-        const successor = await this.awaitPaneRegistration(root, paneId, role, line)
+        try {
+          successor = await this.awaitPaneRegistration(root, paneId, role, line, entry.sessionId)
+        } catch {
+          // The reset never produced a live successor registration (the
+          // /new was swallowed or the line never landed) — fall through to
+          // the replacement branch below instead of failing the handoff.
+        }
+      }
+      if (successor !== undefined) {
         if (masterId !== undefined) {
           const masterEntry = (await this.v2Tables(root))
             .find(candidate => candidate.roles.includes('master') && String(candidate.masterId) === masterId)
@@ -3857,6 +3888,7 @@ export class CoopService extends Service {
             await this.createNodeV2(masterAgent, {
               role: 'worker',
               ...(declared.length === 0 ? {} : { skills: declared }),
+              ...(opts.handoverPath === undefined ? {} : { handoverPath: opts.handoverPath }),
             })
             await this.deliverV2(masterId, masterEntry.sessionId, root,
               `${label} hit the context hard limit${opts.forced === true ? ' (handoff deadline)' : ''} — released, tasks reclaimed${reclaimed.length === 0 ? '' : ` (${reclaimed.join(', ')})`}, fresh replacement spawned`)
@@ -3870,7 +3902,7 @@ export class CoopService extends Service {
         }
       }
     }
-    const report = `${opts.deadPane === true ? `${label} pane died at the context hard limit — entry dropped` : `handoff for ${label}: no resettable pane`} — ${role === 'worker' ? 'worker released' : 'restart the session and replay its registration line'}${line === undefined ? '' : `: ${line}`}${reclaimed.length === 0 ? '' : `; reclaimed tasks: ${reclaimed.join(', ')}`}`
+    const report = `${opts.deadPane === true ? `${label} pane died at the context hard limit — entry dropped` : `handoff for ${label}: no resettable pane (the turn was still running or the reset never landed)`} — ${role === 'worker' ? `spawn the successor from the master: coop_worker_create(role="worker"${opts.handoverPath === undefined ? '' : `, handoverPath="${opts.handoverPath}"`})` : 'restart the session and replay its registration line'}${line === undefined ? '' : `: ${line}`}${reclaimed.length === 0 ? '' : `; reclaimed tasks: ${reclaimed.join(', ')}`}`
     if (masterId !== undefined) {
       const masterEntry = (await this.v2Tables(root))
         .find(candidate => candidate.roles.includes('master') && String(candidate.masterId) === masterId)
