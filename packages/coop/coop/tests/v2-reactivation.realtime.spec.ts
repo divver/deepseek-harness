@@ -50,7 +50,7 @@ describe('auto reactivation (real time)', () => {
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do it' })
     await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: String(m.masterId) })
     await ctx.coop.submitReviewV2(master, plan.planId)
-    await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass')
+    await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
     console.log('[realtime] setup complete; going quiet for 15 minutes')
 
     const registry = v2RegistryPath(v2Root(root, '.dsh/coop'))

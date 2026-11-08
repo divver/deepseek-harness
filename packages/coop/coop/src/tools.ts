@@ -626,11 +626,21 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
 
   ctx.tools.register(defineTool({
     name: 'coop_plan_review',
-    description: 'Review a submitted plan (reviewer bound to the plan\'s master; the master itself when no reviewer is bound, or with allowSelfReview). pass → active (ready tasks schedule); request_changes → back to designing for the master.',
+    description: 'Review a submitted plan (reviewer bound to the plan\'s master; the master itself when no reviewer is bound, or with allowSelfReview). pass → active (ready tasks schedule; requires severityCounts within the quality gate); request_changes → back to designing for the master.',
     parameters: {
       planId: { type: 'string', required: true, description: 'Plan under review.' },
       decision: { type: 'string', required: true, enum: ['pass', 'request_changes'], description: 'Review verdict.' },
       summary: { type: 'string', description: 'One-line rationale.' },
+      severityCounts: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'P0/P1/P2 finding counts. Grade every finding (P0 correctness/security/data-loss/spec break, P1 fix-before-merge, P2 minor); a pass requires these when the quality gate constrains a level, and P0>0 demands request_changes.',
+        properties: {
+          p0: { type: 'integer', description: 'P0 findings found.' },
+          p1: { type: 'integer', description: 'P1 findings found.' },
+          p2: { type: 'integer', description: 'P2 findings found.' },
+        },
+      },
     },
     output: {
       schema: {
@@ -644,7 +654,8 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       const agent = needAgent(exec)
       try {
         const plan = await service.reviewPlanV2(agent, args.planId, args.decision,
-          args.summary === undefined ? undefined : args.summary)
+          args.summary === undefined ? undefined : args.summary,
+          args.severityCounts === undefined ? undefined : args.severityCounts)
         return { planId: plan.planId, status: plan.status }
       } catch (error) {
         throw new Error(failMessage(error))
@@ -908,12 +919,22 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
 
   ctx.tools.register(defineTool({
     name: 'coop_task_verify',
-    description: 'Verify a reported task (reviewer bound to the plan\'s master; the master itself when no reviewer is bound, or with allowSelfReview). pass → done; request_changes → rework for the assignee.',
+    description: 'Verify a reported task (reviewer bound to the plan\'s master; the master itself when no reviewer is bound, or with allowSelfReview). pass → done (requires severityCounts within the quality gate); request_changes → rework for the assignee.',
     parameters: {
       planId: { type: 'string', required: true, description: 'Owning plan id.' },
       taskId: { type: 'string', required: true, description: 'Target task id.' },
       decision: { type: 'string', required: true, enum: ['pass', 'request_changes'], description: 'Verification verdict.' },
       summary: { type: 'string', description: 'Acceptance rationale or rework demand.' },
+      severityCounts: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'P0/P1/P2 finding counts. Grade every finding (P0 correctness/security/data-loss/spec break, P1 fix-before-merge, P2 minor); a pass requires these when the quality gate constrains a level, and P0>0 demands request_changes.',
+        properties: {
+          p0: { type: 'integer', description: 'P0 findings found.' },
+          p1: { type: 'integer', description: 'P1 findings found.' },
+          p2: { type: 'integer', description: 'P2 findings found.' },
+        },
+      },
     },
     output: {
       schema: {
@@ -927,7 +948,8 @@ export function registerCoopV2Tools(ctx: Context, service: CoopService): void {
       const agent = needAgent(exec)
       try {
         const task = await service.verifyTaskV2(agent, args.planId, args.taskId, args.decision,
-          args.summary === undefined ? undefined : args.summary)
+          args.summary === undefined ? undefined : args.summary,
+          args.severityCounts === undefined ? undefined : args.severityCounts)
         return { taskId: task.taskId, status: task.status, attempts: task.attempts }
       } catch (error) {
         throw new Error(failMessage(error))

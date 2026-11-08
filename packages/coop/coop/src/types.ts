@@ -150,6 +150,8 @@ export type CoopErrorCode =
     | 'COOP_WORKTREE_NOT_FOUND'
     | 'COOP_WORKTREE_NAME_TAKEN'
     | 'COOP_WORKTREE_MERGE_CONFLICT'
+  | 'COOP_GATE_EXCEEDED'
+  | 'COOP_GATE_COUNTS_REQUIRED'
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
@@ -243,6 +245,26 @@ export interface CoopV2RegistryEventData {
 /** Lifecycle of one v2 plan (review gate arrives with P3). */
 export type V2PlanStatus = 'designing' | 'reviewing' | 'active' | 'closing' | 'closed' | 'aborted'
 
+/** P0/P1/P2 finding counts reported by a reviewer alongside a verdict. */
+export interface CoopSeverityCounts {
+  /** Findings that block a pass under any gate: correctness, security, data loss, spec break. */
+  p0: number
+  /** Findings that should be fixed before merge. */
+  p1: number
+  /** Minor findings. */
+  p2: number
+}
+
+/** Quality-gate snapshot persisted with a verdict: only constrained levels appear; an absent level was unconstrained. */
+export interface CoopQualityGate {
+  /** Max allowed P0 findings on the passing verdict. */
+  p0?: number
+  /** Max allowed P1 findings on the passing verdict. */
+  p1?: number
+  /** Max allowed P2 findings on the passing verdict. */
+  p2?: number
+}
+
 /** Lifecycle of one v2 task inside a plan DAG. */
 export type V2TaskStatus =
   | 'pending'
@@ -287,7 +309,14 @@ export interface CoopV2Task {
   createdAt: number
   updatedAt: number
   /** Latest verify conclusion, once one exists. */
-  verify?: { decision: 'pass' | 'request_changes'; summary?: string; by: string; at: number }
+  verify?: {
+    decision: 'pass' | 'request_changes'
+    summary?: string
+    severityCounts?: CoopSeverityCounts
+    gate?: CoopQualityGate
+    by: string
+    at: number
+  }
   /** Latest worker report text, once one exists. */
   report?: { summary: string; by: string; at: number }
 }
@@ -320,6 +349,14 @@ export interface CoopV2PlanFile {
   /** DAG edges; `from` finishing unblocks `to`. */
   edges: { from: string; to: string }[]
   history: CoopV2PlanHistoryEntry[]
+  /** Latest plan-review outcome with its quality-gate evidence, once one exists. */
+  lastReview?: {
+    decision: 'pass' | 'request_changes'
+    severityCounts?: CoopSeverityCounts
+    gate?: CoopQualityGate
+    by: string
+    at: number
+  }
 }
 /** Lifecycle of one coop-managed worktree. */
 export type CoopWtStatus = 'active' | 'merged' | 'cleaned'

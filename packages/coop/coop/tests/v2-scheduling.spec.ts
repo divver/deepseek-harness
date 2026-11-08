@@ -70,7 +70,7 @@ async function activate(ctx: Context, master: Agent, reviewer: Agent, planId: st
     await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
   }
   await ctx.coop.submitReviewV2(master, planId)
-  await ctx.coop.reviewPlanV2(reviewer, planId, 'pass')
+  await ctx.coop.reviewPlanV2(reviewer, planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
 }
 
 /** Stamp one entry's meta.contextPct directly in the shared registry file. */

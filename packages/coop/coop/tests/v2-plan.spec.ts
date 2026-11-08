@@ -71,7 +71,7 @@ async function activate(ctx: Context, master: Agent, reviewer: Agent, planId: st
     await ctx.coop.registerV2(reviewer, { roles: ['reviewer'], masterId: m })
   }
   await ctx.coop.submitReviewV2(master, planId)
-  await ctx.coop.reviewPlanV2(reviewer, planId, 'pass')
+  await ctx.coop.reviewPlanV2(reviewer, planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
 }
 
 /** Rewrite one plan file for tests that need to backdate watchdog anchors. */
@@ -147,7 +147,7 @@ describe('dag', () => {
     expect(board[0]?.tasks.find(task => task.taskId === 't2')?.status).toBe('pending')
     await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
     await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done A')
-    await ctx.coop.verifyTaskV2(reviewer, plan.planId, 't1', 'pass', 'lgtm')
+    await ctx.coop.verifyTaskV2(reviewer, plan.planId, 't1', 'pass', 'lgtm', { p0: 0, p1: 0, p2: 0 })
     board = await ctx.coop.boardV2(master, plan.planId)
     expect(board[0]?.tasks.find(task => task.taskId === 't1')?.status).toBe('done')
     expect(board[0]?.tasks.find(task => task.taskId === 't2')?.status).toBe('assigned')
@@ -250,10 +250,10 @@ describe('verification gate', () => {
     const plan2 = await ctx2.coop.createPlanV2(m2, { title: 'P', objective: 'O' })
     await ctx2.coop.addTaskV2(m2, plan2.planId, { title: 't', spec: 'do' })
     await ctx2.coop.submitReviewV2(m2, plan2.planId)
-    await ctx2.coop.reviewPlanV2(m2, plan2.planId, 'pass')
+    await ctx2.coop.reviewPlanV2(m2, plan2.planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
     await ctx2.coop.executeBeginV2(w2, plan2.planId, 't1')
     await ctx2.coop.executeReportV2(w2, plan2.planId, 't1', 'done')
-    const verified = await ctx2.coop.verifyTaskV2(m2, plan2.planId, 't1', 'pass', 'self ok')
+    const verified = await ctx2.coop.verifyTaskV2(m2, plan2.planId, 't1', 'pass', 'self ok', { p0: 0, p1: 0, p2: 0 })
     expect(verified.status).toBe('done')
   })
 
@@ -331,7 +331,7 @@ describe('plan review gate', () => {
     expect(returned.status).toBe('designing')
     expect(coopNotices(master).some(text => text.includes('plan review requested changes'))).toBe(true)
     await ctx.coop.submitReviewV2(master, plan.planId)
-    const active = await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass')
+    const active = await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
     expect(active.status).toBe('active')
     const board = await ctx.coop.boardV2(master, plan.planId)
     expect(board[0]?.tasks[0]?.status).toBe('assigned')
@@ -352,7 +352,7 @@ describe('plan review gate', () => {
     await ctx2.coop.registerV2(r2, { roles: ['reviewer'], masterId: m2id })
     const plan2 = await ctx2.coop.createPlanV2(m2, { title: 'P', objective: 'O' })
     await ctx2.coop.submitReviewV2(m2, plan2.planId)
-    const active = await ctx2.coop.reviewPlanV2(m2, plan2.planId, 'pass')
+    const active = await ctx2.coop.reviewPlanV2(m2, plan2.planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
     expect(active.status).toBe('active')
   })
 
@@ -366,14 +366,14 @@ describe('plan review gate', () => {
     await ctx.coop.submitReviewV2(master, plan.planId)
     // No reviewer bound: submit wakes the master itself to gate the plan.
     expect(coopNotices(master).some(text => text.includes('no reviewer bound'))).toBe(true)
-    const active = await ctx.coop.reviewPlanV2(master, plan.planId, 'pass')
+    const active = await ctx.coop.reviewPlanV2(master, plan.planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
     expect(active.status).toBe('active')
     const board = await ctx.coop.boardV2(master, plan.planId)
     expect(board[0]?.tasks[0]?.assignee).toBe('worker')
     await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
     await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done')
     expect(coopNotices(master).some(text => text.includes('no reviewer bound — you verify'))).toBe(true)
-    const verified = await ctx.coop.verifyTaskV2(master, plan.planId, 't1', 'pass', 'self')
+    const verified = await ctx.coop.verifyTaskV2(master, plan.planId, 't1', 'pass', 'self', { p0: 0, p1: 0, p2: 0 })
     expect(verified.status).toBe('done')
   })
 })
@@ -456,7 +456,7 @@ describe('auto-approve without reviewer', () => {
     const reported = await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done work')
     expect(reported.status).toBe('verifying')
     expect(coopNotices(master).some(text => text.includes('no reviewer bound — you verify'))).toBe(true)
-    const verified = await ctx.coop.verifyTaskV2(master, plan.planId, 't1', 'pass', 'ok')
+    const verified = await ctx.coop.verifyTaskV2(master, plan.planId, 't1', 'pass', 'ok', { p0: 0, p1: 0, p2: 0 })
     expect(verified.status).toBe('done')
     const after = await ctx.coop.boardV2(master, plan.planId)
     expect(after[0]?.tasks[1]?.status).toBe('assigned')
@@ -494,7 +494,7 @@ describe('auto-approve without reviewer', () => {
     await ctx.coop.addTaskV2(master, plan.planId, { title: 't1', spec: 'do' })
     const submitted = await ctx.coop.submitReviewV2(master, plan.planId)
     expect(submitted.status).toBe('reviewing')
-    await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass')
+    await ctx.coop.reviewPlanV2(reviewer, plan.planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
     await ctx.coop.executeBeginV2(worker, plan.planId, 't1')
     const reported = await ctx.coop.executeReportV2(worker, plan.planId, 't1', 'done')
     expect(reported.status).toBe('verifying')
@@ -518,7 +518,7 @@ describe('plan id prefixes and self-heal', () => {
     // The verify wake-up carries the canonical id, so the loop never depends
     // on prefix tolerance again.
     expect(coopNotices(reviewer).some(text => text.includes('coop_task_verify') && text.includes(plan.planId))).toBe(true)
-    const verified = await ctx.coop.verifyTaskV2(reviewer, short, 't1', 'pass', 'lgtm')
+    const verified = await ctx.coop.verifyTaskV2(reviewer, short, 't1', 'pass', 'lgtm', { p0: 0, p1: 0, p2: 0 })
     expect(verified.status).toBe('done')
   })
 
@@ -648,7 +648,7 @@ describe('concurrent masters in one workspace', () => {
     await ctx.coop.executeReportV2(worker, p1.planId, 't1', 'done A')
     expect(coopNotices(master).some(text => text.includes('coop_task_verify') && text.includes(p1.planId))).toBe(true)
     expect(coopNotices(second).some(text => text.includes(p1.planId))).toBe(false)
-    await ctx.coop.verifyTaskV2(reviewer, p1.planId, 't1', 'pass', 'lgtm')
+    await ctx.coop.verifyTaskV2(reviewer, p1.planId, 't1', 'pass', 'lgtm', { p0: 0, p1: 0, p2: 0 })
     expect((await ctx.coop.boardV2(master, p1.planId))[0]?.tasks[0]?.status).toBe('done')
   })
 

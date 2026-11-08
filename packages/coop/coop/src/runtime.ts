@@ -4,6 +4,19 @@ import { isAbsolute, join, normalize, resolve, basename } from 'node:path'
 import { HarnessError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { CwdScope, CoopErrorCode, MasterId, PlanId, ReviewLevel, Role, V2Role } from './types.ts'
 import { randomUUID } from 'node:crypto'
+/** Per-level quality-gate thresholds (non-negative safe integers); omitted levels stay unconstrained. */
+export interface QualityGateSettings {
+  /** Max allowed P0 findings on a pass (default 0 at resolution). */
+  p0?: number
+  /** Max allowed P1 findings on a pass (default unconstrained). */
+  p1?: number
+  /** Max allowed P2 findings on a pass (default unconstrained). */
+  p2?: number
+}
+
+/** Quality-gate deployment config: level shorthand applies to both gates, or split `plan`/`task`. */
+export type QualityGateConfig = QualityGateSettings | { plan?: QualityGateSettings; task?: QualityGateSettings }
+
 /** v2 hard-context-guard handling strategy for one role. */
 export type ContextGuardStrategy = 'handoff' | 'compact' | 'none'
 
@@ -12,6 +25,13 @@ export type ContextGuardStrategy = 'handoff' | 'compact' | 'none'
 
 /** All roles that may hold `cwdScope: "any"` when the deployment allows any-scope at all. */
 export const DEFAULT_ANY_CWD_ROLES: readonly Role[] = ['master', 'worker']
+
+/** Fully-resolved quality gate for one surface: every level carries a usable threshold; `Infinity` means unconstrained. */
+export interface ResolvedQualityGate {
+  p0: number
+  p1: number
+  p2: number
+}
 
 /** Deployment-tunable coop defaults; every value is a validated `Config` field, none are hardcoded at use sites. */
 export interface ResolvedCoopConfig {
@@ -54,11 +74,11 @@ export interface ResolvedCoopConfig {
   spawnReadyRegex: string
   /** v2 window waiting for a spawned pane's registration to land in the registry, re-sending the line meanwhile. */
   spawnRegisterTimeoutMs: number
-  /** v2 herdr pane arrangement for auto-spawned nodes: role columns or every pane right of the master. */
+  /** v2 herdr pane arrangement for auto-spawned nodes: role columns or legacy `right`. */
   spawnLayout: 'columns' | 'right'
   /** v2 per-role LLM routes applied to every request of a registered session (mode v2 only). */
   roleLlm: RoleLlmRoutes
-  /** v2 pane identity for pane-keyed master revival; unset falls back to `HERDR_PANE_ID`. */
+  /** v2 pane identity for pane-keyed master revival; unset falls back to `HERDR_PANE_ID` (test seam). */
   paneId?: string | undefined
   /** v2 scheduler skill-demand matching: strict gate, fallback to any free worker when none declares, or off (default strict). */
   skillMatch: 'strict' | 'fallback' | 'off'
@@ -70,6 +90,8 @@ export interface ResolvedCoopConfig {
    * fresh session of the same role, `compact` compacts in place, `none`
    * disables (default: worker handoff, master/reviewer compact). */
   contextStrategy: { worker: ContextGuardStrategy; master: ContextGuardStrategy; reviewer: ContextGuardStrategy }
+  /** v2 resolved quality gates: max P0/P1/P2 counts a `pass` may carry per surface (`Infinity` = unconstrained; default `{ p0: 0 }`). */
+  qualityGate: { plan: ResolvedQualityGate; task: ResolvedQualityGate }
 }
 
 /**
@@ -112,6 +134,7 @@ export function resolveCoopConfig(config: {
   contextHardGraceMs?: number
   contextStrategy?: { worker?: string; master?: string; reviewer?: string }
   paneId?: string
+  qualityGate?: QualityGateConfig
 }): ResolvedCoopConfig {
   const positive = (value: number | undefined, name: string): number | undefined => {
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
@@ -156,6 +179,46 @@ export function resolveCoopConfig(config: {
   if (workerContextCeilingPct !== undefined && (typeof workerContextCeilingPct !== 'number' || !Number.isFinite(workerContextCeilingPct) || workerContextCeilingPct <= 0 || workerContextCeilingPct > 1)) {
     throw new CoopError(`config workerContextCeilingPct must be a number in (0, 1], got ${String(workerContextCeilingPct)}`, 'COOP_CONFIG_UNSUPPORTED')
   }
+  // Quality gates: with no config at all, both gates default to { p0: 0 }
+  // (a pass must carry zero P0). In any explicitly provided object, an
+  // omitted level is unconstrained — except `plan`, which inherits the
+  // resolved task gate's value for every level it leaves out. A flat
+  // { p0, p1, p2 } object configures both gates at once.
+  const GATE_LEVELS = ['p0', 'p1', 'p2'] as const
+  const parseGate = (value: unknown, name: string, fallback: ResolvedQualityGate): ResolvedQualityGate => {
+    if (value === undefined) return fallback
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new CoopError(`config qualityGate.${name} must be an object of p0/p1/p2 thresholds`, 'COOP_CONFIG_UNSUPPORTED')
+    }
+    const out: ResolvedQualityGate = { ...fallback }
+    for (const [key, threshold] of Object.entries(value)) {
+      if (!(GATE_LEVELS as readonly string[]).includes(key)) {
+        throw new CoopError(`config qualityGate.${name} key "${key}" must be one of p0/p1/p2`, 'COOP_CONFIG_UNSUPPORTED')
+      }
+      if (typeof threshold !== 'number' || !Number.isSafeInteger(threshold) || threshold < 0) {
+        throw new CoopError(`config qualityGate.${name}.${key} must be a non-negative safe integer, got ${String(threshold)}`, 'COOP_CONFIG_UNSUPPORTED')
+      }
+      out[key as (typeof GATE_LEVELS)[number]] = threshold
+    }
+    return out
+  }
+  const UNCONSTRAINED_GATE: ResolvedQualityGate = {
+    p0: Number.POSITIVE_INFINITY,
+    p1: Number.POSITIVE_INFINITY,
+    p2: Number.POSITIVE_INFINITY,
+  }
+  const DEFAULT_GATE: ResolvedQualityGate = { ...UNCONSTRAINED_GATE, p0: 0 }
+  const gateConfig = config.qualityGate
+  const gateSplit = gateConfig !== undefined && typeof gateConfig === 'object' && !Array.isArray(gateConfig)
+      && Object.keys(gateConfig).some(key => key === 'plan' || key === 'task')
+  const taskInput: QualityGateSettings | undefined = gateSplit
+    ? (gateConfig as { plan?: QualityGateSettings; task?: QualityGateSettings }).task
+    : (gateConfig as QualityGateSettings | undefined)
+  const taskGate = parseGate(taskInput, 'task', taskInput === undefined ? DEFAULT_GATE : UNCONSTRAINED_GATE)
+  const planInput: QualityGateSettings | undefined = gateSplit
+    ? (gateConfig as { plan?: QualityGateSettings; task?: QualityGateSettings }).plan
+    : (gateConfig as QualityGateSettings | undefined)
+  const planGate = parseGate(planInput, 'plan', taskGate)
   return {
     mode: config.mode ?? 'v1',
     defaultReviewLevel: config.defaultReviewLevel ?? 'standard',
@@ -193,6 +256,7 @@ export function resolveCoopConfig(config: {
     },
     roleLlm,
     paneId: config.paneId,
+    qualityGate: { plan: planGate, task: taskGate },
   }
 }
 

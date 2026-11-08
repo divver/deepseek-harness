@@ -58,6 +58,7 @@ executing heartbeat timeout → needs_rework (worker may re-begin)
 | `roleLlm` | _（空）_ | v2 按角色固定 LLM 路由 `{ master\|worker\|reviewer: { provider, model, reasoningEffort? } }`；注册为该角色的会话其每个请求都改走此路由（provider+model 成对，effort 档位由目标 adapter 解释） |
 | `spawnRegisterTimeoutMs` | `30000` | v2 等待新窗格注册落入注册表的窗口；期间每约 4 秒重发注册行，超时 fail-loud 并给出手动注册行 |
 | `skillMatch` | `strict` | v2 调度器 skill 需求匹配：`strict` —— worker 声明了任务要求的全部 skill 才可接；`fallback` —— 声明者优先，但无任何空闲 worker 声明时允许任意空闲 worker 接（单机部署下 skill 是全局的）；`off` —— 忽略 skill 需求 |
+| `qualityGate` | `{ p0: 0 }` | v2 质量门控：`pass` 时各档 P0/P1/P2 计数须 ≤ 阈值。平铺对象同时作用于 plan 评审与 task 验收，`{ plan: …, task: … }` 分开设置；`task` 缺省 `{ p0: 0 }`，`plan` 未列出的档沿用 task 值。受控档缺 `severityCounts` 的 `pass` 报 `COOP_GATE_COUNTS_REQUIRED`，超限报 `COOP_GATE_EXCEEDED`；`request_changes` 永不受限 |
 | `contextHardPct` | `0.5` | v2 硬限护栏，覆盖**全部角色**（master/worker/reviewer）：会话上下文占比达到该阈值即触发该角色的 `contextStrategy` |
 | `contextHardPctByRole` | _(空)_ | v2 按角色覆盖护栏阈值（`worker`/`master`/`reviewer`），优先于 `contextHardPct` |
 | `contextHardGraceMs` | `300000` | v2 handoff 收尾指令到强制重置窗格之间的宽限期 |
@@ -78,6 +79,14 @@ executing heartbeat timeout → needs_rework (worker may re-begin)
 - **按角色固定 LLM 路由（roleLlm）** —— 配置 `roleLlm: { master|worker|reviewer: { provider, model, reasoningEffort? } }` 后，注册为对应角色的会话其每个 LLM 请求都改走该路由：本进程的 `agent/request` 监听器重写 provider/model/effort。`/coop master`、`/coop worker|reviewer` 注册即生效；`/coop spawn` 切出的 herdr 窗格收到注册行后同样生效（每个进程套用同一份部署配置），headless 节点还会在创建时直接带上该 provider/model。注册表 meta.model 记录生效路由；`/coop off` 解除。
 - **Summarizer → memory（P4）** —— 每个通过验证的 task 与关闭的 plan 都会被确定性汇总进 master 的记忆轨 `v2/masters/<masterId>/memory.jsonl`（report 文本 + verify 结论作为 lessons），并镜像人读的 `memory.md`；追加按 `memoryRetainEntries` 压缩。`coop:memory` 提示段为该 master 的每个成员注入最新 `memoryInjectTopK` 条（仅时间倒序，§12.3）；针对性回忆用 `coop_memory_search`（关键词，按 master 隔离）。可选的 summarizer-model LLM 通道已延后 —— 确定性汇总对 report/verify 文本保持无损。
 - **Plan 即 task DAG（P1）** —— `coop_plan_create`（绑定单一 `repoRoot`，§12.1）→ `coop_task_add`/`coop_task_link`/`coop_task_cancel`（plan 锁内环检测）→ `coop_plan_activate`。就绪度由 DAG 推导；调度器把 ready 任务分派给空闲的被绑定 worker（skill 需求 ⊆ 声明技能，`maxParallelTasks`），并用 `task assigned` 信令唤醒。`coop_task_add`/`coop_task_update` 可传 `assigneeSessionId` 把任务钉给 master 指定的 worker —— 调度器此后只把该任务派给被钉的 worker（需其空闲），否则任务保持 ready。节点在每次心跳时从 token-meter 投影上报上下文占用（`meta.contextPct`）；调度器优先选择占用更低的 worker，而当全部被绑定 worker 都达到/超过 `workerContextCeilingPct` 且已持满 `maxWorkers` 时，释放占用最高的空闲 worker 并换入新 worker（每 master 60 秒冷却）。worker 执行 `coop_execute_begin` → `coop_execute_report`；被绑定的 reviewer 用 `coop_task_verify` 验收（`pass` → done 且下游转 ready；`request_changes` → 同一 worker 返工）。`coop_board` 是看板投影；`coop_plan_close` 要求全部任务 done/cancelled；`coop_plan_abort` 取消开放任务并通知执行中的 assignee。Worktree、plan 评审门控、subagent 执行器与 memory 随 P2–P4 交付。
+
+## 随包技能（bundled skills）
+
+本包自带一套精选技能（`skills/` 目录，随 tarball 分发）：以 pstack 为主体（`tdd`、`interrogate`、`unslop`、`architect`、`how`/`why`、`sharpen`、`ketchup`/`recall`、`benchmark-checklist`、`no-comments`、`blast-radius`、`figure-it-out`、`reflect`、`typescript-best-practices`），点缀 superpowers 的 `brainstorming`/`systematic-debugging` 与 matt-skills 的 `grilling`/`diagnosing-bugs`/`handoff`，外加自研的 `coop-flow`（六步循环操作手册）与 `coop-help`（技能路由器，仅用户键入触发）。来源与本地改动记录在 `skills/SOURCES.md`。
+
+- **注册**：部署装配了 `ctx.skills`（dsh-skill 注册表）时，插件自动把 `skills/` 注册为 `bundled` provider（rank 600，provider 名 `coop`）；未装配则跳过，coop 功能不受影响。同名的项目级/用户级技能（rank 100/400）胜出，可整份覆盖自带副本。
+- **角色分工**：master —— 需求澄清/设计争议时**由用户手动选** `brainstorming` 或 `grilling`，设计用 `architect`/`how`/`why`，下发前用 `sharpen`，收尾用 `ketchup`/`recall`；worker —— 实现主动 `tdd`，调试主动 `diagnosing-bugs`（`systematic-debugging` 为手动备用）；reviewer —— 验收用 `interrogate`/`unslop`/`benchmark-checklist`；全角色 `handoff`/`reflect`。
+- **subagent 规则**：pstack 原单 skill 多 subagent 并行整体角色化 —— 并行由多 worker/多 reviewer 节点承担；单 reviewer 单线评审（禁评审 subagent）；仅多 reviewer（≤ `maxReviewers`）时角色级并行；worker 节点内部 subagent 仅限任务实现（`executor: 'subagent'`）。
 
 ## 按角色固定模型（roleLlm）的完整配置
 

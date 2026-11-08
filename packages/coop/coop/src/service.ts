@@ -23,7 +23,9 @@ import type {
   CoopInboxEntry,
   CoopMemoryEntry,
   CoopPlanFile,
+  CoopQualityGate,
   CoopRegistryEntry,
+  CoopSeverityCounts,
   CoopV2PlanFile,
   CoopV2RegistryEntry,
   CoopV2RegistryFile,
@@ -47,7 +49,7 @@ import {
   normalizeCwd,
   resolveCoopConfig,
   v2Root, applyRoleLlmRoute, planColumnSplit, PaneBox, spawnRouteEnv } from './runtime.ts'
-import type { ContextGuardStrategy, ResolvedCoopConfig, RoleLlmRoute, RoleLlmSettings } from './runtime.ts'
+import type { ContextGuardStrategy, QualityGateConfig, ResolvedCoopConfig, ResolvedQualityGate, RoleLlmRoute, RoleLlmSettings } from './runtime.ts'
 import * as store from './store.ts'
 import { COOP_POLICY_ORDER, COOP_POLICY_SECTION_NAME, COOP_POLICY_TEXT, COOP_V2_POLICY_TEXT } from './policy.ts'
 import { registerCoopCommands } from './commands.ts'
@@ -69,6 +71,7 @@ declare module '@deepseek-ai/dsh-session/types' {
 }
 
 import { registerCoopTools, registerCoopV2Tools } from './tools.ts'
+import { registerCoopBundledSkills } from './bundled-skills.ts'
 
 /** Raw deployment config; enum and positivity rules are enforced in {@link resolveCoopConfig}. */
 export interface Config {
@@ -137,6 +140,9 @@ export interface Config {
      * same-role session), compact (in-place compaction), none (default: worker
    * handoff, master/reviewer compact). */
   contextStrategy?: { worker?: ContextGuardStrategy; master?: ContextGuardStrategy; reviewer?: ContextGuardStrategy }
+  /** v2 quality gates: max P0/P1/P2 finding counts a `pass` may carry; flat object sets both
+     * gates, `plan`/`task` split them (default `{ p0: 0 }`). */
+  qualityGate?: QualityGateConfig
 }
 
 /** Schemastery surface of {@link Config}; enum narrowing happens in resolveCoopConfig. */
@@ -170,6 +176,7 @@ export const Config: z<Config> = z.object({
   contextHardPctByRole: z.any(),
   contextHardGraceMs: z.number(),
   contextStrategy: z.any(),
+  qualityGate: z.any(),
   paneId: z.string(),
   roleLlm: z.any(),
   inboxPollMs: z.number(),
@@ -287,6 +294,27 @@ export class CoopService extends Service {
     ctx.inject(['tools'], (toolCtx) => {
       if (this.resolved.mode === 'v2') registerCoopV2Tools(toolCtx, this)
       else registerCoopTools(toolCtx, this)
+    })
+    // Bundled coop skills ride the package's own `skills/` directory. The
+    // inject callback only gates timing on the skills service; registration
+    // happens on coop's own mount context so the provider lands in this
+    // plugin's layer (deployment root or agent preset), visible to every
+    // session beneath it. Without a skill registry composed in, the callback
+    // never fires and coop keeps working unskilled (fail-soft by design).
+    // Bundled coop skills ride the package's own `skills/` directory. They
+    // mount at the composition ROOT — the unscoped context whose registry
+    // layer is global, so every session in the process sees the catalog —
+    // and tear down with coop. Without a skill registry composed in, the
+    // sub-plugin never starts and coop keeps working unskilled (fail-soft).
+    const bundledSkillsFiber = ctx.root.plugin({
+      name: 'coop-bundled-skills',
+      inject: ['skills'],
+      apply: (rootCtx: Context) => {
+        void registerCoopBundledSkills(rootCtx)
+      },
+    })
+    ctx.effect(() => () => {
+      void bundledSkillsFiber.dispose()
     })
     ctx.inject(['commands'], (commandCtx) => {
       registerCoopCommands(commandCtx, this)
@@ -2079,11 +2107,56 @@ export class CoopService extends Service {
        * @param summary - one-line rationale.
        * @returns the committed plan.
        */
+  /**
+   * Quality-gate one review/verify decision: validate reported P0/P1/P2 counts
+   * and, on a `pass`, enforce the configured thresholds (spec 2026-11-07 §1.3:
+   * exceeded → COOP_GATE_EXCEEDED; counts missing while a level is constrained
+   * → COOP_GATE_COUNTS_REQUIRED; `request_changes` is never gated).
+   * @param surface - gate surface in force (`plan` review or `task` verify).
+   * @param decision - verdict being gated.
+   * @param counts - reviewer-reported P0/P1/P2 findings.
+   * @returns the durable evidence — normalized counts and, on a constrained pass, the gate snapshot.
+   */
+  private qualityGateOutcome(
+    surface: 'plan' | 'task',
+    decision: 'pass' | 'request_changes',
+    counts: Partial<CoopSeverityCounts> | undefined,
+  ): { severityCounts?: CoopSeverityCounts; gate?: CoopQualityGate } {
+    if (counts !== undefined) {
+      for (const [level, value] of Object.entries(counts)) {
+        if (value === undefined) continue
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+          throw new CoopError(`severityCounts.${level} must be a non-negative safe integer, got ${String(value)}`, 'COOP_CONFIG_UNSUPPORTED')
+        }
+      }
+    }
+    const normalized: CoopSeverityCounts = counts === undefined
+      ? { p0: 0, p1: 0, p2: 0 }
+      : { p0: counts.p0 ?? 0, p1: counts.p1 ?? 0, p2: counts.p2 ?? 0 }
+    const gate: ResolvedQualityGate = surface === 'plan' ? this.resolved.qualityGate.plan : this.resolved.qualityGate.task
+    if (decision !== 'pass') {
+      return counts === undefined ? {} : { severityCounts: normalized }
+    }
+    const exceeded = (['p0', 'p1', 'p2'] as const).filter(level => normalized[level] > gate[level])
+    if (exceeded.length > 0) {
+      const detail = exceeded.map(level => `${level.toUpperCase()}=${String(normalized[level])}>${gate[level] === Number.POSITIVE_INFINITY ? '∞' : String(gate[level])}`).join(', ')
+      throw new CoopError(`quality gate (${surface}) exceeded: ${detail} — fix the findings and request_changes instead`, 'COOP_GATE_EXCEEDED')
+    }
+    const constrained = (['p0', 'p1', 'p2'] as const).filter(level => gate[level] !== Number.POSITIVE_INFINITY)
+    if (counts === undefined && constrained.length > 0) {
+      throw new CoopError(`quality gate (${surface}) constrains ${constrained.map(level => level.toUpperCase()).join('/')} — count your findings and pass severityCounts explicitly to pass`, 'COOP_GATE_COUNTS_REQUIRED')
+    }
+    const snapshot: CoopQualityGate = {}
+    for (const level of constrained) snapshot[level] = gate[level]
+    return counts === undefined ? {} : { severityCounts: normalized, ...(constrained.length === 0 ? {} : { gate: snapshot }) }
+  }
+
   async reviewPlanV2(
     agent: Agent,
     planId: string,
     decision: 'pass' | 'request_changes',
     summary?: string,
+    severityCounts?: Partial<CoopSeverityCounts>,
   ): Promise<CoopV2PlanFile> {
     const sessionId = String(agent.session.id)
     const root = await this.v2RootOf(agent)
@@ -2109,6 +2182,7 @@ export class CoopService extends Service {
     if (!isReviewer && !(isMaster && (!hasReviewer || this.resolved.allowSelfReview))) {
       throw new CoopError('plan review requires a reviewer bound to this master (or none bound / allowSelfReview)', 'COOP_NOT_ASSIGNED_WORKER')
     }
+    const gateEvidence = this.qualityGateOutcome('plan', decision, severityCounts)
     const masterIdStr = String(masterId)
     const plan = await store.mutateV2Plan(
       store.v2PlanPath(root, masterIdStr, planId),
@@ -2122,6 +2196,13 @@ export class CoopService extends Service {
         const staged: CoopV2PlanFile = {
           ...current,
           status,
+          lastReview: {
+            decision,
+            by: sessionId,
+            at,
+            ...(gateEvidence.severityCounts === undefined ? {} : { severityCounts: gateEvidence.severityCounts }),
+            ...(gateEvidence.gate === undefined ? {} : { gate: gateEvidence.gate }),
+          },
           history: [...current.history, { time: at, sessionId, op: `plan_review ${decision}`, ...(summary === undefined ? {} : { summary }) }],
         }
         const next = decision === 'pass' ? recomputeReady(staged, at) : staged
@@ -2557,6 +2638,7 @@ export class CoopService extends Service {
     taskId: string,
     decision: 'pass' | 'request_changes',
     summary?: string,
+    severityCounts?: Partial<CoopSeverityCounts>,
   ): Promise<CoopV2Task> {
     const sessionId = String(agent.session.id)
     const { plan, root, planId: canonical } = await this.planForNode(agent, planId)
@@ -2579,6 +2661,7 @@ export class CoopService extends Service {
     if (!isReviewer && !(isMaster && (!hasReviewer || this.resolved.allowSelfReview))) {
       throw new CoopError('task verification requires a reviewer bound to this master (or none bound / allowSelfReview)', 'COOP_NOT_ASSIGNED_WORKER')
     }
+    const gateEvidence = this.qualityGateOutcome('task', decision, severityCounts)
     const verified = await store.mutateV2Plan(
       store.v2PlanPath(root, masterId, canonical),
       (current): { next?: CoopV2PlanFile; value: CoopV2Task } => {
@@ -2596,7 +2679,14 @@ export class CoopService extends Service {
           status: decision === 'pass' ? 'done' : (escalated ? 'blocked' : 'rework'),
           updatedAt: at,
           ...(decision === 'pass' ? {} : { attempts }),
-          verify: { decision, ...(summary === undefined ? {} : { summary }), by: sessionId, at },
+          verify: {
+            decision,
+            ...(summary === undefined ? {} : { summary }),
+            ...(gateEvidence.severityCounts === undefined ? {} : { severityCounts: gateEvidence.severityCounts }),
+            ...(gateEvidence.gate === undefined ? {} : { gate: gateEvidence.gate }),
+            by: sessionId,
+            at,
+          },
         }
         const staged: CoopV2PlanFile = {
           ...current,

@@ -64,10 +64,10 @@ async function finishTask(h: Harness, title: string, report: string, review: str
   const plan = await h.ctx.coop.createPlanV2(h.master, { title, objective: 'O' })
   await h.ctx.coop.addTaskV2(h.master, plan.planId, { title: 't1', spec: 'do' })
   await h.ctx.coop.submitReviewV2(h.master, plan.planId)
-  await h.ctx.coop.reviewPlanV2(h.reviewer, plan.planId, 'pass')
+  await h.ctx.coop.reviewPlanV2(h.reviewer, plan.planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
   await h.ctx.coop.executeBeginV2(h.worker, plan.planId, 't1')
   await h.ctx.coop.executeReportV2(h.worker, plan.planId, 't1', report)
-  await h.ctx.coop.verifyTaskV2(h.reviewer, plan.planId, 't1', 'pass', review)
+  await h.ctx.coop.verifyTaskV2(h.reviewer, plan.planId, 't1', 'pass', review, { p0: 0, p1: 0, p2: 0 })
 }
 
 describe('memory trail', () => {
@@ -96,10 +96,10 @@ describe('memory trail', () => {
     const plan = await h.ctx.coop.createPlanV2(h.master, { title: 'plan-b', objective: 'Ship it' })
     await h.ctx.coop.addTaskV2(h.master, plan.planId, { title: 't1', spec: 'do' })
     await h.ctx.coop.submitReviewV2(h.master, plan.planId)
-    await h.ctx.coop.reviewPlanV2(h.reviewer, plan.planId, 'pass')
+    await h.ctx.coop.reviewPlanV2(h.reviewer, plan.planId, 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
     await h.ctx.coop.executeBeginV2(h.worker, plan.planId, 't1')
     await h.ctx.coop.executeReportV2(h.worker, plan.planId, 't1', 'second')
-    await h.ctx.coop.verifyTaskV2(h.reviewer, plan.planId, 't1', 'pass')
+    await h.ctx.coop.verifyTaskV2(h.reviewer, plan.planId, 't1', 'pass', undefined, { p0: 0, p1: 0, p2: 0 })
     await h.ctx.coop.closePlanV2(h.master, plan.planId)
     const lines = await h.ctx.coop.memoryLinesV2(h.master)
     expect(lines[0]).toContain('[plan]')
