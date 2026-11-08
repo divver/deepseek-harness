@@ -120,3 +120,18 @@ export async function registerCoopBundledSkills(ctx: Context): Promise<void> {
     ctx.logger.warn(`coop: bundled skills not registered: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
+
+/**
+ * Standalone mount for deployments that compose the bundled skills as their own
+ * plugin row (`name: '@deepseek-ai/dsh-coop/bundled-skills'`). Hosts that guard
+ * root capabilities during plugin activation (the TUI) reject coop's internal
+ * root mount; composing this export instead registers from a composition-level
+ * context, which the skill registry files into its global layer.
+ */
+export default {
+  name: 'coop-bundled-skills',
+  inject: ['skills'],
+  apply(ctx: Context): void {
+    void registerCoopBundledSkills(ctx)
+  },
+} as const

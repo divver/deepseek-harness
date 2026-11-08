@@ -3,7 +3,7 @@ import { Context } from '@deepseek-ai/cordis'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
-import CoopService from '../src/index.ts'
+import CoopService, { bundledSkillsPlugin } from '../src/index.ts'
 import { registerCoopBundledSkills } from '../src/bundled-skills.ts'
 
 interface CapturedProvider {
@@ -74,6 +74,25 @@ describe('bundled skills', () => {
     // No ctx.skills: the dynamic registry import fails and the helper warns instead of throwing.
     await expect(registerCoopBundledSkills(ctx as never)).resolves.toBeUndefined()
     expect(warns.length).toBe(1)
+  })
+
+  it('surfaces the bundled set through the standalone plugin row (TUI path)', async () => {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(SkillRegistry)
+      await ctx.plugin(bundledSkillsPlugin as unknown as { apply: (ctx: Context) => void })
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const catalog = await ctx.skills.list()
+        if (catalog.length >= 20) {
+          expect(catalog.map(skill => skill.name)).toContain('coop-help')
+          return
+        }
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      expect((await ctx.skills.list()).map(skill => skill.name).join(',')).toContain('coop-help')
+    } finally {
+      await ctx.fiber.dispose()
+    }
   })
 
   it('surfaces the bundled set through a real skill registry when coop mounts', async () => {

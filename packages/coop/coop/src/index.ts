@@ -12,6 +12,7 @@ export { CoopService, Config }
 export { CoopError, MasterId, PlanId, canCommunicate, coopRoot, mintMasterId, normalizeCwd, resolveCoopConfig, v2Root } from './runtime.ts'
 export type { QualityGateConfig, QualityGateSettings, ResolvedCoopConfig, ResolvedQualityGate } from './runtime.ts'
 export { registerCoopBundledSkills } from './bundled-skills.ts'
+export { default as bundledSkillsPlugin } from './bundled-skills.ts'
 export {
   COOP_POLICY_ORDER,
   COOP_POLICY_SECTION_NAME,

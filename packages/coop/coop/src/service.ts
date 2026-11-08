@@ -304,18 +304,24 @@ export class CoopService extends Service {
     // Bundled coop skills ride the package's own `skills/` directory. They
     // mount at the composition ROOT — the unscoped context whose registry
     // layer is global, so every session in the process sees the catalog —
-    // and tear down with coop. Without a skill registry composed in, the
-    // sub-plugin never starts and coop keeps working unskilled (fail-soft).
-    const bundledSkillsFiber = ctx.root.plugin({
-      name: 'coop-bundled-skills',
-      inject: ['skills'],
-      apply: (rootCtx: Context) => {
-        void registerCoopBundledSkills(rootCtx)
-      },
-    })
-    ctx.effect(() => () => {
-      void bundledSkillsFiber.dispose()
-    })
+    // and tear down with coop. Hosts that guard root capabilities during
+    // plugin activation (the TUI) reject this mount; deployments there
+    // compose the standalone `@deepseek-ai/dsh-coop/bundled-skills` row
+    // instead, and without any registry coop keeps working unskilled.
+    try {
+      const bundledSkillsFiber = ctx.root.plugin({
+        name: 'coop-bundled-skills',
+        inject: ['skills'],
+        apply: (rootCtx: Context) => {
+          void registerCoopBundledSkills(rootCtx)
+        },
+      })
+      ctx.effect(() => () => {
+        void bundledSkillsFiber.dispose()
+      })
+    } catch {
+      // Root capability guarded (TUI): the standalone row owns registration.
+    }
     ctx.inject(['commands'], (commandCtx) => {
       registerCoopCommands(commandCtx, this)
     })
